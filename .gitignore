@@ -1,0 +1,18 @@
+# Python (test_static.py)
+__pycache__/
+*.pyc
+
+# Windows OS cruft
+Thumbs.db
+desktop.ini
+
+# Editor cruft
+.vscode/
+*.swp
+
+# PowerShell transcripts, if ever started manually in this folder
+PowerShell_transcript.*.txt
+
+# Dropped from the repo (redundant with git / goes stale quickly); keep them from sneaking back in
+/SHA256SUMS.txt
+/VALIDATION.txt
