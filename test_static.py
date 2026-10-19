@@ -155,6 +155,21 @@ class SourceContract(unittest.TestCase):
     def test_set_vm_settings_core_requires_off(self):
         body = self.s.split('function Set-LabVMSettingsCore {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('Assert-LabVMOff', body)
+    def test_assert_vm_running_exists(self):
+        self.assertIn('function Assert-LabVMRunning', self.s)
+        body = self.s.split('function Assert-LabVMRunning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("-ne 'Running'", body)
+    def test_resolve_windows_credential_noninteractive_never_prompts(self):
+        body = self.s.split('function Resolve-LabWindowsCredential {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$NonInteractive', body)
+        self.assertNotRegex(body, r'if\s*\(\s*\$NonInteractive\s*\)\s*\{\s*Get-Credential')
+    def test_psdirect_session_uses_vmid(self):
+        body = self.s.split('function New-LabPSDirectSession {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('New-PSSession -VMId', body)
+    def test_connection_test_closes_session_in_finally(self):
+        body = self.s.split('function Test-LabTransferConnection {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('finally', body)
+        self.assertIn('Remove-PSSession', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -11,7 +11,7 @@ A standalone menu-driven PowerShell script for managing **local Hyper-V VMs whos
 - `MANUAL-TESTS.md`: acceptance checklist for a disposable VM.
 - `test_static.py`: source-level regression checks; optional, requires Python.
 
-The script has been source-reviewed: all 43 `test_static.py` source-contract checks pass, and all 56 `Test-LabVM.ps1` helper tests pass in Windows PowerShell 5.1. An earlier version (before the Create, Edit and Delete VM workflows were added) was exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, checkpoint deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM, Edit VM settings and Delete VM workflows — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
+The script has been source-reviewed: all 47 `test_static.py` source-contract checks pass, and all 68 `Test-LabVM.ps1` helper tests pass in Windows PowerShell 5.1. An earlier version (before the Create, Edit and Delete VM workflows were added) was exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, checkpoint deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM, Edit VM settings and Delete VM workflows — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
 
 ## Start
 
@@ -83,10 +83,15 @@ The selected-VM menu provides:
 | 10 | Explicitly select Standard checkpoints and disable automatic checkpoints |
 | 11 | Edit VM settings: name, notes, vCPU count, memory, network switch; VM must be Off |
 | 12 | Delete the VM (retain virtual disks); VM must be Off; blocked by non-Standard checkpoints |
+| T | Test Windows guest connectivity over PowerShell Direct; VM must be Running |
 | X | Emergency power-off, with strong confirmation and data-loss warning |
 | R / B / Q | Refresh / choose another VM / quit |
 
-`-ReadOnly` allows only inspection and listing. It still writes a host audit log.
+`-ReadOnly` allows only inspection, listing and the connectivity test (option `T`); it performs no mutation. It still writes a host audit log.
+
+### Test connection (`T`)
+
+Prompts for the guest's Windows credentials (never stored), opens a PowerShell Direct session to the Running VM, and runs a trivial remote command to confirm round-trip execution. On success it reports the guest's OS version string; on failure (wrong credentials, VM not Running, etc.) it reports a clear message, never a raw stack trace. The session is always closed afterward. This does not transfer any files by itself; it only proves the connection used by later file-transfer operations is reachable.
 
 ## First baseline
 
@@ -133,7 +138,7 @@ Audit files default to:
 
 Records contain UTC timestamps, host/operator, VM ID/name, actions, status and relevant checkpoint/export/error details. They do not capture guest logs. Log creation failure prevents startup. Failure after a VM command may mean the VM changed but completion could not be recorded; the script reports `FAILED_OR_UNCONFIRMED`, not "nothing changed."
 
-No passwords are requested by the manager. VM names, export paths and error messages can still be sensitive. Protect the host scripts, logs and exports with appropriate filesystem permissions. This tool is not a security boundary against an administrator or a sandbox for untrusted guest code.
+No passwords are requested by the manager for VM lifecycle/checkpoint operations. The connectivity test (`T`) is the one exception: it prompts for guest Windows credentials via `Get-Credential` to open a PowerShell Direct session, and credentials are never logged or written to disk. VM names, export paths and error messages can still be sensitive. Protect the host scripts, logs and exports with appropriate filesystem permissions. This tool is not a security boundary against an administrator or a sandbox for untrusted guest code.
 
 ## Export and checkpoint deletion
 

@@ -233,6 +233,45 @@ function Assert-LabVMOff {
     return $vm
 }
 
+function Assert-LabVMRunning {
+    param([guid]$VMId)
+    $vm = Get-LabVM $VMId
+    if ([string]$vm.State -ne 'Running') {
+        throw "'$($vm.Name)' is $($vm.State). This operation requires Running. Start it first."
+    }
+    return $vm
+}
+
+function Resolve-LabWindowsCredential {
+    param([AllowNull()][PSCredential]$Credential, [bool]$NonInteractive)
+    if ($null -ne $Credential) { return $Credential }
+    if ($NonInteractive) { throw 'Guest Windows credentials are required in non-interactive mode. Supply -Credential.' }
+    $Credential = Get-Credential -Message 'Guest Windows credentials for PowerShell Direct'
+    if ($null -eq $Credential) { throw 'Credential prompt was cancelled. Guest Windows credentials are required.' }
+    return $Credential
+}
+
+function New-LabPSDirectSession {
+    param([guid]$VMId, [PSCredential]$Credential)
+    $null = Assert-LabVMRunning $VMId
+    return New-PSSession -VMId $VMId -Credential $Credential -ErrorAction Stop
+}
+
+function Test-LabTransferConnection {
+    param([guid]$VMId)
+    $session = $null
+    try {
+        $credential = Resolve-LabWindowsCredential $null $false
+        $session = New-LabPSDirectSession $VMId $credential
+        $osVersion = Invoke-Command -Session $session { [Environment]::OSVersion.VersionString }
+        Write-Host "Connection succeeded. Guest OS version: $osVersion"
+    } catch {
+        Write-Warning "Connection test failed: $($_.Exception.Message)"
+    } finally {
+        if ($session) { Remove-PSSession $session }
+    }
+}
+
 function Wait-LabVMState {
     param([guid]$VMId, [string]$State)
     $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -1188,6 +1227,7 @@ function Show-LabVMMenu {
             Write-Host @'
   1  Inspect VM: configuration, disks, network, integration services
   4  List checkpoints
+  T  Test Windows guest connectivity (PowerShell Direct)
   R  Refresh
   B  Choose another VM
   Q  Quit
@@ -1207,6 +1247,7 @@ READ-ONLY: VM-changing operations are disabled.
  10  Configure lab checkpoint policy           [requires Off]
  11  Edit VM settings                          [requires Off]
  12  Delete VM (retain virtual disks)          [requires Off]
+  T  Test Windows guest connectivity (PowerShell Direct) [requires Running]
   X  EMERGENCY power-off                       [risk of data loss]
   R  Refresh
   B  Choose another VM
@@ -1228,6 +1269,7 @@ READ-ONLY: VM-changing operations are disabled.
                 '10' { Invoke-LabAction $VMId 'configure-policy' { param($id) Set-LabCheckpointPolicy $id } }
                 '11' { Invoke-LabAction $VMId 'edit-settings-menu' { param($id) Edit-LabVMSettings $id } }
                 '12' { Invoke-LabAction $VMId 'delete-vm-menu' { param($id) Remove-LabVM $id } }
+                'T'  { Test-LabTransferConnection $VMId }
                 'X'  { Invoke-LabAction $VMId 'emergency-power-off' { param($id) Stop-LabVMPower $id } }
                 'R'  { continue vmMenu }
                 'B'  { return 'BACK' }

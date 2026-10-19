@@ -102,3 +102,10 @@
 - Repeat on a different disposable VM, this time answering `N` to skip the export, and complete the deletion: verify the removal manifest shows `ExportPerformed: false`, disk files are still retained on disk, and the VM is gone from inventory.
 - Start a manager session, select a disposable VM while it is Running or Saved, and choose option 12: verify it refuses with a message requiring Off, and makes no change.
 - Confirm no script operation directly deletes `.vhdx`/`.avhdx` files during any of the above; only `Remove-VM` (through the Hyper-V API) is used, never manual file deletion.
+
+## PowerShell Direct connection test
+
+- Select a disposable Windows guest while it is Running, with valid local/domain Windows credentials known. Choose option `T` and enter the correct credentials: verify it reports success and prints the guest's OS version string, and that the session is closed afterward (no leftover `Get-PSSession` entries on the host).
+- Repeat with a deliberately wrong password: verify it reports a clear failure message (e.g. an authentication error), never a raw .NET stack trace, and that no session is left open.
+- Shut the guest down (`Off`), then choose option `T`: it still prompts for credentials first (per the function's fixed order), but then refuses before opening any PowerShell Direct session, reporting the `Assert-LabVMRunning` message naming the VM's actual state. No session is ever attempted.
+- Confirm `-ReadOnly` mode still offers option `T` and that it behaves identically to normal mode (no mutation is possible through this option).
