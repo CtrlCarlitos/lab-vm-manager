@@ -7,9 +7,10 @@
     Select a VM, then an operation. Uses VM/checkpoint IDs, not name wildcards.
     Checkpoint changes and exports require the VM to be Off. Restores offer an
     optional safety checkpoint and never issue an automatic start/resume.
-    No VM creation/deletion, guest provisioning, credential copying, or disk
-    file deletion is implemented. This is an operator tool, not a security
-    boundary against another administrator or an untrusted guest.
+    LAB-* VMs can be created, have settings edited, and be deleted (virtual
+    disks are retained). Guest provisioning, credential copying, and disk
+    file deletion are not implemented. This is an operator tool, not a
+    security boundary against another administrator or an untrusted guest.
 .PARAMETER ReadOnly
     Allows inventory, details and checkpoint listing; blocks all VM changes.
     A host-side audit log is still written.
