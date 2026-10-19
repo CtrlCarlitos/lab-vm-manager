@@ -988,7 +988,7 @@ function Edit-LabVMSettings {
         DynamicMemoryEnabled = $newIsDynamic
         SwitchName = $newSwitchName
     }
-    $diff = @(Get-LabSettingsDiff $current $proposed)
+    $diff = Get-LabSettingsDiff $current $proposed
     if ($diff.Count -eq 0) { Write-Host 'No changes.'; return 'NO_CHANGE' }
 
     Write-Host "`n=== Proposed changes ==="

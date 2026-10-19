@@ -91,6 +91,10 @@ class SourceContract(unittest.TestCase):
             self.assertNotIn(cmd, body)
     def test_edit_menu_option_eleven(self):
         self.assertIn("'11' { Invoke-LabAction $VMId 'edit-settings-menu' { param($id) Edit-LabVMSettings $id } }", self.s)
+    def test_edit_diff_not_double_wrapped(self):
+        body = self.s.split('function Edit-LabVMSettings {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$diff = Get-LabSettingsDiff', body)
+        self.assertNotIn('$diff = @(Get-LabSettingsDiff', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
