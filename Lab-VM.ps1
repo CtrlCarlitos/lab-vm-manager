@@ -164,6 +164,46 @@ function Get-LabVM {
     return $vm
 }
 
+function Get-LabHostDefaults {
+    $vmHost = Get-VMHost -ErrorAction Stop
+    $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    return [pscustomobject]@{
+        VirtualMachinePath = [string]$vmHost.VirtualMachinePath
+        VirtualHardDiskPath = [string]$vmHost.VirtualHardDiskPath
+        LogicalProcessorCount = [int]$computer.NumberOfLogicalProcessors
+        TotalPhysicalMemoryBytes = [long]$computer.TotalPhysicalMemory
+    }
+}
+
+function Get-LabSwitchNames {
+    return @(Get-VMSwitch -ErrorAction Stop | ForEach-Object { [string]$_.Name })
+}
+
+function Test-LabNewVMName {
+    param([AllowNull()][AllowEmptyString()][string]$Name, [AllowNull()][AllowEmptyCollection()][string[]]$ExistingNames)
+    if (-not (Test-LabVMName $Name)) { return $false }
+    foreach ($existing in $ExistingNames) {
+        if ([string]::Equals($existing, $Name, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
+}
+
+function Test-LabVCpuCount {
+    param([int]$Count, [int]$MaxLogicalProcessors)
+    return ($Count -ge 1 -and $Count -le $MaxLogicalProcessors)
+}
+
+function Test-LabMemorySpec {
+    param([long]$MinimumBytes, [long]$StartupBytes, [long]$MaximumBytes, [bool]$IsDynamic)
+    $unit = 2MB
+    if (-not $IsDynamic) {
+        return ($StartupBytes -gt 0 -and ($StartupBytes % $unit) -eq 0)
+    }
+    return ($MinimumBytes -gt 0 -and $StartupBytes -gt 0 -and $MaximumBytes -gt 0 -and
+        ($MinimumBytes % $unit) -eq 0 -and ($StartupBytes % $unit) -eq 0 -and ($MaximumBytes % $unit) -eq 0 -and
+        $MinimumBytes -le $StartupBytes -and $StartupBytes -le $MaximumBytes)
+}
+
 function Assert-LabVMOff {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId

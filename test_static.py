@@ -60,6 +60,9 @@ class SourceContract(unittest.TestCase):
     def test_all_named_operations_exist(self):
         for name in ['Get-LabVM','Select-LabVM','Start-LabVM','Stop-LabVMGracefully','New-LabCheckpoint','Restore-LabCheckpoint','Rename-LabCheckpoint','Remove-LabCheckpoint','Export-LabVM','Set-LabCheckpointPolicy','Stop-LabVMPower','Invoke-LabAction','Start-LabVMManager']:
             self.assertIn('function '+name+' {',self.s)
+    def test_host_discovery_functions_exist(self):
+        self.assertIn('function Get-LabHostDefaults', self.s)
+        self.assertIn('function Get-LabSwitchNames', self.s)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
