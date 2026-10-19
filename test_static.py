@@ -170,6 +170,23 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Test-LabTransferConnection {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('finally', body)
         self.assertIn('Remove-PSSession', body)
+    def test_transfer_engine_uses_temp_sibling(self):
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('.labxfer-', body)
+    def test_transfer_engine_literal_path_only(self):
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotRegex(body, r'-ToSession[^\r\n]*-Path ')
+        self.assertNotRegex(body, r'-FromSession[^\r\n]*-Path ')
+    def test_transfer_engine_rejects_reparse_points(self):
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('ReparsePoint', body)
+    def test_transfer_engine_dry_run_skips_copy_item(self):
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$DryRun', body)
+    def test_transfer_engine_returns_summary_shape(self):
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        for field in ['Completed', 'Skipped', 'Failed', 'BytesTransferred', 'Errors']:
+            self.assertIn(field, body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

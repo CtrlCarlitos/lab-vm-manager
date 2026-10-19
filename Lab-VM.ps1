@@ -1172,6 +1172,337 @@ function Stop-LabVMPower {
     return 'COMPLETED'
 }
 
+function Invoke-LabTransferSide {
+    param([System.Management.Automation.Runspaces.PSSession]$Session, [bool]$Remote,
+        [scriptblock]$ScriptBlock, [object[]]$ArgumentList)
+    if ($Remote) { return Invoke-Command -Session $Session -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -ErrorAction Stop }
+    return & $ScriptBlock @ArgumentList
+}
+
+function Resolve-LabTransferItemAction {
+    param([hashtable]$State, [string]$SourceLabel, [string]$DestinationLabel, [bool]$SourceIsDirectory,
+        [bool]$SourceIsReparse, $Destination, [string]$OnConflict)
+    $reason = $null
+    if ($SourceIsReparse) { $reason = "${SourceLabel}: source is a symbolic link, junction or other reparse point; only regular files and plain directories are supported." }
+    elseif ($Destination.Error) { $reason = "${DestinationLabel}: destination could not be inspected: $($Destination.Error)" }
+    elseif ($Destination.IsReparse) { $reason = "${DestinationLabel}: destination is a symbolic link, junction or other reparse point; refusing to write through it." }
+    if ($reason) { $State.Failed++; $State.Errors.Add($reason); return 'Error' }
+    $kind = Get-LabTransferConflictKind $SourceIsDirectory ([bool]$Destination.Exists) ([bool]$Destination.IsDirectory)
+    # An existing directory is merged into; -OnConflict then applies to each file inside it.
+    if ($SourceIsDirectory -and $kind -eq 'Exists') { return 'Merge' }
+    $action = Resolve-LabConflictAction $kind $OnConflict
+    if ($action -eq 'Error') {
+        $why = if ($kind -eq 'TypeMismatch') { 'destination exists as a different type (file vs directory)' } else { 'destination already exists' }
+        $State.Failed++
+        $State.Errors.Add("${DestinationLabel}: $why.")
+    } elseif ($action -eq 'Skip') {
+        $State.Skipped++
+        Write-Host "Skipped (destination exists): $DestinationLabel"
+    }
+    return $action
+}
+
+function Copy-LabTransferItem {
+    param(
+        [System.Management.Automation.Runspaces.PSSession]$Session,
+        [ValidateSet('ToVM', 'FromVM')][string]$Direction,
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [bool]$Recurse,
+        [ValidateSet('Error', 'Skip', 'Overwrite')][string]$OnConflict,
+        [bool]$VerifyHash,
+        [bool]$DryRun
+    )
+    if ($null -eq $Session -or [string]$Session.State -ne 'Opened') {
+        throw 'The PowerShell Direct session is not open. No transfer was attempted.'
+    }
+    $state = @{ Completed = 0; Skipped = 0; Failed = 0; BytesTransferred = [long]0
+        Errors = [Collections.Generic.List[string]]::new() }
+    $summary = {
+        [pscustomobject]@{ Completed = [int]$state.Completed; Skipped = [int]$state.Skipped; Failed = [int]$state.Failed
+            BytesTransferred = [long]$state.BytesTransferred; Errors = [string[]]$state.Errors.ToArray() }
+    }
+    $fail = { param([string]$Message) $state.Failed++; $state.Errors.Add($Message) }
+    $sourceRemote = $Direction -eq 'FromVM'
+    $destinationRemote = $Direction -eq 'ToVM'
+
+    foreach ($path in @($SourcePath, $DestinationPath)) {
+        if ($path -notmatch '^[A-Za-z]:[\\/]') { & $fail "${path}: transfer paths must be absolute drive-letter paths."; return & $summary }
+    }
+    $SourcePath = $SourcePath.TrimEnd('\', '/')
+    $DestinationPath = $DestinationPath.TrimEnd('\', '/')
+    foreach ($path in @($SourcePath, $DestinationPath)) {
+        if ($path -match '^[A-Za-z]:$') { & $fail "${path}\: a drive root cannot be a transfer source or destination."; return & $summary }
+    }
+
+    # These scriptblocks run on whichever side owns the path: locally, or in the guest via
+    # Invoke-Command. They return plain values only, so nothing depends on deserialized types.
+    $statSb = {
+        param([string[]]$Paths, [bool]$Hash)
+        foreach ($path in $Paths) {
+            $info = [ordered]@{ Path = $path; Exists = $false; IsDirectory = $false; IsReparse = $false
+                Length = [long]0; Hash = $null; Error = $null }
+            try {
+                # GetAttributes reports a link itself (even a dangling one), never its target.
+                $attributes = [IO.File]::GetAttributes($path)
+                $info.Exists = $true
+                $info.IsDirectory = [bool]($attributes -band [IO.FileAttributes]::Directory)
+                $info.IsReparse = [bool]($attributes -band [IO.FileAttributes]::ReparsePoint)
+                if (-not $info.IsDirectory) {
+                    $info.Length = [long]([IO.FileInfo]::new($path)).Length
+                    if ($Hash) { $info.Hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash }
+                }
+            } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
+                $info.Exists = $false
+            } catch { $info.Error = $_.Exception.Message }
+            [pscustomobject]$info
+        }
+    }
+    $listSb = {
+        param([string]$Root)
+        $pending = [Collections.Generic.Stack[string]]::new()
+        $pending.Push('')
+        while ($pending.Count -gt 0) {
+            $relativeDirectory = $pending.Pop()
+            foreach ($child in @(Get-ChildItem -LiteralPath ([IO.Path]::Combine($Root, $relativeDirectory)) -Force -ErrorAction Stop)) {
+                $relative = if ($relativeDirectory) { [IO.Path]::Combine($relativeDirectory, $child.Name) } else { $child.Name }
+                $isReparse = [bool]($child.Attributes -band [IO.FileAttributes]::ReparsePoint)
+                [pscustomobject]@{ RelativePath = $relative; IsDirectory = [bool]$child.PSIsContainer; IsReparse = $isReparse }
+                # Never descend into a link: it can loop or lead outside the source tree.
+                if ($child.PSIsContainer -and -not $isReparse) { $pending.Push($relative) }
+            }
+        }
+    }
+    $finalizeSb = {
+        param([object[]]$Moves)
+        foreach ($move in $Moves) {
+            $removed = $false
+            try {
+                if ($move.IsDirectory) {
+                    [void][IO.Directory]::CreateDirectory($move.Destination)
+                } else {
+                    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($move.Destination))
+                    if ($move.Overwrite -and [IO.File]::Exists($move.Destination)) {
+                        [IO.File]::SetAttributes($move.Destination, [IO.FileAttributes]::Normal)
+                        [IO.File]::Delete($move.Destination)
+                        $removed = $true
+                    }
+                    Move-Item -LiteralPath $move.Temp -Destination $move.Destination -Force -ErrorAction Stop
+                }
+                [pscustomobject]@{ Ok = $true; Error = $null; TempRetained = $false }
+            } catch {
+                # If the old file is already gone, keep the verified copy rather than delete the only one left.
+                [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message
+                    TempRetained = [bool]($removed -and [IO.File]::Exists($move.Temp)) }
+            }
+        }
+    }
+    $removeSb = {
+        param([string]$Path)
+        $removeTree = {
+            param([string]$Target)
+            $attributes = [IO.File]::GetAttributes($Target)
+            [IO.File]::SetAttributes($Target, [IO.FileAttributes]::Normal)
+            if (-not ($attributes -band [IO.FileAttributes]::Directory)) { [IO.File]::Delete($Target); return }
+            if (-not ($attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                foreach ($entry in [IO.Directory]::GetFileSystemEntries($Target)) { & $removeTree $entry }
+            }
+            [IO.Directory]::Delete($Target, $false)
+        }
+        if ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path)) { & $removeTree $Path }
+    }
+    $copyPayload = {
+        param([string]$From, [string]$To, [bool]$Tree)
+        if ($Direction -eq 'ToVM') {
+            Copy-Item -LiteralPath $From -ToSession $Session -Destination $To -Recurse:$Tree -Force -ErrorAction Stop
+        } else {
+            Copy-Item -LiteralPath $From -FromSession $Session -Destination $To -Recurse:$Tree -Force -ErrorAction Stop
+        }
+    }
+    $removeTemp = {
+        param([string]$Path)
+        try { $null = Invoke-LabTransferSide $Session $destinationRemote $removeSb @($Path) }
+        catch { Write-Warning "Could not remove temporary transfer item '$Path': $($_.Exception.Message)" }
+    }
+    $assertConnected = {
+        param($ErrorRecord)
+        if ([string]$Session.State -eq 'Opened' -and
+            $ErrorRecord.Exception -isnot [Management.Automation.Remoting.PSRemotingTransportException]) { return }
+        throw ("The PowerShell Direct connection failed during the transfer: {0} Counts before the failure: Completed={1}, Skipped={2}, Failed={3}. Inspect the destination before retrying; a '*.labxfer-*.tmp' item may remain next to it." -f
+            $ErrorRecord.Exception.Message, $state.Completed, $state.Skipped, $state.Failed)
+    }
+    $getMismatch = {
+        param($Expected, $Actual)
+        if ($Expected.Error) { return "could not re-read the source: $($Expected.Error)" }
+        if ($Actual.Error) { return "could not inspect the copied data: $($Actual.Error)" }
+        if (-not $Actual.Exists -or $Actual.IsDirectory) { return 'the copied file is missing from the temporary location' }
+        if ($Actual.Length -ne $Expected.Length) { return "size mismatch after copy (source $($Expected.Length) bytes, copy $($Actual.Length) bytes)" }
+        if ($VerifyHash -and (-not $Expected.Hash -or $Actual.Hash -ne $Expected.Hash)) { return 'SHA-256 mismatch after copy' }
+        return $null
+    }
+    # Unique sibling name: same volume as the destination (so finalize is a rename) and never
+    # mistaken for, or colliding with, a real item.
+    $tempPath = "$DestinationPath.labxfer-$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
+    $retainTemp = $false
+
+    if ($Recurse) {
+        $root = @(Invoke-LabTransferSide $Session $sourceRemote $statSb @([string[]]@($SourcePath), $false))[0]
+        if ($root.Error) { & $fail "${SourcePath}: source could not be inspected: $($root.Error)"; return & $summary }
+        if (-not $root.Exists) { & $fail "${SourcePath}: source does not exist."; return & $summary }
+        if (-not $root.IsDirectory) { & $fail "${SourcePath}: source is a file; a recursive transfer requires a directory."; return & $summary }
+        $destinationRoot = @(Invoke-LabTransferSide $Session $destinationRemote $statSb @([string[]]@($DestinationPath), $false))[0]
+        $rootAction = Resolve-LabTransferItemAction $state $SourcePath $DestinationPath $true $root.IsReparse $destinationRoot $OnConflict
+        if ($rootAction -eq 'Error') { return & $summary }
+
+        try { $items = @(Invoke-LabTransferSide $Session $sourceRemote $listSb @($SourcePath)) }
+        catch {
+            & $assertConnected $_
+            & $fail "${SourcePath}: source tree could not be enumerated: $($_.Exception.Message)"
+            return & $summary
+        }
+        # Every conflict is resolved against the real destination before any payload moves.
+        $destinationStats = @{}
+        if ($items.Count -gt 0) {
+            $paths = [string[]]@($items | ForEach-Object { [IO.Path]::Combine($DestinationPath, $_.RelativePath) })
+            foreach ($stat in @(Invoke-LabTransferSide $Session $destinationRemote $statSb @($paths, $false))) {
+                $destinationStats[[string]$stat.Path] = $stat
+            }
+        }
+        $plan = [Collections.Generic.List[object]]::new()
+        $excludedDirectories = [Collections.Generic.List[string]]::new()
+        foreach ($item in $items) {
+            $sourceItem = [IO.Path]::Combine($SourcePath, $item.RelativePath)
+            $destinationItem = [IO.Path]::Combine($DestinationPath, $item.RelativePath)
+            $underExcluded = @($excludedDirectories | Where-Object {
+                $item.RelativePath.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+            if ($underExcluded) { & $fail "${destinationItem}: not transferred because a parent directory failed."; continue }
+            $action = Resolve-LabTransferItemAction $state $sourceItem $destinationItem ([bool]$item.IsDirectory) `
+                ([bool]$item.IsReparse) $destinationStats[$destinationItem] $OnConflict
+            if ($action -in @('Error', 'Skip')) {
+                if ($item.IsDirectory) { $excludedDirectories.Add([string]$item.RelativePath) }
+                continue
+            }
+            $plan.Add([pscustomobject]@{ RelativePath = [string]$item.RelativePath; IsDirectory = [bool]$item.IsDirectory
+                Source = $sourceItem; Destination = $destinationItem; Temp = [IO.Path]::Combine($tempPath, $item.RelativePath)
+                Action = $action; Done = $false; Length = [long]0 })
+        }
+        $files = @($plan | Where-Object { -not $_.IsDirectory })
+        if ($DryRun) {
+            foreach ($entry in $files) {
+                $verb = if ($entry.Action -eq 'Overwrite') { 'overwrite' } else { 'copy' }
+                Write-Host "Dry run: would $verb $($entry.Source) -> $($entry.Destination)"
+                $state.Completed++
+            }
+            return & $summary
+        }
+
+        try {
+            if ($files.Count -gt 0) {
+                if (@($items | Where-Object { $_.IsReparse }).Count -gt 0) {
+                    # A whole-tree Copy-Item would follow the rejected links, so copy surviving files one by one.
+                    $temporaryDirectories = @(@{ IsDirectory = $true; Destination = $tempPath }) +
+                        @($plan | Where-Object { $_.IsDirectory } | ForEach-Object { @{ IsDirectory = $true; Destination = $_.Temp } })
+                    $null = Invoke-LabTransferSide $Session $destinationRemote $finalizeSb @(, $temporaryDirectories)
+                    foreach ($entry in $files) {
+                        try { & $copyPayload $entry.Source $entry.Temp $false }
+                        catch {
+                            & $assertConnected $_
+                            & $fail "$($entry.Destination): copy failed: $($_.Exception.Message)"
+                            $entry.Done = $true
+                        }
+                    }
+                } else {
+                    & $copyPayload $SourcePath $tempPath $true
+                }
+                $pendingFiles = @($files | Where-Object { -not $_.Done })
+                if ($pendingFiles.Count -gt 0) {
+                    $expected = @(Invoke-LabTransferSide $Session $sourceRemote $statSb @([string[]]@($pendingFiles | ForEach-Object { $_.Source }), $VerifyHash))
+                    $actual = @(Invoke-LabTransferSide $Session $destinationRemote $statSb @([string[]]@($pendingFiles | ForEach-Object { $_.Temp }), $VerifyHash))
+                    for ($i = 0; $i -lt $pendingFiles.Count; $i++) {
+                        $problem = & $getMismatch $expected[$i] $actual[$i]
+                        if ($problem) { & $fail "$($pendingFiles[$i].Destination): $problem"; $pendingFiles[$i].Done = $true }
+                        else { $pendingFiles[$i].Length = [long]$actual[$i].Length }
+                    }
+                }
+            }
+            # Only items that passed the upfront check and verification ever reach the real destination.
+            $finalEntries = @($null) + @($plan | Where-Object { $_.IsDirectory -or -not $_.Done })
+            $moves = @($finalEntries | ForEach-Object {
+                if ($null -eq $_) { @{ IsDirectory = $true; Destination = $DestinationPath } }
+                elseif ($_.IsDirectory) { @{ IsDirectory = $true; Destination = $_.Destination } }
+                else { @{ IsDirectory = $false; Temp = $_.Temp; Destination = $_.Destination; Overwrite = ($_.Action -eq 'Overwrite') } }
+            })
+            $results = @(Invoke-LabTransferSide $Session $destinationRemote $finalizeSb @(, $moves))
+            for ($i = 0; $i -lt $finalEntries.Count; $i++) {
+                $entry = $finalEntries[$i]
+                $label = if ($null -eq $entry) { $DestinationPath } else { $entry.Destination }
+                if ($null -ne $entry -and -not $entry.IsDirectory) { $entry.Done = $true }
+                if (-not $results[$i].Ok) {
+                    if ($results[$i].TempRetained) {
+                        $retainTemp = $true
+                        & $fail "${label}: the existing file was removed but the verified copy could not be moved into place ($($results[$i].Error)); the copy was kept in '$tempPath'."
+                    } else { & $fail "${label}: could not be finalized: $($results[$i].Error)" }
+                } elseif ($null -ne $entry -and -not $entry.IsDirectory) {
+                    $state.Completed++
+                    $state.BytesTransferred += $entry.Length
+                }
+            }
+        } catch {
+            $transferError = $_
+            & $assertConnected $transferError
+            foreach ($entry in @($files | Where-Object { -not $_.Done })) {
+                & $fail "$($entry.Destination): not transferred: $($transferError.Exception.Message)"
+            }
+        } finally {
+            if (-not $retainTemp) { & $removeTemp $tempPath }
+        }
+        return & $summary
+    } else {
+        $source = @(Invoke-LabTransferSide $Session $sourceRemote $statSb @([string[]]@($SourcePath), $false))[0]
+        if ($source.Error) { & $fail "${SourcePath}: source could not be inspected: $($source.Error)"; return & $summary }
+        if (-not $source.Exists) { & $fail "${SourcePath}: source does not exist."; return & $summary }
+        if ($source.IsDirectory -and -not $source.IsReparse) {
+            & $fail "${SourcePath}: source is a directory; use a recursive transfer."
+            return & $summary
+        }
+        # The conflict is resolved before any Copy-Item: a refused or skipped item moves zero bytes.
+        $destination = @(Invoke-LabTransferSide $Session $destinationRemote $statSb @([string[]]@($DestinationPath), $false))[0]
+        $action = Resolve-LabTransferItemAction $state $SourcePath $DestinationPath $false $source.IsReparse $destination $OnConflict
+        if ($action -in @('Error', 'Skip')) { return & $summary }
+        if ($DryRun) {
+            $verb = if ($action -eq 'Overwrite') { 'overwrite' } else { 'copy' }
+            Write-Host "Dry run: would $verb $SourcePath -> $DestinationPath"
+            $state.Completed++
+            return & $summary
+        }
+        try {
+            & $copyPayload $SourcePath $tempPath $false
+            $expected = @(Invoke-LabTransferSide $Session $sourceRemote $statSb @([string[]]@($SourcePath), $VerifyHash))[0]
+            $actual = @(Invoke-LabTransferSide $Session $destinationRemote $statSb @([string[]]@($tempPath), $VerifyHash))[0]
+            $problem = & $getMismatch $expected $actual
+            if ($problem) {
+                & $fail "${DestinationPath}: $problem"
+            } else {
+                $move = @{ IsDirectory = $false; Temp = $tempPath; Destination = $DestinationPath; Overwrite = ($action -eq 'Overwrite') }
+                $result = @(Invoke-LabTransferSide $Session $destinationRemote $finalizeSb @(, @($move)))[0]
+                if ($result.Ok) {
+                    $state.Completed++
+                    $state.BytesTransferred += [long]$actual.Length
+                } elseif ($result.TempRetained) {
+                    $retainTemp = $true
+                    & $fail "${DestinationPath}: the existing file was removed but the verified copy could not be moved into place ($($result.Error)); the copy was kept at '$tempPath'."
+                } else { & $fail "${DestinationPath}: could not be finalized: $($result.Error)" }
+            }
+        } catch {
+            & $assertConnected $_
+            & $fail "${DestinationPath}: not transferred: $($_.Exception.Message)"
+        } finally {
+            if (-not $retainTemp) { & $removeTemp $tempPath }
+        }
+        return & $summary
+    }
+}
+
 function Invoke-LabAction {
     param([guid]$VMId, [string]$Name, [scriptblock]$Action)
     if ($script:LabReadOnly) { Write-Warning 'Read-only mode: VM-changing operations are disabled.'; return }
