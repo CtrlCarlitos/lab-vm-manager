@@ -18,6 +18,9 @@
 - Run normally with no `LAB-*` VMs present (or a filtered view). Confirm the empty-inventory message mentions `N` and that choosing `N` starts the create workflow.
 - Start a create, enter a name that does not start with `LAB-`: it must be rejected with a re-prompt, not accepted.
 - Start a create, enter a name matching an existing VM (case-insensitive): it must be rejected with a re-prompt.
+- Start a create, enter names containing `\`, `/`, `:`, `*` or `?` (e.g. `LAB-a\..\b`): each must be rejected with a re-prompt.
+- At the VM storage root and VHDX storage root prompts, enter a relative path (e.g. `VMs`), a UNC path (e.g. `\\server\share`) and, if available, a mapped network drive: each must be rejected with a re-prompt.
+- Cancel a create at any prompt, then confirm the VM list redraws normally and selecting an existing VM and running an operation (e.g. option 1) still works in the same session.
 - Enter an out-of-range or non-numeric vCPU count (0, negative, text, or above the host's logical processor count): it must be rejected with a re-prompt.
 - Enter an invalid memory spec: for dynamic memory, minimum greater than startup, or startup greater than maximum, or a value not a multiple of 2MB; for static memory, a zero/negative startup value. Each must be rejected with a re-prompt.
 - Reach the preview screen and cancel at the `CREATE <name>` confirmation (type anything else, or press Enter): verify no VM, folder or VHDX was created, and that the audit log has no `create-vm` `STARTED` entry for this attempt.
@@ -29,7 +32,8 @@
 
 - Select a disposable VM while it is Running or Saved; choose option 11: it must refuse with a message requiring Off, and make no change.
 - Shut down normally, then choose option 11. Verify every prompt shows the VM's current value (name, notes, vCPU count, dynamic/static memory, min/startup/max bytes, current switch or Disconnected) and that pressing Enter on every prompt keeps that field unchanged.
-- Repeat with every field left blank through to the diff screen: it must report no changes and return without a confirmation prompt or any audit `COMPLETED` entry.
+- Repeat with every field left blank through to the diff screen: it must report no changes and return without a confirmation prompt or any audit `COMPLETED` entry. Do this on a static-memory VM too (one whose stored minimum/maximum differ from its startup memory, e.g. Hyper-V's 512MB/1TB defaults): it must still report no changes.
+- Change only the casing of the name (e.g. `LAB-Test` to `LAB-test`): it must be shown as a Name change and require the `EDIT <name>` confirmation, not be treated as no change.
 - Enter a new name that does not start with `LAB-`, or that matches another existing VM's name (case-insensitive): it must be rejected with a re-prompt, not accepted.
 - Change only the vCPU count to a valid new value, confirm with the exact `EDIT <name>` phrase, and verify the diff screen listed only that field. After completion, confirm the new vCPU count in Hyper-V Manager or option 1, and that notes/memory/switch are unchanged.
 - Change the memory spec to an invalid combination (e.g. minimum greater than startup under dynamic memory): it must be rejected with a re-prompt, not applied.
@@ -94,6 +98,7 @@
 - Create a non-Standard (recovery/backup) checkpoint on a disposable VM — for example via a backup application, or `Checkpoint-VM -SnapshotType ... ` outside this tool — and attempt option 12: verify it refuses immediately with a message about unresolved recovery/backup checkpoints, before any export/confirmation prompt, and that the VM is unaffected. Remove that checkpoint afterward.
 - On a VM with only Standard checkpoints (or none), choose option 12, answer `Y` to export, and complete the export normally: verify the export reaches `COMPLETE`, then the removal preview is re-shown, and the final `DELETE VM <name> <ID prefix>` confirmation is required before anything is removed.
 - Type the exact `DELETE VM <name> <ID prefix>` confirmation: verify the VM disappears from Hyper-V Manager/inventory, a `<VM ID>-removal-manifest.json` file exists next to the host audit log with `ExportPerformed: true` and a populated `RemovedUtc`, and the console reports the retained disk paths. Confirm those `.vhdx`/`.avhdx` files are still present on disk at the reported paths.
+- After that successful delete, open the host audit log: the final record for this attempt must be `delete-vm-menu` with status `COMPLETED` (carrying the deleted VM's ID/name), not `FAILED_OR_UNCONFIRMED`, and the console must not print an "Operation failed or completion is unconfirmed" warning.
 - Repeat on a different disposable VM, this time answering `N` to skip the export, and complete the deletion: verify the removal manifest shows `ExportPerformed: false`, disk files are still retained on disk, and the VM is gone from inventory.
 - Start a manager session, select a disposable VM while it is Running or Saved, and choose option 12: verify it refuses with a message requiring Off, and makes no change.
 - Confirm no script operation directly deletes `.vhdx`/`.avhdx` files during any of the above; only `Remove-VM` (through the Hyper-V API) is used, never manual file deletion.

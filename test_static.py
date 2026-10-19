@@ -113,6 +113,48 @@ class SourceContract(unittest.TestCase):
         idx_manifest = body.index("'removal-manifest.json'")
         idx_remove = body.index('Remove-VM -VM ')
         self.assertLess(idx_manifest, idx_remove)
+    def test_select_vm_discards_new_vm_return(self):
+        body = self.s.split('function Select-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$null = New-LabVM', body)
+    def test_action_audit_survives_completed_vm_removal(self):
+        body = self.s.split('function Invoke-LabAction {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn('Write-LabAudit $Name $status (Get-LabVM $VMId)', body)
+        self.assertIn('$finalVm = $vm', body)
+        self.assertIn("if ($status -ne 'COMPLETED' -or @(Get-VM -Id $VMId -ErrorAction SilentlyContinue).Count -ne 0)", body)
+        self.assertIn('Write-LabAudit $Name $status $finalVm', body)
+    def test_edit_static_memory_carries_min_max_forward(self):
+        body = self.s.split('function Edit-LabVMSettings {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$newMinimumBytes = $current.MinimumBytes\n', body.replace('\r\n', '\n'))
+        self.assertIn('$newMaximumBytes = $current.MaximumBytes\n', body.replace('\r\n', '\n'))
+        self.assertNotIn('$newMinimumBytes = $newStartupBytes', body)
+        self.assertNotIn('$newMaximumBytes = $newStartupBytes', body)
+    def test_edit_rename_detection_is_case_sensitive(self):
+        body = self.s.split('function Edit-LabVMSettings {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$newName -ceq $current.Name', body)
+    def test_settings_diff_name_notes_case_sensitive(self):
+        body = self.s.split('function Get-LabSettingsDiff {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('[string]$oldValue -cne [string]$newValue', body)
+    def test_create_vm_creates_vhdx_directory_before_new_vhd(self):
+        body = self.s.split('function New-LabVMCore {', 1)[1].split('\nfunction ', 1)[0]
+        idx_check = body.index('VHDX directory already exists')
+        idx_create = body.index('[IO.Directory]::CreateDirectory((Split-Path -Parent $VhdxPath))')
+        idx_new_vhd = body.index('New-VHD -Path $VhdxPath')
+        self.assertLess(idx_check, idx_create)
+        self.assertLess(idx_create, idx_new_vhd)
+    def test_new_vm_name_rejects_path_characters(self):
+        body = self.s.split('function Test-LabNewVMName {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('\'[\\\\/:*?"<>|\\x00-\\x1F]\'', body)
+    def test_create_vm_roots_are_local_absolute_paths(self):
+        body = self.s.split('function New-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        for root in ['$storageRoot', '$vhdxRoot']:
+            self.assertIn(root + " -notmatch '^[A-Za-z]:\\\\'", body)
+            self.assertIn('[IO.DriveInfo]::new([IO.Path]::GetPathRoot(' + root + ')).DriveType -eq [IO.DriveType]::Network', body)
+        export = self.s.split('function Export-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("-notmatch '^[A-Za-z]:\\\\'", export)
+        self.assertIn('[IO.DriveType]::Network', export)
+    def test_set_vm_settings_core_requires_off(self):
+        body = self.s.split('function Set-LabVMSettingsCore {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Assert-LabVMOff', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

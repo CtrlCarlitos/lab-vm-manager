@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    Interactive, local Hyper-V manager restricted to existing LAB-* VMs.
+    Interactive, local Hyper-V manager restricted to VMs whose names begin with LAB-.
 .DESCRIPTION
     Run on the Hyper-V host in elevated Windows PowerShell 5.1 (powershell.exe).
     Select a VM, then an operation. Uses VM/checkpoint IDs, not name wildcards.
@@ -183,6 +183,9 @@ function Get-LabSwitchNames {
 function Test-LabNewVMName {
     param([AllowNull()][AllowEmptyString()][string]$Name, [AllowNull()][AllowEmptyCollection()][string[]]$ExistingNames)
     if (-not (Test-LabVMName $Name)) { return $false }
+    # The name becomes a folder/file name under the storage roots: same character and length rules
+    # as Test-LabCheckpointName, so it cannot escape the root or act as a wildcard.
+    if ($Name.Length -gt 100 -or $Name -ne $Name.Trim() -or $Name -match '[\\/:*?"<>|\x00-\x1F]') { return $false }
     foreach ($existing in $ExistingNames) {
         if ([string]::Equals($existing, $Name, [StringComparison]::OrdinalIgnoreCase)) { return $false }
     }
@@ -300,7 +303,8 @@ function Select-LabVM {
         }
         if ($answer -ieq 'Q') { return $null }
         if ($answer -ieq 'R') { continue }
-        if ($answer -ieq 'N' -and -not $script:LabReadOnly) { New-LabVM; continue }
+        # New-LabVM returns a status string; discard it so it cannot leak into Select-LabVM's output.
+        if ($answer -ieq 'N' -and -not $script:LabReadOnly) { $null = New-LabVM; continue }
         $index = ConvertTo-LabMenuIndex $answer $items.Count
         if ($index -ge 0) { return Get-LabVM ([guid]$items[$index].Id) }
         if (-not $script:LabReadOnly) { Write-Host 'Choose a listed number, N, R or Q.' }
@@ -407,6 +411,8 @@ function New-LabVMCore {
         $vm = New-VM -Name $Name -Generation 2 -Path $VmStoragePath -NoVHD `
             -MemoryStartupBytes $StartupBytes -SwitchName $SwitchName -Confirm:$false -ErrorAction Stop
     }
+    # New-VHD does not create missing parent folders; create the dedicated (verified-absent) VHDX folder.
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $VhdxPath))
     New-VHD -Path $VhdxPath -Dynamic -SizeBytes $VhdxMaximumBytes -Confirm:$false -ErrorAction Stop | Out-Null
     Add-VMHardDiskDrive -VM $vm -Path $VhdxPath -Confirm:$false -ErrorAction Stop
     Set-VMProcessor -VM $vm -Count $VCpuCount -Confirm:$false -ErrorAction Stop
@@ -425,7 +431,7 @@ function New-LabVM {
         $name = Read-LabText 'New VM name, must start with LAB- and be unique (blank cancels)'
         if ($name -eq '') { return 'CANCELLED' }
         if (Test-LabNewVMName $name $existingNames) { break }
-        Write-Host 'Name must start with LAB- (case-insensitive) and not match an existing VM name.'
+        Write-Host 'Name must start with LAB- (case-insensitive), be unique, be at most 100 characters, and contain no path, wildcard or control characters.'
     }
 
     while ($true) {
@@ -433,8 +439,13 @@ function New-LabVM {
         if ($storageInput -ieq 'C') { return 'CANCELLED' }
         $storageRoot = $(if ($storageInput -eq '') { $defaults.VirtualMachinePath } else { $storageInput })
         Write-Host 'An ISO/installer media folder such as E:\ISO is not valid VM storage.'
-        if (Test-Path -LiteralPath $storageRoot -PathType Container) { break }
-        Write-Host 'Enter an existing directory, or C to cancel.'
+        # Same local-only rule as Export-LabVM: absolute local drive path, no UNC/mapped network drive.
+        if ($storageRoot -notmatch '^[A-Za-z]:\\') { Write-Host 'Use an absolute local drive path, e.g. D:\Hyper-V, or C to cancel.'; continue }
+        if (-not (Test-Path -LiteralPath $storageRoot -PathType Container)) { Write-Host 'Enter an existing directory, or C to cancel.'; continue }
+        if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($storageRoot)).DriveType -eq [IO.DriveType]::Network) {
+            Write-Host 'Mapped network drives are outside this tool; use a local disk, or C to cancel.'; continue
+        }
+        break
     }
     $vmStoragePath = Join-Path $storageRoot $name
 
@@ -479,8 +490,13 @@ function New-LabVM {
         $vhdxRootInput = Read-LabText "VHDX storage root [$($defaults.VirtualHardDiskPath)] (blank = default; C cancels)"
         if ($vhdxRootInput -ieq 'C') { return 'CANCELLED' }
         $vhdxRoot = $(if ($vhdxRootInput -eq '') { $defaults.VirtualHardDiskPath } else { $vhdxRootInput })
-        if (Test-Path -LiteralPath $vhdxRoot -PathType Container) { break }
-        Write-Host 'Enter an existing directory, or C to cancel.'
+        # Same local-only rule as Export-LabVM: absolute local drive path, no UNC/mapped network drive.
+        if ($vhdxRoot -notmatch '^[A-Za-z]:\\') { Write-Host 'Use an absolute local drive path, e.g. D:\Hyper-V, or C to cancel.'; continue }
+        if (-not (Test-Path -LiteralPath $vhdxRoot -PathType Container)) { Write-Host 'Enter an existing directory, or C to cancel.'; continue }
+        if ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($vhdxRoot)).DriveType -eq [IO.DriveType]::Network) {
+            Write-Host 'Mapped network drives are outside this tool; use a local disk, or C to cancel.'; continue
+        }
+        break
     }
     $vhdxPath = Join-Path (Join-Path $vhdxRoot $name) "$name.vhdx"
 
@@ -843,8 +859,13 @@ function Get-LabSettingsDiff {
         if ($null -eq $currentProperty -or $null -eq $proposedProperty) { continue }
         $oldValue = $currentProperty.Value
         $newValue = $proposedProperty.Value
-        # DynamicMemoryEnabled is a bool; -ne can misfire on loose equality, so compare it exactly.
-        $changed = $(if ($field -eq 'DynamicMemoryEnabled') { ([bool]$oldValue) -cne ([bool]$newValue) } else { $oldValue -ne $newValue })
+        # DynamicMemoryEnabled: the explicit [bool] casts make this a bool-to-bool comparison regardless
+        # of either operand's original type (PowerShell otherwise converts the right operand to the
+        # left's type). Case sensitivity is irrelevant for bools; -cne behaves exactly like -ne here.
+        # Name/Notes: case-sensitive, so a casing-only rename or Notes edit counts as a real change.
+        $changed = $(if ($field -eq 'DynamicMemoryEnabled') { ([bool]$oldValue) -cne ([bool]$newValue) }
+            elseif ($field -eq 'Name' -or $field -eq 'Notes') { [string]$oldValue -cne [string]$newValue }
+            else { $oldValue -ne $newValue })
         if ($changed) {
             $diff += [pscustomobject]@{ Field = $field; OldValue = $oldValue; NewValue = $newValue }
         }
@@ -974,8 +995,10 @@ function Edit-LabVMSettings {
         $nameInput = Read-LabText "Name [$($current.Name)] (blank keeps current; C cancels)"
         if ($nameInput -ieq 'C') { return 'CANCELLED' }
         $newName = $(if ($nameInput -eq '') { $current.Name } else { $nameInput })
-        if ($newName -eq $current.Name -or (Test-LabNewVMName $newName $existingNames)) { break }
-        Write-Host 'Name must start with LAB- (case-insensitive) and not match an existing VM name.'
+        # Case-sensitive: an exact match keeps the current name; a casing-only change is a real rename
+        # and, like any rename, must pass Test-LabNewVMName (own name excluded from the duplicate check).
+        if ($newName -ceq $current.Name -or (Test-LabNewVMName $newName $existingNames)) { break }
+        Write-Host 'Name must start with LAB- (case-insensitive), be unique, be at most 100 characters, and contain no path, wildcard or control characters.'
     }
 
     $notesInput = Read-LabText "Notes [$($current.Notes)] (blank keeps current)"
@@ -1028,8 +1051,9 @@ function Edit-LabVMSettings {
             if ($parsedOk -and (Test-LabMemorySpec 0 $newStartupBytes 0 $false)) { break }
             Write-Host 'Enter a whole-byte value that is a multiple of 2MB, or blank to keep current.'
         }
-        $newMinimumBytes = $newStartupBytes
-        $newMaximumBytes = $newStartupBytes
+        # Static memory ignores min/max; carry the stored values forward so a no-op edit yields no diff.
+        $newMinimumBytes = $current.MinimumBytes
+        $newMaximumBytes = $current.MaximumBytes
     }
 
     $newSwitchName = $current.SwitchName
@@ -1110,7 +1134,18 @@ function Invoke-LabAction {
         if ($status -notin @('COMPLETED', 'CANCELLED', 'NO_CHANGE')) {
             throw 'Operation returned an unexpected status; inspect the VM before retrying.'
         }
-        Write-LabAudit $Name $status (Get-LabVM $VMId)
+        # A completed delete-VM leaves no VM to re-resolve; only when the action reported COMPLETED
+        # and the VM is genuinely gone, fall back to the object captured before the action.
+        # Any other lookup failure (e.g. renamed out of LAB scope) still counts as a failure.
+        $finalVm = $vm
+        try { $finalVm = Get-LabVM $VMId }
+        catch {
+            $lookupError = $_
+            if ($status -ne 'COMPLETED' -or @(Get-VM -Id $VMId -ErrorAction SilentlyContinue).Count -ne 0) {
+                throw $lookupError
+            }
+        }
+        Write-LabAudit $Name $status $finalVm
         if ($status -eq 'CANCELLED') { Write-Host 'Cancelled.' }
     } catch [Management.Automation.PipelineStoppedException] {
         throw

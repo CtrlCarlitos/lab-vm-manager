@@ -117,6 +117,13 @@ Test-Case 'Paused VM is not Off' {
 Test-Case 'New VM name must start with LAB-' { Assert-Equal (Test-LabNewVMName 'OTHER-Test' @()) $false }
 Test-Case 'New VM name rejects case-insensitive duplicate' { Assert-Equal (Test-LabNewVMName 'lab-test' @('LAB-Test')) $false }
 Test-Case 'New VM name accepts unique name' { Assert-Equal (Test-LabNewVMName 'LAB-New' @('LAB-Test')) $true }
+Test-Case 'New VM name rejects backslash path separator' { Assert-Equal (Test-LabNewVMName 'LAB-a\..\b' @()) $false }
+Test-Case 'New VM name rejects forward slash path separator' { Assert-Equal (Test-LabNewVMName 'LAB-a/b' @()) $false }
+Test-Case 'New VM name rejects wildcard' { Assert-Equal (Test-LabNewVMName 'LAB-*' @()) $false }
+Test-Case 'New VM name rejects drive/colon character' { Assert-Equal (Test-LabNewVMName 'LAB-C:x' @()) $false }
+Test-Case 'New VM name rejects control character' { Assert-Equal (Test-LabNewVMName "LAB-a`tb" @()) $false }
+Test-Case 'New VM name rejects excessive length' { Assert-Equal (Test-LabNewVMName ('LAB-' + ('a' * 97)) @()) $false }
+Test-Case 'New VM name accepts 100-character name' { Assert-Equal (Test-LabNewVMName ('LAB-' + ('a' * 96)) @()) $true }
 Test-Case 'vCPU count zero rejected' { Assert-Equal (Test-LabVCpuCount 0 8) $false }
 Test-Case 'vCPU count above host max rejected' { Assert-Equal (Test-LabVCpuCount 9 8) $false }
 Test-Case 'vCPU count within range accepted' { Assert-Equal (Test-LabVCpuCount 4 8) $true }
@@ -148,6 +155,29 @@ Test-Case 'Diff uses exact boolean comparison for DynamicMemoryEnabled' {
     $diff = Get-LabSettingsDiff $current $proposed
     Assert-Equal $diff.Count 1
     Assert-Equal $diff[0].Field 'DynamicMemoryEnabled'
+}
+Test-Case 'Diff reports a case-only Name change' {
+    $current = [pscustomobject]@{ Name='LAB-Test' }
+    $proposed = [pscustomobject]@{ Name='lab-test' }
+    $diff = Get-LabSettingsDiff $current $proposed
+    Assert-Equal $diff.Count 1
+    Assert-Equal $diff[0].Field 'Name'
+    Assert-Equal $diff[0].NewValue 'lab-test'
+}
+Test-Case 'Diff reports a case-only Notes change' {
+    $current = [pscustomobject]@{ Notes='build box' }
+    $proposed = [pscustomobject]@{ Notes='Build Box' }
+    $diff = Get-LabSettingsDiff $current $proposed
+    Assert-Equal $diff.Count 1
+    Assert-Equal $diff[0].Field 'Notes'
+}
+Test-Case 'Static-memory no-op edit carrying min/max forward yields no diff' {
+    # Mirrors Edit-LabVMSettings' static branch: unequal stored min/max (Hyper-V defaults) carried forward.
+    $current = [pscustomobject]@{ Name='LAB-Test'; Notes=''; VCpuCount=2; StartupBytes=2GB;
+        MinimumBytes=512MB; MaximumBytes=1TB; DynamicMemoryEnabled=$false; SwitchName=$null }
+    $proposed = [pscustomobject]@{ Name='LAB-Test'; Notes=''; VCpuCount=2; StartupBytes=2GB;
+        MinimumBytes=$current.MinimumBytes; MaximumBytes=$current.MaximumBytes; DynamicMemoryEnabled=$false; SwitchName=$null }
+    Assert-Equal (Get-LabSettingsDiff $current $proposed).Count 0
 }
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
