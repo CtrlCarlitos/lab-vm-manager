@@ -210,6 +210,17 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("'copy-to-vm-menu' -AllowReadOnly", body)
         self.assertIn("'copy-from-vm-menu' -AllowReadOnly", body)
+    def test_transfer_params_exist(self):
+        for p in ['$CopyToVM', '$CopyFromVM', '$SourcePath', '$DestinationPath', '$OnConflict', '$DryRun', '$NonInteractive', '$VerifyHash', '$Credential']:
+            self.assertIn(p, self.s.split('param(', 1)[1].split(')\n\n', 1)[0])
+    def test_copyto_and_copyfrom_mutually_exclusive(self):
+        self.assertRegex(self.s, r'CopyToVM.{0,200}CopyFromVM|CopyFromVM.{0,200}CopyToVM')
+    def test_parameter_mode_does_not_launch_menu(self):
+        body = self.s.rsplit("if ($MyInvocation.InvocationName -ne '.')", 1)[1]
+        self.assertIn('CopyToVM', body)
+    def test_credential_never_passed_as_plaintext_arg(self):
+        self.assertNotIn('-Password ', self.s)
+        self.assertNotRegex(self.s, r'\$Credential\.GetNetworkCredential\(\)\.Password')
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

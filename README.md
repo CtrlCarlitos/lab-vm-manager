@@ -99,6 +99,28 @@ Prompts for the guest's Windows credentials (never stored), opens a PowerShell D
 
 Collects a source path, a destination path (blank cancels either), recursion (asked only when the source resolves to a directory, checked by inspection rather than a blind prompt), a conflict policy chosen from a numbered list (`Error`, `Skip` or `Overwrite`; default `Error`), and whether to verify a SHA-256 hash after copying. A preview of the direction, VM name/ID, both resolved paths, recursion, conflict policy and verify-hash choice is shown, and you then type the exact `COPY TO VM <name>` or `COPY FROM VM <name>` confirmation. The transfer itself uses PowerShell Direct and the same temp-sibling-then-finalize engine described below; the console reports the returned completed/skipped/failed counts and any per-item errors. A partial failure is still reported as a completed operation (with a prominent warning listing what failed), since "some items failed" is not the same as "the whole operation was cancelled." The VM must be `Running`.
 
+## Parameter mode: file transfer
+
+Pass `-CopyToVM` or `-CopyFromVM` on the command line to run a single file-transfer operation non-interactively and exit, instead of launching the menu. The two switches are mutually exclusive; supplying both (or neither, while still using either switch) throws before anything else runs.
+
+```
+powershell.exe -NoProfile -File .\Lab-VM.ps1 -CopyToVM -VMName LAB-dev -SourcePath C:\code\app -DestinationPath C:\app -Recurse -OnConflict Skip -VerifyHash
+```
+
+Parameters:
+
+- `-CopyToVM` / `-CopyFromVM` — direction switch; pick exactly one.
+- `-VMName` / `-VMId` — identify the target VM; pick exactly one. `-VMName` matches case-insensitively against the current VM inventory with no wildcard expansion; zero or more than one match throws.
+- `-SourcePath` / `-DestinationPath` — required paths, on the side implied by the direction switch (e.g. `-CopyToVM` reads `-SourcePath` from this host and writes `-DestinationPath` on the VM).
+- `-Recurse` — copy a directory source's contents recursively.
+- `-OnConflict` — `Error` (default), `Skip`, or `Overwrite`.
+- `-DryRun` — report what would be copied without changing any files.
+- `-NonInteractive` — never prompt; `-Credential` must already supply what's needed.
+- `-VerifyHash` — verify a SHA-256 hash of each copied file after the copy.
+- `-Credential` — a `PSCredential` for the guest Windows account. This only works when `Lab-VM.ps1` is dot-sourced (`. .\Lab-VM.ps1`) or invoked from a calling Windows PowerShell session that already holds a `PSCredential` object in a variable; **never pass a plaintext password on the command line** (there is no `-Password` parameter, and none will be added).
+
+Exit-code contract: the process exits `0` only when the transfer summary reports `Failed -eq 0` (including when `-DryRun` is set and nothing failed); any failed item, or a thrown validation/setup error, exits non-zero. The same host assertion, log initialization, and `session` `STARTED`/`ENDED` audit records that interactive mode writes are also written in parameter mode; only the menu loop itself is skipped.
+
 ## First baseline
 
 1. Install/update the guest, finish required reboots, and shut it down **normally**.

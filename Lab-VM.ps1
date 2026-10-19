@@ -22,6 +22,35 @@
 .PARAMETER TimeoutSeconds
     Maximum polling interval for VM start/shutdown state (default 180 seconds).
     Does not impose a timeout on Hyper-V checkpoint/export/merge operations.
+.PARAMETER CopyToVM
+    Parameter mode: copy a file/directory from this host to the VM, then exit.
+    Mutually exclusive with -CopyFromVM; requires exactly one of -VMName/-VMId.
+.PARAMETER CopyFromVM
+    Parameter mode: copy a file/directory from the VM to this host, then exit.
+    Mutually exclusive with -CopyToVM; requires exactly one of -VMName/-VMId.
+.PARAMETER VMName
+    Exact, case-insensitive VM name for parameter-mode transfer. Mutually
+    exclusive with -VMId; exactly one of the two is required.
+.PARAMETER VMId
+    VM id for parameter-mode transfer. Mutually exclusive with -VMName.
+.PARAMETER SourcePath
+    Parameter-mode transfer source path, on the side -CopyToVM/-CopyFromVM implies.
+.PARAMETER DestinationPath
+    Parameter-mode transfer destination path, on the side -CopyToVM/-CopyFromVM implies.
+.PARAMETER Recurse
+    Copy a directory source's contents recursively (parameter mode).
+.PARAMETER OnConflict
+    Destination conflict policy for parameter mode: Error (default), Skip, or Overwrite.
+.PARAMETER DryRun
+    Parameter mode: report what would be copied without changing any files.
+.PARAMETER NonInteractive
+    Parameter mode: never prompt; -Credential must be supplied when it is needed.
+.PARAMETER VerifyHash
+    Parameter mode: verify a SHA-256 hash of each copied file after the copy.
+.PARAMETER Credential
+    Guest Windows credential for parameter-mode transfer. Only pass an existing
+    PSCredential object (dot-source this script or build one in the calling
+    session) -- never a plaintext password on the command line.
 .EXAMPLE
     powershell.exe -NoProfile -File .\Lab-VM.ps1 -ReadOnly
 .EXAMPLE
@@ -37,7 +66,20 @@ param(
     [string]$LogRoot = '',
     [string]$ExportRoot = '',
     [ValidateRange(30, 3600)]
-    [int]$TimeoutSeconds = 180
+    [int]$TimeoutSeconds = 180,
+    [switch]$CopyToVM,
+    [switch]$CopyFromVM,
+    [string]$VMName,
+    [Nullable[guid]]$VMId,
+    [string]$SourcePath,
+    [string]$DestinationPath,
+    [switch]$Recurse,
+    [ValidateSet('Error', 'Skip', 'Overwrite')]
+    [string]$OnConflict = 'Error',
+    [switch]$DryRun,
+    [switch]$NonInteractive,
+    [switch]$VerifyHash,
+    [PSCredential]$Credential
 )
 
 Set-StrictMode -Version Latest
@@ -163,6 +205,19 @@ function Get-LabVM {
         throw "Refusing VM '$($vm.Name)' [$VMId]: its current name does not start with LAB-."
     }
     return $vm
+}
+
+function Resolve-LabVMByNameOrId {
+    param([AllowEmptyString()][string]$VMName, [Nullable[guid]]$VMId)
+    $hasName = -not [string]::IsNullOrEmpty($VMName)
+    $hasId = $null -ne $VMId
+    if ($hasName -eq $hasId) { throw 'Supply exactly one of -VMName or -VMId.' }
+    if ($hasId) { return [guid]$VMId }
+    # Exact, case-insensitive match only; no wildcard expansion of operator-supplied text.
+    $matches = @(Get-VM -ErrorAction Stop | Where-Object { $_.Name -ieq $VMName })
+    if ($matches.Count -eq 0) { throw "No matching VM named '$VMName'." }
+    if ($matches.Count -gt 1) { throw "Ambiguous VM name '$VMName' matches $($matches.Count) VMs; use -VMId instead." }
+    return [guid]$matches[0].Id
 }
 
 function Get-LabHostDefaults {
@@ -1764,11 +1819,59 @@ function Start-LabVMManager {
     }
 }
 
+function Start-LabFileTransferCli {
+    param(
+        [bool]$CopyToVM, [bool]$CopyFromVM, [string]$VMName, [Nullable[guid]]$VMId,
+        [string]$SourcePath, [string]$DestinationPath, [bool]$Recurse, [string]$OnConflict,
+        [bool]$DryRun, [bool]$NonInteractive, [bool]$VerifyHash,
+        [AllowNull()][PSCredential]$Credential, [string]$RequestedLogRoot
+    )
+    if ($CopyToVM -and $CopyFromVM) { throw 'Supply exactly one of -CopyToVM or -CopyFromVM, not both.' }
+    $hasVMName = -not [string]::IsNullOrEmpty($VMName)
+    $hasVMId = $null -ne $VMId
+    if ($hasVMName -eq $hasVMId) { throw 'Supply exactly one of -VMName or -VMId.' }
+    $direction = $(if ($CopyToVM) { 'ToVM' } else { 'FromVM' })
+    $ErrorActionPreference = 'Stop'
+    Assert-LabHost
+    Initialize-LabLog $RequestedLogRoot
+    Write-LabAudit 'session' 'STARTED' $null ("ReadOnly={0}" -f $script:LabReadOnly)
+    try {
+        $resolvedVMId = Resolve-LabVMByNameOrId -VMName $VMName -VMId $VMId
+        $result = Invoke-LabFileTransfer -VMId $resolvedVMId -Direction $direction -SourcePath $SourcePath `
+            -DestinationPath $DestinationPath -Recurse $Recurse -OnConflict $OnConflict -VerifyHash $VerifyHash `
+            -DryRun $DryRun -Credential $Credential -NonInteractive $NonInteractive
+        Write-Host "Completed: $($result.Completed); Skipped: $($result.Skipped); Failed: $($result.Failed); Bytes transferred: $($result.BytesTransferred)"
+        if ($result.Failed -gt 0) {
+            foreach ($errorMessage in $result.Errors) { Write-Warning "  $errorMessage" }
+        }
+        return [int]$result.Failed
+    } finally {
+        try { Write-LabAudit 'session' 'ENDED' }
+        catch { Write-Warning 'Could not write the final audit entry.' }
+        Write-Host "Audit log: $script:LabLogFile"
+    }
+}
+
 # Dot-sourcing loads functions without launching the UI; normal invocation runs it.
 if ($MyInvocation.InvocationName -ne '.') {
-    try { Start-LabVMManager -RequestedLogRoot $LogRoot }
-    catch {
-        Write-Error -Message $_.Exception.Message -ErrorAction Continue
-        exit 1
+    if ($CopyToVM -or $CopyFromVM) {
+        try {
+            $failedCount = Start-LabFileTransferCli -CopyToVM ([bool]$CopyToVM) -CopyFromVM ([bool]$CopyFromVM) `
+                -VMName $VMName -VMId $VMId -SourcePath $SourcePath -DestinationPath $DestinationPath `
+                -Recurse ([bool]$Recurse) -OnConflict $OnConflict -DryRun ([bool]$DryRun) `
+                -NonInteractive ([bool]$NonInteractive) -VerifyHash ([bool]$VerifyHash) -Credential $Credential `
+                -RequestedLogRoot $LogRoot
+            exit $(if ($failedCount -eq 0) { 0 } else { 1 })
+        }
+        catch {
+            Write-Error -Message $_.Exception.Message -ErrorAction Continue
+            exit 1
+        }
+    } else {
+        try { Start-LabVMManager -RequestedLogRoot $LogRoot }
+        catch {
+            Write-Error -Message $_.Exception.Message -ErrorAction Continue
+            exit 1
+        }
     }
 }
