@@ -1,6 +1,6 @@
 # LAB VM Manager — v1.0.0
 
-A standalone menu-driven PowerShell script for managing **existing local Hyper-V VMs whose names start with `LAB-`**. The prefix check is case-insensitive. It is intended for your Linux/Windows development-and-test lab, not production VMs.
+A standalone menu-driven PowerShell script for managing **local Hyper-V VMs whose names start with `LAB-`**: creating them, operating and checkpointing them, editing their basic settings, and deleting them while retaining their virtual disks. The prefix check is case-insensitive. It is intended for your Linux/Windows development-and-test lab, not production VMs.
 
 **Run the manager on the physical Hyper-V host, not inside either guest.** Use elevated **Windows PowerShell 5.1 (`powershell.exe`)**. The manager deliberately refuses PowerShell Core/7 rather than silently importing Hyper-V through a compatibility session. You can invoke `powershell.exe` from an elevated Windows Terminal tab running PowerShell 7.
 
@@ -11,7 +11,7 @@ A standalone menu-driven PowerShell script for managing **existing local Hyper-V
 - `MANUAL-TESTS.md`: acceptance checklist for a disposable VM.
 - `test_static.py`: source-level regression checks; optional, requires Python.
 
-The script has been source-reviewed and its 22 source-contract checks passed. It has since been run in Windows PowerShell 5.1: all 42 `Test-LabVM.ps1` helper tests pass, and it has been exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM workflow — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
+The script has been source-reviewed: all 43 `test_static.py` source-contract checks pass, and all 56 `Test-LabVM.ps1` helper tests pass in Windows PowerShell 5.1. An earlier version (before the Create, Edit and Delete VM workflows were added) was exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, checkpoint deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM, Edit VM settings and Delete VM workflows — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
 
 ## Start
 
@@ -65,7 +65,7 @@ The first menu lists matching VMs, current state, CPU count, assigned memory and
 
 ### Create VM (`N`)
 
-Collects, in order: a unique `LAB-` name; a VM storage root (defaults to the host's configured VM path; an ISO/installer media folder such as `E:\ISO` is explicitly called out as invalid storage); vCPU count (bounded by host logical processors); startup RAM and a static/dynamic memory choice with minimum/maximum when dynamic; a VHDX storage root and maximum capacity; and a virtual switch, or an explicit "Disconnected" choice. Each new VM gets its own dedicated storage subfolder and VHDX subfolder, so creation refuses to proceed if that destination already exists. The VM is always created as **Generation 2**, with the same Standard/no-automatic-checkpoints policy used elsewhere in this tool. A full preview is shown before the `CREATE <name>` confirmation; creation itself is also protected by a dedicated per-name creation lock, and is blocked entirely in `-ReadOnly` mode.
+Collects, in order: a unique `LAB-` name (at most 100 characters, with no path, wildcard or control characters, since it becomes a folder and file name); a VM storage root (defaults to the host's configured VM path; an ISO/installer media folder such as `E:\ISO` is explicitly called out as invalid storage); vCPU count (bounded by host logical processors); startup RAM and a static/dynamic memory choice with minimum/maximum when dynamic; a VHDX storage root and maximum capacity; and a virtual switch, or an explicit "Disconnected" choice. Both storage roots must be existing absolute local drive paths (e.g. `D:\Hyper-V`); relative paths, UNC paths and mapped network drives are rejected, as for exports. Each new VM gets its own dedicated storage subfolder and VHDX subfolder, so creation refuses to proceed if that destination already exists. The VM is always created as **Generation 2**, with the same Standard/no-automatic-checkpoints policy used elsewhere in this tool. A full preview is shown before the `CREATE <name>` confirmation; creation itself is also protected by a dedicated per-name creation lock, and is blocked entirely in `-ReadOnly` mode.
 
 The selected-VM menu provides:
 
@@ -149,7 +149,7 @@ Option `12` calls Hyper-V's `Remove-VM`, which unregisters the VM and its config
 
 ## Intentionally not included
 
-No VM clone/import, OS activation/licensing, remote hosts, automatic login, dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool.
+No guest OS installation, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing, remote hosts, automatic login, guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool.
 
 ## Primary references
 
