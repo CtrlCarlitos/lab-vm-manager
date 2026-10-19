@@ -166,7 +166,7 @@ git commit -m "feat: add SSH connection settings persistence and address discove
 - Consumes: `Get-LabSshToolingInfo` (Task 1), `Get-LabSshConnectionSettings` (Task 2), `Assert-LabVMRunning` (existing).
 - Produces:
   - `Resolve-LabSshAuthMode([AllowNull()][AllowEmptyString()][string]$IdentityFilePath, [bool]$NonInteractive)` → `string`, `'KeyAgent'` or `'InteractivePassword'`: `'KeyAgent'` when `$IdentityFilePath` is non-empty; otherwise, when `-not $NonInteractive`, `'InteractivePassword'`; when `$NonInteractive` and `$IdentityFilePath` is empty, throws naming `-Credential`-equivalent-for-SSH (an identity file) as required — mirrors `Resolve-LabWindowsCredential`'s exact never-prompt-under-NonInteractive guarantee. Pure, fully unit-testable.
-  - `Invoke-LabSftpCommand([string]$HostNameOrAddress, [int]$Port, [string]$UserName, [AllowNull()][AllowEmptyString()][string]$IdentityFilePath, [string]$BatchFilePath, [string]$AuthMode)` → `[pscustomobject]@{ ExitCode = [int]; Output = [string[]] }`. Builds the `sftp.exe` argument list per the Global Constraints: `-o BatchMode=yes -o StrictHostKeyChecking=yes -P $Port -i $IdentityFilePath -b $BatchFilePath $UserName@$HostNameOrAddress` for `'KeyAgent'` (omit `-i` when `$IdentityFilePath` is empty, relying on agent/default identities); `-o StrictHostKeyChecking=yes -P $Port -b $BatchFilePath $UserName@$HostNameOrAddress` for `'InteractivePassword'` — **no `-o BatchMode=yes`, and the call must not redirect stdin/stdout/stderr**, so the operator's console is the real terminal OpenSSH prompts against. Runs via the `&` call operator (not `Start-Process`) so the console is inherited by default. Captures `$LASTEXITCODE` and whatever output streams were captured (interactive mode's prompts are NOT part of `Output` — they go straight to the real console, not through this function's return value).
+  - `Invoke-LabSftpCommand([string]$HostNameOrAddress, [int]$Port, [string]$UserName, [AllowNull()][AllowEmptyString()][string]$IdentityFilePath, [string]$BatchFilePath, [string]$AuthMode)` → `[pscustomobject]@{ ExitCode = [int]; Output = [string[]] }`. **First statement, before anything else:** calls `Get-LabSshToolingInfo` (Task 1) and throws a clear message naming `ssh.exe`/`sftp.exe` as missing if `Available` is `$false` — this is the one, single integration point for that check; both `Test-LabSshConnection` and `Copy-LabTransferItemSftp` (Task 4) call into this function for every real SFTP operation, so neither needs its own separate tooling check. Then builds the `sftp.exe` argument list per the Global Constraints: `-o BatchMode=yes -o StrictHostKeyChecking=yes -P $Port -i $IdentityFilePath -b $BatchFilePath $UserName@$HostNameOrAddress` for `'KeyAgent'` (omit `-i` when `$IdentityFilePath` is empty, relying on agent/default identities); `-o StrictHostKeyChecking=yes -P $Port -b $BatchFilePath $UserName@$HostNameOrAddress` for `'InteractivePassword'` — **no `-o BatchMode=yes`, and the call must not redirect stdin/stdout/stderr**, so the operator's console is the real terminal OpenSSH prompts against. Runs via the `&` call operator (not `Start-Process`) so the console is inherited by default. Captures `$LASTEXITCODE` and whatever output streams were captured (interactive mode's prompts are NOT part of `Output` — they go straight to the real console, not through this function's return value). (Task 4's separate `ssh.exe ... sha256sum` hash-verification call does *not* go through this function and so isn't covered by this check — accepted as a minor residual gap, since `ssh.exe`/`sftp.exe` ship together in the same OpenSSH package and are overwhelmingly likely to be present or absent together.)
   - `Test-LabSshConnection(guid $VMId)` → no return value (console-reporting only, like `Test-LabTransferConnection`); requires `Get-LabSshConnectionSettings $VMId` to be non-null (else reports "not configured, use Configure SSH connection first"); calls `Assert-LabVMRunning`; builds a one-line batch file (`pwd`) in a temp location; calls `Invoke-LabSftpCommand` with `Resolve-LabSshAuthMode`'s result; reports success/failure; always deletes the temp batch file in `finally`. Not wrapped in `Invoke-LabAction` (no mutation) — same precedent as `Test-LabTransferConnection`.
   - `Update-LabSshKnownHost([string]$HostNameOrAddress, [int]$Port)`: previews what's about to be removed (names the host:port being cleared), requires `Confirm-LabText "UPDATE KNOWN HOST $HostNameOrAddress"`, then runs `ssh-keygen.exe -R "[$HostNameOrAddress]:$Port"` (or `-R $HostNameOrAddress` when `$Port` is the default `22`, matching `ssh-keygen`'s own bracket-notation convention for non-default ports) — never edits `known_hosts` directly.
 
@@ -200,16 +200,21 @@ Expected: PASS on all four new cases plus everything existing.
 - [ ] **Step 5: Write failing `test_static.py` cases for the other three functions**
 
 ```python
+def test_sftp_command_checks_tooling_before_invoking(self):
+    body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
+    self.assertIn('Get-LabSshToolingInfo', body)
+    idx_check = body.index('Get-LabSshToolingInfo')
+    idx_sftp = body.index('sftp.exe')
+    self.assertLess(idx_check, idx_sftp)
 def test_sftp_command_uses_batch_mode_for_key_auth(self):
     body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
     self.assertIn('BatchMode=yes', body)
     self.assertIn('StrictHostKeyChecking=yes', body)
-def test_sftp_command_interactive_mode_has_no_batchmode(self):
+def test_sftp_command_recognizes_interactive_password_mode(self):
+    # Presence check only — this does not prove BatchMode=yes is absent from this
+    # specific branch's code path at runtime, only that the branch exists at all.
     body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
     self.assertIn("'InteractivePassword'", body)
-def test_sftp_command_never_uses_controlmaster(self):
-    self.assertNotIn('ControlMaster', self.s)
-    self.assertNotIn('ControlPath', self.s)
 def test_connection_test_requires_configured_settings(self):
     body = self.s.split('function Test-LabSshConnection {', 1)[1].split('\nfunction ', 1)[0]
     self.assertIn('Get-LabSshConnectionSettings', body)
@@ -218,12 +223,18 @@ def test_update_known_host_requires_confirmation(self):
     self.assertIn('Confirm-LabText', body)
     self.assertIn('ssh-keygen', body)
     self.assertNotRegex(body, r'Set-Content[^\r\n]*known_hosts')
+def test_sftp_command_never_uses_controlmaster(self):
+    # Standing invariant, not a red/green case: this is already true on unmodified
+    # code (the substring doesn't exist anywhere yet) and must *stay* true — it can
+    # only ever go red if a future change reintroduces ControlMaster/ControlPath.
+    self.assertNotIn('ControlMaster', self.s)
+    self.assertNotIn('ControlPath', self.s)
 ```
 
 - [ ] **Step 6: Run `test_static.py` and confirm it fails**
 
 Run: `python test_static.py`
-Expected: FAIL on all five new cases.
+Expected: FAIL on the first five cases (`test_sftp_command_checks_tooling_before_invoking`, `test_sftp_command_uses_batch_mode_for_key_auth`, `test_sftp_command_recognizes_interactive_password_mode`, `test_connection_test_requires_configured_settings`, `test_update_known_host_requires_confirmation`) — none of those functions/branches exist yet. `test_sftp_command_never_uses_controlmaster` is a standing invariant and already passes on unmodified code; it isn't expected to go red.
 
 - [ ] **Step 7: Implement `Invoke-LabSftpCommand`, `Test-LabSshConnection`, `Update-LabSshKnownHost`**
 
