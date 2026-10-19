@@ -187,6 +187,14 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
         for field in ['Completed', 'Skipped', 'Failed', 'BytesTransferred', 'Errors']:
             self.assertIn(field, body)
+    def test_transfer_engine_abandons_tree_when_no_file_verified(self):
+        # When every planned file fails, the directory skeleton must not be created at the destination.
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        guard = re.search(r'if \(\$files\.Count -gt 0 -and @\(\$files \| Where-Object \{ -not \$_\.Done \}\)\.Count -eq 0\) \{', body)
+        self.assertIsNotNone(guard)
+        rest = body[guard.end():]
+        self.assertIn('return & $summary', rest.split('\n            }', 1)[0])
+        self.assertLess(guard.start(), body.index('$finalEntries ='))
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

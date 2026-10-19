@@ -1425,6 +1425,14 @@ function Copy-LabTransferItem {
                     }
                 }
             }
+            # No file survived (for example, a remote copy nested the tree one level deeper): abandon the
+            # whole operation without touching the destination, not even to create its directory skeleton.
+            if ($files.Count -gt 0 -and @($files | Where-Object { -not $_.Done }).Count -eq 0) {
+                $abandoned = "directory transfer abandoned: none of the $($files.Count) file(s) copied verified, so nothing was created or changed under '$DestinationPath'."
+                & $fail "${DestinationPath}: $abandoned"
+                foreach ($entry in @($plan | Where-Object { $_.IsDirectory })) { & $fail "$($entry.Destination): not created; $abandoned" }
+                return & $summary
+            }
             # Only items that passed the upfront check and verification ever reach the real destination.
             $finalEntries = @($null) + @($plan | Where-Object { $_.IsDirectory -or -not $_.Done })
             $moves = @($finalEntries | ForEach-Object {
