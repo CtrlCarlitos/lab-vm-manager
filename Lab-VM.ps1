@@ -407,6 +407,98 @@ function Test-LabTransferConnection {
     }
 }
 
+function Resolve-LabSshAuthMode {
+    param([AllowNull()][AllowEmptyString()][string]$IdentityFilePath, [bool]$NonInteractive)
+    if (-not [string]::IsNullOrEmpty($IdentityFilePath)) { return 'KeyAgent' }
+    if ($NonInteractive) {
+        throw 'An SSH identity file is required in non-interactive mode (the SSH equivalent of -Credential). Supply an identity file.'
+    }
+    return 'InteractivePassword'
+}
+
+function Invoke-LabSftpCommand {
+    param(
+        [string]$HostNameOrAddress,
+        [int]$Port,
+        [string]$UserName,
+        [AllowNull()][AllowEmptyString()][string]$IdentityFilePath,
+        [string]$BatchFilePath,
+        [string]$AuthMode
+    )
+    # Local override only (does not leak to the caller): callers such as Start-LabVMManager run
+    # with $ErrorActionPreference = 'Stop', under which any captured native stderr line -- a plain
+    # connection/auth failure, not a PowerShell error -- would otherwise be promoted to a
+    # terminating exception instead of flowing into Output alongside ExitCode below.
+    $ErrorActionPreference = 'Continue'
+    $tooling = Get-LabSshToolingInfo
+    if (-not $tooling.Available) {
+        throw 'ssh.exe/sftp.exe (Windows OpenSSH Client) were not found. Install the OpenSSH Client optional feature on this host.'
+    }
+    $target = "$UserName@$HostNameOrAddress"
+    switch ($AuthMode) {
+        'KeyAgent' {
+            $arguments = @('-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-P', $Port)
+            if (-not [string]::IsNullOrEmpty($IdentityFilePath)) { $arguments += @('-i', $IdentityFilePath) }
+            $arguments += @('-b', $BatchFilePath, $target)
+            $raw = & sftp.exe @arguments 2>&1
+            $exitCode = $LASTEXITCODE
+            $output = [string[]]@($raw | ForEach-Object { [string]$_ })
+        }
+        'InteractivePassword' {
+            $arguments = @('-o', 'StrictHostKeyChecking=yes', '-P', $Port, '-b', $BatchFilePath, $target)
+            # No -o BatchMode=yes and no stream redirection here: OpenSSH's own password and
+            # host-key-trust prompts must reach the operator's real console unmodified, so a
+            # future reader should not "fix" this branch to match the batch-mode one above.
+            & sftp.exe @arguments
+            $exitCode = $LASTEXITCODE
+            $output = [string[]]@()
+        }
+        default { throw "Unknown SSH auth mode '$AuthMode'." }
+    }
+    return [pscustomobject]@{ ExitCode = [int]$exitCode; Output = $output }
+}
+
+function Test-LabSshConnection {
+    param([guid]$VMId)
+    $settings = Get-LabSshConnectionSettings $VMId
+    if ($null -eq $settings) {
+        Write-Host 'SSH connection is not configured for this VM. Use Configure SSH connection first.'
+        return
+    }
+    $batchPath = $null
+    try {
+        $null = Assert-LabVMRunning $VMId
+        $batchPath = Join-Path ([IO.Path]::GetTempPath()) ('labssh-' + [guid]::NewGuid().ToString('N') + '.batch')
+        [IO.File]::WriteAllText($batchPath, "pwd`n")
+        $authMode = Resolve-LabSshAuthMode $settings.IdentityFilePath $false
+        $result = Invoke-LabSftpCommand $settings.HostNameOrAddress $settings.Port $settings.UserName `
+            $settings.IdentityFilePath $batchPath $authMode
+        if ($result.ExitCode -eq 0) {
+            Write-Host "Connection succeeded ($authMode)."
+        } else {
+            Write-Warning "Connection test failed (sftp exit code $($result.ExitCode))."
+        }
+    } catch {
+        Write-Warning "Connection test failed: $($_.Exception.Message)"
+    } finally {
+        if ($batchPath -and [IO.File]::Exists($batchPath)) { [IO.File]::Delete($batchPath) }
+    }
+}
+
+function Update-LabSshKnownHost {
+    param([string]$HostNameOrAddress, [int]$Port)
+    # ssh-keygen's own bracket notation marks a non-default port; port 22 stays unbracketed.
+    $target = if ($Port -eq 22) { $HostNameOrAddress } else { "[$HostNameOrAddress]:$Port" }
+    Write-Host "This clears the known_hosts entry for $target so a changed host key can be re-trusted."
+    if (-not (Confirm-LabText "UPDATE KNOWN HOST $HostNameOrAddress")) { return }
+    & ssh-keygen.exe -R $target
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Known-hosts entry for $target removed."
+    } else {
+        Write-Warning "ssh-keygen -R exited with code $LASTEXITCODE; known_hosts may be unchanged."
+    }
+}
+
 function Wait-LabVMState {
     param([guid]$VMId, [string]$State)
     $watch = [Diagnostics.Stopwatch]::StartNew()

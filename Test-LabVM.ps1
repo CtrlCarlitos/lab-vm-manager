@@ -49,7 +49,8 @@ Write-Host 'PASS: the full script parses in this PowerShell runtime.'
 $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointName',
     'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
     'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
-    'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath')
+    'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath',
+    'Resolve-LabSshAuthMode')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -195,6 +196,12 @@ Test-Case 'Static-memory no-op edit carrying min/max forward yields no diff' {
         MinimumBytes=$current.MinimumBytes; MaximumBytes=$current.MaximumBytes; DynamicMemoryEnabled=$false; SwitchName=$null }
     Assert-Equal (Get-LabSettingsDiff $current $proposed).Count 0
 }
+Test-Case 'Identity file present selects KeyAgent mode' { Assert-Equal (Resolve-LabSshAuthMode 'C:\keys\id_ed25519' $false) 'KeyAgent' }
+Test-Case 'No identity file, interactive allowed, selects InteractivePassword' { Assert-Equal (Resolve-LabSshAuthMode '' $false) 'InteractivePassword' }
+Test-Case 'No identity file under NonInteractive throws' {
+    Assert-Throws { Resolve-LabSshAuthMode '' $true } 'identity file'
+}
+Test-Case 'Identity file present under NonInteractive still selects KeyAgent' { Assert-Equal (Resolve-LabSshAuthMode 'C:\keys\id_ed25519' $true) 'KeyAgent' }
 
 # --- Transfer engine (Copy-LabTransferItem) against a local temp tree ---
 # The engine's functions are loaded from the AST with only the PSSession parameter type loosened,

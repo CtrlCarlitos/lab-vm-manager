@@ -322,6 +322,35 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Set-LabSshConnectionSettings {', 1)[1].split('\nfunction ', 1)[0]
         self.assertNotIn('Password', body)
         self.assertNotIn('$Credential', body)
+    def test_sftp_command_checks_tooling_before_invoking(self):
+        body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Get-LabSshToolingInfo', body)
+        idx_check = body.index('Get-LabSshToolingInfo')
+        idx_sftp = body.index('sftp.exe')
+        self.assertLess(idx_check, idx_sftp)
+    def test_sftp_command_uses_batch_mode_for_key_auth(self):
+        body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('BatchMode=yes', body)
+        self.assertIn('StrictHostKeyChecking=yes', body)
+    def test_sftp_command_recognizes_interactive_password_mode(self):
+        # Presence check only -- this does not prove BatchMode=yes is absent from this
+        # specific branch's code path at runtime, only that the branch exists at all.
+        body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'InteractivePassword'", body)
+    def test_connection_test_requires_configured_settings(self):
+        body = self.s.split('function Test-LabSshConnection {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Get-LabSshConnectionSettings', body)
+    def test_update_known_host_requires_confirmation(self):
+        body = self.s.split('function Update-LabSshKnownHost {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Confirm-LabText', body)
+        self.assertIn('ssh-keygen', body)
+        self.assertNotRegex(body, r'Set-Content[^\r\n]*known_hosts')
+    def test_sftp_command_never_uses_controlmaster(self):
+        # Standing invariant, not a red/green case: this is already true on unmodified
+        # code (the substring doesn't exist anywhere yet) and must *stay* true -- it can
+        # only ever go red if a future change reintroduces ControlMaster/ControlPath.
+        self.assertNotIn('ControlMaster', self.s)
+        self.assertNotIn('ControlPath', self.s)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
