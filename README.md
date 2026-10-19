@@ -83,15 +83,21 @@ The selected-VM menu provides:
 | 10 | Explicitly select Standard checkpoints and disable automatic checkpoints |
 | 11 | Edit VM settings: name, notes, vCPU count, memory, network switch; VM must be Off |
 | 12 | Delete the VM (retain virtual disks); VM must be Off; blocked by non-Standard checkpoints |
+| 13 | Copy a file or directory from this host to the VM; VM must be Running |
+| 14 | Copy a file or directory from the VM to this host; VM must be Running |
 | T | Test Windows guest connectivity over PowerShell Direct; VM must be Running |
 | X | Emergency power-off, with strong confirmation and data-loss warning |
 | R / B / Q | Refresh / choose another VM / quit |
 
-`-ReadOnly` allows only inspection, listing and the connectivity test (option `T`); it performs no mutation. It still writes a host audit log.
+`-ReadOnly` allows only inspection, listing, the connectivity test (option `T`) and the file-copy options (`13`/`14`); it performs no mutation. The copy options still remain listed because a real copy is blocked deeper inside the transfer itself (reported as a failed item, not a generic read-only warning), not by the menu dispatch gate. It still writes a host audit log.
 
 ### Test connection (`T`)
 
 Prompts for the guest's Windows credentials (never stored), opens a PowerShell Direct session to the Running VM, and runs a trivial remote command to confirm round-trip execution. On success it reports the guest's OS version string; on failure (wrong credentials, VM not Running, etc.) it reports a clear message, never a raw stack trace. The session is always closed afterward. This does not transfer any files by itself; it only proves the connection used by later file-transfer operations is reachable.
+
+### Copy file/directory to/from VM (`13` / `14`)
+
+Collects a source path, a destination path (blank cancels either), recursion (asked only when the source resolves to a directory, checked by inspection rather than a blind prompt), a conflict policy chosen from a numbered list (`Error`, `Skip` or `Overwrite`; default `Error`), and whether to verify a SHA-256 hash after copying. A preview of the direction, VM name/ID, both resolved paths, recursion, conflict policy and verify-hash choice is shown, and you then type the exact `COPY TO VM <name>` or `COPY FROM VM <name>` confirmation. The transfer itself uses PowerShell Direct and the same temp-sibling-then-finalize engine described below; the console reports the returned completed/skipped/failed counts and any per-item errors. A partial failure is still reported as a completed operation (with a prominent warning listing what failed), since "some items failed" is not the same as "the whole operation was cancelled." The VM must be `Running`.
 
 ## First baseline
 

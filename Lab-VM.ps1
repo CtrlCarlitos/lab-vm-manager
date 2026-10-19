@@ -1543,6 +1543,88 @@ function Invoke-LabFileTransfer {
     }
 }
 
+function Copy-LabVMItemInteractive {
+    param([guid]$VMId, [ValidateSet('ToVM', 'FromVM')][string]$Direction)
+    $vm = Assert-LabVMRunning $VMId
+
+    $sourcePrompt = $(if ($Direction -eq 'ToVM') { 'Source path on this host (blank cancels)' } else { "Source path on '$($vm.Name)' (blank cancels)" })
+    $sourcePath = Read-LabText $sourcePrompt
+    if ($sourcePath -eq '') { return 'CANCELLED' }
+
+    $destinationPrompt = $(if ($Direction -eq 'ToVM') { "Destination path on '$($vm.Name)' (blank cancels)" } else { 'Destination path on this host (blank cancels)' })
+    $destinationPath = Read-LabText $destinationPrompt
+    if ($destinationPath -eq '') { return 'CANCELLED' }
+
+    # Resolve the source's type by inspection (not a blind prompt) so recursion is only asked about
+    # when it is actually relevant; a FromVM source lives in the guest, so that inspection needs a session.
+    $probeSb = { param([string]$Path) [bool](Test-Path -LiteralPath $Path -PathType Container) }
+    $sourceRemote = ($Direction -eq 'FromVM')
+    $credential = $null
+    $session = $null
+    try {
+        if ($sourceRemote) {
+            $credential = Resolve-LabWindowsCredential $null $false
+            $session = New-LabPSDirectSession $VMId $credential
+        }
+        $sourceIsDirectory = [bool](Invoke-LabTransferSide $session $sourceRemote $probeSb @($sourcePath))
+    } finally {
+        if ($session) { Remove-PSSession $session }
+    }
+
+    $recurse = $false
+    if ($sourceIsDirectory) {
+        $recurseAnswer = Read-LabYesNoCancel 'Source is a directory. Copy its contents recursively?'
+        if ($recurseAnswer -eq 'C') { return 'CANCELLED' }
+        $recurse = ($recurseAnswer -eq 'Y')
+    }
+
+    # Only a listed number ever reaches $onConflict, never free text; Copy-LabTransferItem's own
+    # [ValidateSet('Error', 'Skip', 'Overwrite')] would throw on anything else.
+    $conflictOptions = @('Error', 'Skip', 'Overwrite')
+    $rows = for ($i = 0; $i -lt $conflictOptions.Count; $i++) { [pscustomobject]@{ No = $i + 1; OnConflict = $conflictOptions[$i] } }
+    $rows | Format-Table -AutoSize | Out-Host
+    $onConflict = 'Error'
+    while ($true) {
+        $conflictAnswer = Read-LabText 'Conflict policy number [blank = Error] (C cancels)'
+        if ($conflictAnswer -ieq 'C') { return 'CANCELLED' }
+        if ($conflictAnswer -eq '') { break }
+        $conflictIndex = ConvertTo-LabMenuIndex $conflictAnswer $rows.Count
+        if ($conflictIndex -ge 0) { $onConflict = $conflictOptions[$conflictIndex]; break }
+        Write-Host 'Choose a listed number, or blank for Error.'
+    }
+
+    $verifyAnswer = Read-LabYesNoCancel 'Verify SHA-256 hash after copy?'
+    if ($verifyAnswer -eq 'C') { return 'CANCELLED' }
+    $verifyHash = ($verifyAnswer -eq 'Y')
+
+    Write-Host "`n=== Copy preview ==="
+    [pscustomobject]@{
+        Direction = $Direction
+        VMName = $vm.Name
+        VMId = $vm.Id
+        SourcePath = $sourcePath
+        DestinationPath = $destinationPath
+        Recurse = $recurse
+        OnConflict = $onConflict
+        VerifyHash = $verifyHash
+    } | Format-List | Out-Host
+
+    $confirmPhrase = $(if ($Direction -eq 'ToVM') { "COPY TO VM $($vm.Name)" } else { "COPY FROM VM $($vm.Name)" })
+    if (-not (Confirm-LabText $confirmPhrase)) { return 'CANCELLED' }
+
+    $result = Invoke-LabFileTransfer -VMId $VMId -Direction $Direction -SourcePath $sourcePath -DestinationPath $destinationPath `
+        -Recurse $recurse -OnConflict $onConflict -VerifyHash $verifyHash -DryRun $false -Credential $credential -NonInteractive $false
+
+    Write-Host "Completed: $($result.Completed); Skipped: $($result.Skipped); Failed: $($result.Failed); Bytes transferred: $($result.BytesTransferred)"
+    # Completed/Skipped/Failed counts are independent outcomes per item; a partial failure is still a
+    # completed operation overall (not a cancellation), so this reports COMPLETED with a loud warning.
+    if ($result.Failed -gt 0) {
+        Write-Warning "$($result.Failed) of $($result.Completed + $result.Skipped + $result.Failed) item(s) FAILED:"
+        foreach ($errorMessage in $result.Errors) { Write-Warning "  $errorMessage" }
+    }
+    return 'COMPLETED'
+}
+
 function Invoke-LabAction {
     param([guid]$VMId, [string]$Name, [scriptblock]$Action, [switch]$AllowReadOnly)
     if ($script:LabReadOnly -and -not $AllowReadOnly) { Write-Warning 'Read-only mode: VM-changing operations are disabled.'; return }
@@ -1598,6 +1680,8 @@ function Show-LabVMMenu {
             Write-Host @'
   1  Inspect VM: configuration, disks, network, integration services
   4  List checkpoints
+ 13  Copy file/directory to VM          [requires Running]
+ 14  Copy file/directory from VM        [requires Running]
   T  Test Windows guest connectivity (PowerShell Direct)
   R  Refresh
   B  Choose another VM
@@ -1618,6 +1702,8 @@ READ-ONLY: VM-changing operations are disabled.
  10  Configure lab checkpoint policy           [requires Off]
  11  Edit VM settings                          [requires Off]
  12  Delete VM (retain virtual disks)          [requires Off]
+ 13  Copy file/directory to VM          [requires Running]
+ 14  Copy file/directory from VM        [requires Running]
   T  Test Windows guest connectivity (PowerShell Direct) [requires Running]
   X  EMERGENCY power-off                       [risk of data loss]
   R  Refresh
@@ -1640,6 +1726,8 @@ READ-ONLY: VM-changing operations are disabled.
                 '10' { Invoke-LabAction $VMId 'configure-policy' { param($id) Set-LabCheckpointPolicy $id } }
                 '11' { Invoke-LabAction $VMId 'edit-settings-menu' { param($id) Edit-LabVMSettings $id } }
                 '12' { Invoke-LabAction $VMId 'delete-vm-menu' { param($id) Remove-LabVM $id } }
+                '13' { Invoke-LabAction $VMId 'copy-to-vm-menu' -AllowReadOnly { param($id) Copy-LabVMItemInteractive $id 'ToVM' } }
+                '14' { Invoke-LabAction $VMId 'copy-from-vm-menu' -AllowReadOnly { param($id) Copy-LabVMItemInteractive $id 'FromVM' } }
                 'T'  { Test-LabTransferConnection $VMId }
                 'X'  { Invoke-LabAction $VMId 'emergency-power-off' { param($id) Stop-LabVMPower $id } }
                 'R'  { continue vmMenu }

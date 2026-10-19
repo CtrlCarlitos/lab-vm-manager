@@ -206,6 +206,10 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('finally', body)
         self.assertIn('Remove-PSSession', body)
+    def test_copy_menu_options_pass_allow_readonly(self):
+        body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'copy-to-vm-menu' -AllowReadOnly", body)
+        self.assertIn("'copy-from-vm-menu' -AllowReadOnly", body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
