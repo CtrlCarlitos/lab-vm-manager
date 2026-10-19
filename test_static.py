@@ -195,6 +195,17 @@ class SourceContract(unittest.TestCase):
         rest = body[guard.end():]
         self.assertIn('return & $summary', rest.split('\n            }', 1)[0])
         self.assertLess(guard.start(), body.index('$finalEntries ='))
+    def test_invoke_lab_action_has_allow_readonly_switch(self):
+        body = self.s.split('function Invoke-LabAction {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('[switch]$AllowReadOnly', body)
+        self.assertIn('-not $AllowReadOnly', body)
+    def test_file_transfer_orchestrator_blocks_real_copy_in_readonly(self):
+        body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('LabReadOnly', body)
+    def test_file_transfer_orchestrator_closes_session_in_finally(self):
+        body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('finally', body)
+        self.assertIn('Remove-PSSession', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

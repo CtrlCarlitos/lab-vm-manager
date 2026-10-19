@@ -1511,9 +1511,41 @@ function Copy-LabTransferItem {
     }
 }
 
+function Invoke-LabFileTransfer {
+    param(
+        [guid]$VMId,
+        [ValidateSet('ToVM', 'FromVM')][string]$Direction,
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [bool]$Recurse,
+        [string]$OnConflict,
+        [bool]$VerifyHash,
+        [bool]$DryRun,
+        [AllowNull()][PSCredential]$Credential,
+        [bool]$NonInteractive
+    )
+    $null = Assert-LabVMRunning $VMId
+    $resolvedCredential = Resolve-LabWindowsCredential $Credential $NonInteractive
+    # The Invoke-LabAction caller may pass -AllowReadOnly so a dry run's audit record still gets
+    # written; this is still the one place that decides whether a real copy is allowed to happen.
+    if (-not $DryRun -and $script:LabReadOnly) {
+        return [pscustomobject]@{ VMId = $VMId; Completed = 0; Skipped = 0; Failed = 1
+            BytesTransferred = [long]0
+            Errors = [string[]]@('Read-only mode: a real file copy is blocked under -ReadOnly. Retry with a dry run.') }
+    }
+    $session = $null
+    try {
+        $session = New-LabPSDirectSession $VMId $resolvedCredential
+        $result = Copy-LabTransferItem $session $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun
+        return $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
+    } finally {
+        if ($session) { Remove-PSSession $session }
+    }
+}
+
 function Invoke-LabAction {
-    param([guid]$VMId, [string]$Name, [scriptblock]$Action)
-    if ($script:LabReadOnly) { Write-Warning 'Read-only mode: VM-changing operations are disabled.'; return }
+    param([guid]$VMId, [string]$Name, [scriptblock]$Action, [switch]$AllowReadOnly)
+    if ($script:LabReadOnly -and -not $AllowReadOnly) { Write-Warning 'Read-only mode: VM-changing operations are disabled.'; return }
     $mutex = [Threading.Mutex]::new($false, "Global\LabVmManager-$VMId")
     $held = $false
     $vm = $null
