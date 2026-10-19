@@ -208,6 +208,22 @@ function Test-LabMemorySpec {
         $MinimumBytes -le $StartupBytes -and $StartupBytes -le $MaximumBytes)
 }
 
+function Get-LabTransferConflictKind {
+    param([bool]$SourceIsDirectory, [bool]$DestinationExists, [bool]$DestinationIsDirectory)
+    if (-not $DestinationExists) { return 'None' }
+    if ($SourceIsDirectory -ne $DestinationIsDirectory) { return 'TypeMismatch' }
+    return 'Exists'
+}
+
+function Resolve-LabConflictAction {
+    param([string]$ConflictKind, [string]$OnConflict)
+    switch ($ConflictKind) {
+        'None'         { return 'Proceed' }
+        'TypeMismatch' { return 'Error' }
+        'Exists'       { return $OnConflict }
+    }
+}
+
 function Assert-LabVMOff {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId
