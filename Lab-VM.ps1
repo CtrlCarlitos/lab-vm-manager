@@ -417,6 +417,7 @@ function New-LabVMCore {
 }
 
 function New-LabVM {
+    if ($script:LabReadOnly) { Write-Warning 'Read-only mode: VM creation is disabled.'; return 'CANCELLED' }
     $defaults = Get-LabHostDefaults
     $existingNames = @((Get-VM -ErrorAction Stop).Name)
     while ($true) {
@@ -546,7 +547,7 @@ function New-LabVM {
         throw
     } catch {
         $message = $_.Exception.Message
-        try { Write-LabAudit 'create-vm' 'FAILED_OR_UNCONFIRMED' $null $message }
+        try { Write-LabAudit 'create-vm' 'FAILED_OR_UNCONFIRMED' $null "$name`: $message" }
         catch { Write-Warning 'Audit logging also failed. Inspect Hyper-V inventory; do not assume nothing was created.' }
         Write-Warning "Create VM failed or completion is unconfirmed: $message"
     } finally {
