@@ -49,7 +49,7 @@ Write-Host 'PASS: the full script parses in this PowerShell runtime.'
 $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointName',
     'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
     'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
-    'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter')
+    'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -631,6 +631,13 @@ Test-Case 'Gate: the real script refuses -NonInteractive without a direction swi
     # Whitespace-insensitive: the child may wrap the error text at its console width.
     if (-not ($output -replace '\s', '').Contains('-VMName,-NonInteractiveonlyapplytofiletransfer')) { throw "Unexpected output: $output" }
 }
+# --- SSH connection settings persistence ---
+Test-Case 'SSH connection settings path is scoped by VM GUID' {
+    $id = [guid]'11111111-1111-1111-1111-111111111111'
+    $path = Get-LabSshConnectionSettingsPath $id
+    Assert-Equal ($path -like "*SshConnections*$id.json") $true
+}
+
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
 if ($script:Failed -gt 0) { exit 1 }

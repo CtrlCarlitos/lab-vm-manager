@@ -315,6 +315,13 @@ class SourceContract(unittest.TestCase):
             self.assertNotIn('$DryRun', between)
     def test_private_acl_helper_exists(self):
         self.assertIn('function Set-LabTransferPrivateAcl', self.s)
+    def test_ssh_connection_settings_functions_exist(self):
+        for name in ['Get-LabSshConnectionSettings', 'Set-LabSshConnectionSettings', 'Get-LabGuestAddressCandidates']:
+            self.assertIn('function ' + name, self.s)
+    def test_ssh_connection_settings_never_writes_password_field(self):
+        body = self.s.split('function Set-LabSshConnectionSettings {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn('Password', body)
+        self.assertNotIn('$Credential', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
