@@ -255,6 +255,17 @@ function Get-LabSwitchNames {
     return @(Get-VMSwitch -ErrorAction Stop | ForEach-Object { [string]$_.Name })
 }
 
+function Get-LabSshToolingInfo {
+    $sshCommand = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    $sftpCommand = Get-Command sftp.exe -ErrorAction SilentlyContinue
+    return [pscustomobject]@{
+        Available = [bool]($sshCommand -and $sftpCommand)
+        SshPath = if ($sshCommand) { [string]$sshCommand.Source } else { $null }
+        SftpPath = if ($sftpCommand) { [string]$sftpCommand.Source } else { $null }
+        Version = if ($sshCommand) { $sshCommand.Version } else { $null }
+    }
+}
+
 function Test-LabNewVMName {
     param([AllowNull()][AllowEmptyString()][string]$Name, [AllowNull()][AllowEmptyCollection()][string[]]$ExistingNames)
     if (-not (Test-LabVMName $Name)) { return $false }

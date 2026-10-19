@@ -200,6 +200,16 @@ Option `12` calls Hyper-V's `Remove-VM`, which unregisters the VM and its config
 
 No guest OS installation, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing, remote hosts, automatic login, guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. `-PermissionProfile PrivateFiles` is Windows-ACL-only (`icacls`); an equivalent chmod-style permission profile for a Linux guest destination/source is future work, not implemented here.
 
+## Linux file transfer: SFTP backend design decision
+
+Linux-guest file transfer is implemented with the Windows-bundled OpenSSH client (`ssh.exe`/`sftp.exe`), confirmed present and functional on a representative host at version `9.5.6.4`. `Get-LabSshToolingInfo` is the runtime check this plan uses to detect that tooling; the manager reports a clear, actionable error (not a cryptic process-launch failure) when `ssh.exe`/`sftp.exe` cannot be resolved.
+
+This task's investigation produced two empirical findings, recorded here as fact rather than speculation. `ControlMaster`/`ControlPath`/`ControlPersist` failed with `getsockname failed: Not a socket` against both a non-routable address and `127.0.0.1` — this connection-sharing mechanism is not used anywhere in this plan. A plain invocation with no connection-sharing flags, by contrast, worked correctly end-to-end (clean key-based authentication, a clean "subsystem request failed" error against a host with no SFTP subsystem, no hangs) — this plan's entire design rests on plain, self-contained process invocations instead of `ControlMaster`.
+
+Those findings produce a two-mode authentication design: `-o BatchMode=yes` plus a configured identity file for noninteractive/key-based transfers (never prompts; fails cleanly without a usable key), and a plain invocation with full console inheritance (no `BatchMode`) for an interactive, first-time password-authenticated connection, so OpenSSH's own native password and host-key-trust prompts reach the operator directly.
+
+**Directory-merge-into-existing-destination limitation** (restated from the Global Constraints): `sftp`'s batch vocabulary has no recursive delete and no built-in tree-merge primitive, and OpenSSH's own documented behavior for nested symlinks under `put -r`/`get -r` is not independently verified by this plan without a live guest. See `MANUAL-TESTS.md` for the specific live-verification step this gap requires before the limitation note can be removed or narrowed in a future version.
+
 ## Primary references
 
 - Microsoft: Using checkpoints — https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/checkpoints

@@ -63,6 +63,8 @@ class SourceContract(unittest.TestCase):
     def test_host_discovery_functions_exist(self):
         self.assertIn('function Get-LabHostDefaults', self.s)
         self.assertIn('function Get-LabSwitchNames', self.s)
+    def test_ssh_tooling_info_function_exists(self):
+        self.assertIn('function Get-LabSshToolingInfo', self.s)
     def test_create_vm_blocked_in_readonly(self):
         body = self.s.split('function Select-LabVM {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('-not $script:LabReadOnly', body)
