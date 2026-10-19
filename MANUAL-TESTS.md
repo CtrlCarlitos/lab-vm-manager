@@ -12,6 +12,19 @@
 - Confirm R refreshes immediately, B returns to the VM list, and Q exits.
 - Confirm the host audit file exists outside the guest.
 
+## Create VM
+
+- Run `-ReadOnly`. Confirm the VM list prompt does not offer `N`, including when the inventory is empty, and that typing `N` is not treated as a create request.
+- Run normally with no `LAB-*` VMs present (or a filtered view). Confirm the empty-inventory message mentions `N` and that choosing `N` starts the create workflow.
+- Start a create, enter a name that does not start with `LAB-`: it must be rejected with a re-prompt, not accepted.
+- Start a create, enter a name matching an existing VM (case-insensitive): it must be rejected with a re-prompt.
+- Enter an out-of-range or non-numeric vCPU count (0, negative, text, or above the host's logical processor count): it must be rejected with a re-prompt.
+- Enter an invalid memory spec: for dynamic memory, minimum greater than startup, or startup greater than maximum, or a value not a multiple of 2MB; for static memory, a zero/negative startup value. Each must be rejected with a re-prompt.
+- Reach the preview screen and cancel at the `CREATE <name>` confirmation (type anything else, or press Enter): verify no VM, folder or VHDX was created, and that the audit log has no `create-vm` `STARTED` entry for this attempt.
+- Complete a create with valid inputs: verify the new VM appears in the next inventory refresh, is Generation 2, has Standard checkpoint policy with automatic checkpoints disabled, has the requested vCPU/memory, and its VHDX is attached. Verify `create-vm` `STARTED`/`COMPLETED` audit entries exist with the new VM's ID.
+- Repeat creation using the same name and storage root as a prior successful create: it must be rejected before any Hyper-V call because the dedicated VM/VHDX destination already exists.
+- Choose "Disconnected" for the switch: verify the new VM's network adapter has no switch attached.
+
 ## Disposable baseline
 
 - Shut down the guest normally. Select option 10 and cancel the confirmation: policy must not change.

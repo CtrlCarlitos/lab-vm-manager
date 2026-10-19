@@ -11,7 +11,7 @@ A standalone menu-driven PowerShell script for managing **existing local Hyper-V
 - `MANUAL-TESTS.md`: acceptance checklist for a disposable VM.
 - `test_static.py`: source-level regression checks; optional, requires Python.
 
-The script has been source-reviewed and its 16 source-contract checks passed. It has since been run in Windows PowerShell 5.1: all 31 `Test-LabVM.ps1` helper tests pass, and it has been exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, deletion, export, concurrency and shutdown-failure scenarios — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
+The script has been source-reviewed and its 22 source-contract checks passed. It has since been run in Windows PowerShell 5.1: all 42 `Test-LabVM.ps1` helper tests pass, and it has been exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM workflow — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
 
 ## Start
 
@@ -61,7 +61,11 @@ This does not persist a machine/user policy change and cannot override an organi
 
 ## Menus
 
-The first menu lists matching VMs, current state, CPU count, assigned memory and full VM ID. Assigned memory can be zero while a VM is Off. Pick a number, `R` to refresh or `Q` to quit. No match means no selectable VMs; it never creates or renames one automatically.
+The first menu lists matching VMs, current state, CPU count, assigned memory and full VM ID. Assigned memory can be zero while a VM is Off. Pick a number, `N` to create a new VM (hidden in `-ReadOnly` mode), `R` to refresh or `Q` to quit. An empty list still offers `N` (unless read-only); it never creates or renames one automatically on its own.
+
+### Create VM (`N`)
+
+Collects, in order: a unique `LAB-` name; a VM storage root (defaults to the host's configured VM path; an ISO/installer media folder such as `E:\ISO` is explicitly called out as invalid storage); vCPU count (bounded by host logical processors); startup RAM and a static/dynamic memory choice with minimum/maximum when dynamic; a VHDX storage root and maximum capacity; and a virtual switch, or an explicit "Disconnected" choice. Each new VM gets its own dedicated storage subfolder and VHDX subfolder, so creation refuses to proceed if that destination already exists. The VM is always created as **Generation 2**, with the same Standard/no-automatic-checkpoints policy used elsewhere in this tool. A full preview is shown before the `CREATE <name>` confirmation; creation itself is also protected by a dedicated per-name creation lock, and is blocked entirely in `-ReadOnly` mode.
 
 The selected-VM menu provides:
 
@@ -139,7 +143,7 @@ Deleting a checkpoint removes the return point; it does not restore it. Hyper-V 
 
 ## Intentionally not included
 
-No VM installation, creation, clone/import, OS activation/licensing, CPU/RAM tuning, network/firewall changes, remote hosts, automatic login, dotfiles execution, guest result collection, automatic checkpoint pruning, or VM/disk deletion. Those can be separate explicit workflows; a restore menu should not silently provision or erase unrelated state.
+No VM clone/import, OS activation/licensing, post-creation CPU/RAM tuning, network/firewall changes, remote hosts, automatic login, dotfiles execution, guest result collection, automatic checkpoint pruning, or VM/disk deletion. Those can be separate explicit workflows; a restore menu should not silently provision or erase unrelated state.
 
 ## Primary references
 

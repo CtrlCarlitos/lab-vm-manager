@@ -63,6 +63,19 @@ class SourceContract(unittest.TestCase):
     def test_host_discovery_functions_exist(self):
         self.assertIn('function Get-LabHostDefaults', self.s)
         self.assertIn('function Get-LabSwitchNames', self.s)
+    def test_create_vm_blocked_in_readonly(self):
+        body = self.s.split('function Select-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('-not $script:LabReadOnly', body)
+    def test_create_vm_uses_dedicated_directory(self):
+        self.assertIn('function New-LabVMCore', self.s)
+        self.assertRegex(self.s, r'New-VM[^\r\n]*-Path ')
+    def test_create_vm_rejects_existing_destination(self):
+        body = self.s.split('function New-LabVMCore {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Test-Path', body)
+    def test_create_vm_generation_2_default(self):
+        self.assertRegex(self.s, r'New-VM[^\r\n]*-Generation 2')
+    def test_create_vm_name_collision_lock(self):
+        self.assertIn('LabVmManager-Create-', self.s)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

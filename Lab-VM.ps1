@@ -278,7 +278,11 @@ function Select-LabVM {
         $items = @(Get-VM -ErrorAction Stop | Where-Object { Test-LabVMName $_.Name } |
             Sort-Object Name, Id)
         if ($items.Count -eq 0) {
-            Write-Host 'No local VMs whose names begin with LAB- were found. No VMs will be created or renamed.'
+            if (-not $script:LabReadOnly) {
+                Write-Host 'No local VMs whose names begin with LAB- were found. Choose N to create one.'
+            } else {
+                Write-Host 'No local VMs whose names begin with LAB- were found. Read-only mode: VM creation is disabled.'
+            }
         } else {
             $rows = for ($i = 0; $i -lt $items.Count; $i++) {
                 $vm = $items[$i]
@@ -288,12 +292,18 @@ function Select-LabVM {
             }
             $rows | Format-Table -AutoSize -Wrap | Out-Host
         }
-        $answer = Read-LabText 'VM number; R refresh; Q quit'
+        if (-not $script:LabReadOnly) {
+            $answer = Read-LabText 'VM number; N create VM; R refresh; Q quit'
+        } else {
+            $answer = Read-LabText 'VM number; R refresh; Q quit'
+        }
         if ($answer -ieq 'Q') { return $null }
         if ($answer -ieq 'R') { continue }
+        if ($answer -ieq 'N' -and -not $script:LabReadOnly) { New-LabVM; continue }
         $index = ConvertTo-LabMenuIndex $answer $items.Count
         if ($index -ge 0) { return Get-LabVM ([guid]$items[$index].Id) }
-        Write-Host 'Choose a listed number, R or Q.'
+        if (-not $script:LabReadOnly) { Write-Host 'Choose a listed number, N, R or Q.' }
+        else { Write-Host 'Choose a listed number, R or Q.' }
     }
 }
 
@@ -361,6 +371,188 @@ function Stop-LabVMGracefully {
     $null = Wait-LabVMState $VMId 'Off'
     Write-Host 'VM is Off.'
     return 'COMPLETED'
+}
+
+function New-LabVMCore {
+    param(
+        [string]$Name,
+        [string]$VmStoragePath,
+        [int]$VCpuCount,
+        [long]$MinimumBytes,
+        [long]$StartupBytes,
+        [long]$MaximumBytes,
+        [bool]$IsDynamic,
+        [string]$VhdxPath,
+        [long]$VhdxMaximumBytes,
+        [AllowNull()][AllowEmptyString()][string]$SwitchName
+    )
+    if (@(Get-VM -ErrorAction Stop | Where-Object { $_.Name -ieq $Name }).Count -gt 0) {
+        throw "A VM named '$Name' already exists."
+    }
+    if (Test-Path -LiteralPath $VmStoragePath) {
+        throw "VM storage path already exists: $VmStoragePath"
+    }
+    $vhdxDirectory = Split-Path -Path $VhdxPath -Parent
+    if (Test-Path -LiteralPath $vhdxDirectory) {
+        throw "VHDX directory already exists: $vhdxDirectory"
+    }
+    if (-not [string]::IsNullOrEmpty($SwitchName) -and (Get-LabSwitchNames) -notcontains $SwitchName) {
+        throw "Virtual switch '$SwitchName' is no longer available. Choose another switch."
+    }
+    if ([string]::IsNullOrEmpty($SwitchName)) {
+        $vm = New-VM -Name $Name -Generation 2 -Path $VmStoragePath -NoVHD `
+            -MemoryStartupBytes $StartupBytes -Confirm:$false -ErrorAction Stop
+    } else {
+        $vm = New-VM -Name $Name -Generation 2 -Path $VmStoragePath -NoVHD `
+            -MemoryStartupBytes $StartupBytes -SwitchName $SwitchName -Confirm:$false -ErrorAction Stop
+    }
+    New-VHD -Path $VhdxPath -Dynamic -SizeBytes $VhdxMaximumBytes -Confirm:$false -ErrorAction Stop | Out-Null
+    Add-VMHardDiskDrive -VM $vm -Path $VhdxPath -Confirm:$false -ErrorAction Stop
+    Set-VMProcessor -VM $vm -Count $VCpuCount -Confirm:$false -ErrorAction Stop
+    Set-VMMemory -VM $vm -DynamicMemoryEnabled $IsDynamic -MinimumBytes $MinimumBytes `
+        -StartupBytes $StartupBytes -MaximumBytes $MaximumBytes -Confirm:$false -ErrorAction Stop
+    # Same policy as Set-LabCheckpointPolicy; applied directly here since there is no prior VM to re-fetch under Assert-LabVMOff.
+    Set-VM -VM $vm -CheckpointType Standard -AutomaticCheckpointsEnabled $false -Confirm:$false -ErrorAction Stop
+    return (Get-LabVM $vm.Id)
+}
+
+function New-LabVM {
+    $defaults = Get-LabHostDefaults
+    $existingNames = @((Get-VM -ErrorAction Stop).Name)
+    while ($true) {
+        $name = Read-LabText 'New VM name, must start with LAB- and be unique (blank cancels)'
+        if ($name -eq '') { return 'CANCELLED' }
+        if (Test-LabNewVMName $name $existingNames) { break }
+        Write-Host 'Name must start with LAB- (case-insensitive) and not match an existing VM name.'
+    }
+
+    while ($true) {
+        $storageInput = Read-LabText "VM storage root [$($defaults.VirtualMachinePath)] (blank = default; C cancels)"
+        if ($storageInput -ieq 'C') { return 'CANCELLED' }
+        $storageRoot = $(if ($storageInput -eq '') { $defaults.VirtualMachinePath } else { $storageInput })
+        Write-Host 'An ISO/installer media folder such as E:\ISO is not valid VM storage.'
+        if (Test-Path -LiteralPath $storageRoot -PathType Container) { break }
+        Write-Host 'Enter an existing directory, or C to cancel.'
+    }
+    $vmStoragePath = Join-Path $storageRoot $name
+
+    while ($true) {
+        $vCpuText = Read-LabText "vCPU count, 1-$($defaults.LogicalProcessorCount) (blank cancels)"
+        if ($vCpuText -eq '') { return 'CANCELLED' }
+        $vCpuCount = 0
+        if ([int]::TryParse($vCpuText, [ref]$vCpuCount) -and (Test-LabVCpuCount $vCpuCount $defaults.LogicalProcessorCount)) { break }
+        Write-Host "Enter a whole number from 1 to $($defaults.LogicalProcessorCount)."
+    }
+
+    $dynamicAnswer = Read-LabYesNoCancel 'Use dynamic memory?'
+    if ($dynamicAnswer -eq 'C') { return 'CANCELLED' }
+    $isDynamic = ($dynamicAnswer -eq 'Y')
+    if ($isDynamic) {
+        while ($true) {
+            $minText = Read-LabText 'Minimum memory bytes, e.g. 536870912 for 512MB (blank cancels)'
+            if ($minText -eq '') { return 'CANCELLED' }
+            $startupText = Read-LabText 'Startup memory bytes, e.g. 1073741824 for 1GB (blank cancels)'
+            if ($startupText -eq '') { return 'CANCELLED' }
+            $maxText = Read-LabText 'Maximum memory bytes, e.g. 4294967296 for 4GB (blank cancels)'
+            if ($maxText -eq '') { return 'CANCELLED' }
+            $minimumBytes = 0L; $startupBytes = 0L; $maximumBytes = 0L
+            if ([long]::TryParse($minText, [ref]$minimumBytes) -and [long]::TryParse($startupText, [ref]$startupBytes) -and
+                [long]::TryParse($maxText, [ref]$maximumBytes) -and
+                (Test-LabMemorySpec $minimumBytes $startupBytes $maximumBytes $true)) { break }
+            Write-Host 'Enter whole-byte values, multiples of 2MB, with minimum <= startup <= maximum.'
+        }
+    } else {
+        while ($true) {
+            $startupText = Read-LabText 'Startup (static) memory bytes, e.g. 2147483648 for 2GB (blank cancels)'
+            if ($startupText -eq '') { return 'CANCELLED' }
+            $startupBytes = 0L
+            if ([long]::TryParse($startupText, [ref]$startupBytes) -and (Test-LabMemorySpec 0 $startupBytes 0 $false)) { break }
+            Write-Host 'Enter a whole-byte value that is a multiple of 2MB.'
+        }
+        $minimumBytes = $startupBytes
+        $maximumBytes = $startupBytes
+    }
+
+    while ($true) {
+        $vhdxRootInput = Read-LabText "VHDX storage root [$($defaults.VirtualHardDiskPath)] (blank = default; C cancels)"
+        if ($vhdxRootInput -ieq 'C') { return 'CANCELLED' }
+        $vhdxRoot = $(if ($vhdxRootInput -eq '') { $defaults.VirtualHardDiskPath } else { $vhdxRootInput })
+        if (Test-Path -LiteralPath $vhdxRoot -PathType Container) { break }
+        Write-Host 'Enter an existing directory, or C to cancel.'
+    }
+    $vhdxPath = Join-Path (Join-Path $vhdxRoot $name) "$name.vhdx"
+
+    while ($true) {
+        $vhdxSizeText = Read-LabText 'VHDX maximum capacity in bytes, e.g. 68719476736 for 64GB (blank cancels)'
+        if ($vhdxSizeText -eq '') { return 'CANCELLED' }
+        $vhdxMaximumBytes = 0L
+        if ([long]::TryParse($vhdxSizeText, [ref]$vhdxMaximumBytes) -and $vhdxMaximumBytes -gt 0) { break }
+        Write-Host 'Enter a whole-byte value greater than zero.'
+    }
+
+    $switchNames = @(Get-LabSwitchNames)
+    $switchName = $null
+    if ($switchNames.Count -eq 0) {
+        Write-Host 'No virtual switches found; the network adapter will be Disconnected.'
+    } else {
+        $rows = for ($i = 0; $i -lt $switchNames.Count; $i++) {
+            [pscustomobject]@{ No = $i + 1; Switch = $switchNames[$i] }
+        }
+        $rows += [pscustomobject]@{ No = $switchNames.Count + 1; Switch = 'Disconnected' }
+        $rows | Format-Table -AutoSize | Out-Host
+        while ($true) {
+            $switchAnswer = Read-LabText 'Switch number (blank cancels)'
+            if ($switchAnswer -eq '') { return 'CANCELLED' }
+            $switchIndex = ConvertTo-LabMenuIndex $switchAnswer $rows.Count
+            if ($switchIndex -ge 0) {
+                $switchName = $(if ($switchIndex -eq $switchNames.Count) { $null } else { $switchNames[$switchIndex] })
+                break
+            }
+            Write-Host 'Choose a listed number.'
+        }
+    }
+
+    Write-Host "`n=== Create VM preview ==="
+    [pscustomobject]@{
+        Name = $name
+        VMStoragePath = $vmStoragePath
+        VhdxPath = $vhdxPath
+        VhdxMaximumBytesGiB = [math]::Round($vhdxMaximumBytes / 1GB, 1)
+        VCpuCount = $vCpuCount
+        DynamicMemory = $isDynamic
+        MinimumMemoryMiB = [math]::Round($minimumBytes / 1MB, 0)
+        StartupMemoryMiB = [math]::Round($startupBytes / 1MB, 0)
+        MaximumMemoryMiB = [math]::Round($maximumBytes / 1MB, 0)
+        Switch = $(if ([string]::IsNullOrEmpty($switchName)) { 'Disconnected' } else { $switchName })
+        Generation = 2
+        CheckpointPolicy = 'Standard; automatic checkpoints disabled'
+    } | Format-List | Out-Host
+    if (-not (Confirm-LabText "CREATE $name")) { return 'CANCELLED' }
+
+    $mutex = [Threading.Mutex]::new($false, "Global\LabVmManager-Create-$($name.ToUpperInvariant())")
+    $held = $false
+    try {
+        try { $held = $mutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { throw 'Another copy of this script is already creating a VM with this name. No operation was started here.' }
+        Write-LabAudit 'create-vm' 'STARTED' $null $name
+        $vm = New-LabVMCore -Name $name -VmStoragePath $vmStoragePath -VCpuCount $vCpuCount `
+            -MinimumBytes $minimumBytes -StartupBytes $startupBytes -MaximumBytes $maximumBytes `
+            -IsDynamic $isDynamic -VhdxPath $vhdxPath -VhdxMaximumBytes $vhdxMaximumBytes -SwitchName $switchName
+        Write-LabAudit 'create-vm' 'COMPLETED' $vm
+        Write-Host "Created '$($vm.Name)' [$($vm.Id)]."
+        return 'COMPLETED'
+    } catch [Management.Automation.PipelineStoppedException] {
+        throw
+    } catch {
+        $message = $_.Exception.Message
+        try { Write-LabAudit 'create-vm' 'FAILED_OR_UNCONFIRMED' $null $message }
+        catch { Write-Warning 'Audit logging also failed. Inspect Hyper-V inventory; do not assume nothing was created.' }
+        Write-Warning "Create VM failed or completion is unconfirmed: $message"
+    } finally {
+        if ($held) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
 }
 
 function Test-LabCheckpointName {
