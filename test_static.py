@@ -200,8 +200,73 @@ class SourceContract(unittest.TestCase):
         self.assertIn('[switch]$AllowReadOnly', body)
         self.assertIn('-not $AllowReadOnly', body)
     def test_file_transfer_orchestrator_blocks_real_copy_in_readonly(self):
+        # The read-only refusal must come before credentials are resolved (no needless prompt)
+        # and before any PowerShell Direct session is opened.
         body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
-        self.assertIn('LabReadOnly', body)
+        idx_guard = body.index('if (-not $DryRun -and $script:LabReadOnly) {')
+        idx_return = body.index('return $result', idx_guard)
+        self.assertLess(idx_guard, body.index('Resolve-LabWindowsCredential'))
+        self.assertLess(idx_return, body.index('Resolve-LabWindowsCredential'))
+        self.assertLess(idx_guard, body.index('New-LabPSDirectSession'))
+        self.assertLess(idx_guard, body.index('Copy-LabTransferItem'))
+    def test_file_transfer_writes_one_audit_record_in_finally(self):
+        body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
+        idx_finally = body.index('} finally {')
+        self.assertEqual(body.count("Write-LabAudit 'file-transfer'"), 1)
+        self.assertLess(idx_finally, body.index("Write-LabAudit 'file-transfer'"))
+        for status in ["'BLOCKED_READONLY'", "'DRY_RUN'", "'COMPLETED'", "'PARTIAL'", "'FAILED'"]:
+            self.assertIn(status, body[idx_finally:])
+        for field in ['Direction=', 'Source=', 'Destination=', 'OnConflict=', 'PermissionProfile=', 'VerifyHash=',
+                      'Completed=', 'Skipped=', 'Failed=']:
+            self.assertIn(field, body[idx_finally:])
+    def test_file_transfer_audit_never_logs_credential(self):
+        body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
+        audit_part = body[body.index('} finally {'):]
+        self.assertNotIn('Credential', audit_part)
+    def test_cli_holds_per_vm_mutex_for_whole_transfer(self):
+        # Last function in the file: stop at its closing brace, not at the invocation gate below it.
+        body = self.s.split('function Start-LabFileTransferCli {', 1)[1].split('\n}\n', 1)[0]
+        code = '\n'.join(l for l in body.splitlines() if not l.lstrip().startswith('#'))
+        self.assertNotIn('Invoke-LabAction', code)
+        idx_new = body.index('[Threading.Mutex]::new($false, "Global\\LabVmManager-$resolvedVMId")')
+        idx_wait = body.index('$held = $mutex.WaitOne(0)')
+        idx_abandoned = body.index('catch [Threading.AbandonedMutexException] { $held = $true }')
+        idx_refuse = body.index('Another copy of this script is operating on this VM.')
+        idx_transfer = body.index('Invoke-LabFileTransfer ')
+        idx_finally = body.index('} finally {', idx_transfer)
+        idx_release = body.index('if ($held) { $mutex.ReleaseMutex() }')
+        idx_dispose = body.index('$mutex.Dispose()')
+        self.assertLess(body.index('Resolve-LabVMByNameOrId'), idx_new)
+        self.assertLess(idx_new, idx_wait)
+        self.assertLess(idx_wait, idx_abandoned)
+        self.assertLess(idx_abandoned, idx_refuse)
+        self.assertLess(idx_refuse, idx_transfer)
+        self.assertLess(idx_transfer, idx_finally)
+        self.assertLess(idx_finally, idx_release)
+        self.assertLess(idx_release, idx_dispose)
+    def test_single_file_creates_missing_parent_before_copy(self):
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        # The single-file branch is the else of the top-level 'if ($Recurse)' (4-space indent).
+        single = re.split(r'\n    \} else \{\n', body, maxsplit=1)[1]
+        idx_dry = single.index('if ($DryRun) {')
+        idx_parent = single.index('$finalizeSb @(, @(@{ IsDirectory = $true; Destination = $missingParents[0] }))')
+        idx_copy = single.index('& $copyPayload $SourcePath $tempPath $false')
+        self.assertLess(idx_dry, idx_parent)
+        self.assertLess(idx_parent, idx_copy)
+        self.assertIn('$removeEmptyCreatedSb', single[single.index('} finally {', idx_copy):])
+    def test_orphan_transfer_parameters_do_not_open_menu(self):
+        body = self.s.rsplit("if ($MyInvocation.InvocationName -ne '.')", 1)[1]
+        idx_check = body.index('Get-LabTransferOnlyParameter @($PSBoundParameters.Keys)')
+        idx_exit = body.index('exit 1', idx_check)
+        self.assertLess(body.index('if ($CopyToVM -or $CopyFromVM)'), idx_check)
+        self.assertLess(idx_exit, body.index('Start-LabVMManager'))
+    def test_credential_docs_do_not_recommend_dot_sourcing(self):
+        readme = SCRIPT.with_name('README.md').read_text(encoding='utf-8-sig')
+        self.assertNotIn('This only works when `Lab-VM.ps1` is dot-sourced', readme)
+        self.assertIn('& .\\Lab-VM.ps1 -CopyToVM', readme)
+        help_text = self.s.split('#>', 1)[0]
+        self.assertNotIn('(dot-source this script', help_text)
+        self.assertIn('& .\\Lab-VM.ps1 -CopyToVM', help_text)
     def test_file_transfer_orchestrator_closes_session_in_finally(self):
         body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('finally', body)
@@ -226,10 +291,26 @@ class SourceContract(unittest.TestCase):
         self.assertIn('$PermissionProfile', self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0])
         self.assertIn('PermissionProfile', self.s.split('param(', 1)[1].split(')\n\n', 1)[0])
     def test_private_acl_applied_after_finalize_not_before(self):
+        # Every ACL call site must sit after the real finalize call (the one that runs Move-Item over
+        # the planned moves) and after that call's .Ok result has been checked -- i.e. inside the
+        # success branch -- not merely after the Move-Item keyword in source order.
         body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
-        idx_move = body.index('Move-Item')
-        idx_acl = body.index('Set-LabTransferPrivateAcl')
-        self.assertLess(idx_move, idx_acl)
+        finalize_def = body.split('$finalizeSb = {', 1)[1].split('\n    $removeSb = {', 1)[0]
+        self.assertIn('Move-Item', finalize_def)
+        self.assertEqual(body.count('Set-LabTransferPrivateAcl'), 1)
+        self.assertLess(body.index('Set-LabTransferPrivateAcl'), body.index('$applyPrivateAcl = {') + 200)
+        finalize_call = re.compile(r'\$results? = @\(Invoke-LabTransferSide \$Session \$destinationRemote \$finalizeSb @\(, (?:@\(\$move\)|\$moves)\)\)')
+        acl_calls = [m.start() for m in re.finditer(r'& \$applyPrivateAcl ', body)]
+        self.assertEqual(len(acl_calls), 2)
+        for idx_acl in acl_calls:
+            before = body[:idx_acl]
+            calls = list(finalize_call.finditer(before))
+            self.assertTrue(calls, 'ACL call has no preceding finalize call')
+            between = before[calls[-1].end():]
+            self.assertRegex(between, r'if \((?:\$result\.Ok|-not \$results\[\$i\]\.Ok)\) \{')
+            # Not inside a dry-run branch, and no new payload copy happens between finalize and ACL.
+            self.assertNotIn('$copyPayload', between)
+            self.assertNotIn('$DryRun', between)
     def test_private_acl_helper_exists(self):
         self.assertIn('function Set-LabTransferPrivateAcl', self.s)
 

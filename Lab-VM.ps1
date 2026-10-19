@@ -57,12 +57,22 @@
     finalized item to the receiving account only (Windows ACLs; see README.md).
 .PARAMETER Credential
     Guest Windows credential for parameter-mode transfer. Only pass an existing
-    PSCredential object (dot-source this script or build one in the calling
-    session) -- never a plaintext password on the command line.
+    PSCredential object built in the calling elevated Windows PowerShell 5.1
+    session, invoking the script normally with the call operator (see the last
+    example) -- never a plaintext password on the command line. Do not
+    dot-source the script for this: dot-sourcing only loads its functions and
+    runs no transfer at all. powershell.exe -File cannot receive a PSCredential
+    object; without -Credential (and without -NonInteractive) it prompts instead.
+    The transfer-only parameters above (-VMName through -Credential) are
+    rejected with an error, rather than ignored, when neither -CopyToVM nor
+    -CopyFromVM is supplied; the menu is not opened in that case.
 .EXAMPLE
     powershell.exe -NoProfile -File .\Lab-VM.ps1 -ReadOnly
 .EXAMPLE
     powershell.exe -NoProfile -File .\Lab-VM.ps1 -ExportRoot E:\HyperV-Exports
+.EXAMPLE
+    $cred = Get-Credential
+    & .\Lab-VM.ps1 -CopyToVM -VMName LAB-dev -SourcePath C:\keys\id_ed25519 -DestinationPath C:\Users\dev\.ssh\id_ed25519 -PermissionProfile PrivateFiles -NonInteractive -Credential $cred
 .NOTES
     Version: 1.0.0
     Written for Windows PowerShell 5.1. Does not change execution policy.
@@ -1404,6 +1414,16 @@ function Copy-LabTransferItem {
         }
         if ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path)) { & $removeTree $Path }
     }
+    # Deepest first; non-recursive, so it stops at the first directory that is not empty (or is gone),
+    # and never touches a directory that already existed before this transfer.
+    $removeEmptyCreatedSb = {
+        param([string[]]$Paths)
+        foreach ($path in $Paths) {
+            if (-not [IO.Directory]::Exists($path)) { continue }
+            if ([IO.Directory]::GetFileSystemEntries($path).Length -gt 0) { return }
+            [IO.Directory]::Delete($path, $false)
+        }
+    }
     $copyPayload = {
         param([string]$From, [string]$To, [bool]$Tree)
         if ($Direction -eq 'ToVM') {
@@ -1584,17 +1604,44 @@ function Copy-LabTransferItem {
             & $fail "${SourcePath}: source is a directory; use a recursive transfer."
             return & $summary
         }
+        # The destination's ancestors (deepest first, drive root excluded) are inspected in the same call,
+        # so a missing parent directory can be created like the directory branch creates its own.
+        $ancestors = [Collections.Generic.List[string]]::new()
+        try {
+            for ($ancestor = [IO.Path]::GetDirectoryName($DestinationPath); $ancestor -and $ancestor -notmatch '^[A-Za-z]:[\\/]?$';
+                $ancestor = [IO.Path]::GetDirectoryName($ancestor)) { $ancestors.Add($ancestor) }
+        } catch [ArgumentException] {
+            # An invalid path is left to the destination inspection below, which reports it as a failed item.
+            $ancestors.Clear()
+        }
         # The conflict is resolved before any Copy-Item: a refused or skipped item moves zero bytes.
-        $destination = @(Invoke-LabTransferSide $Session $destinationRemote $statSb @([string[]]@($DestinationPath), $false))[0]
+        $destinationStats = @(Invoke-LabTransferSide $Session $destinationRemote $statSb @([string[]](@($DestinationPath) + $ancestors.ToArray()), $false))
+        $destination = $destinationStats[0]
         $action = Resolve-LabTransferItemAction $state $SourcePath $DestinationPath $false $source.IsReparse $destination $OnConflict
         if ($action -in @('Error', 'Skip')) { return & $summary }
+        # Only the contiguous run of missing directories directly above the destination; never one that exists.
+        $missingParents = [Collections.Generic.List[string]]::new()
+        for ($i = 1; $i -lt $destinationStats.Count; $i++) {
+            if ($destinationStats[$i].Exists -or $destinationStats[$i].Error) { break }
+            $missingParents.Add([string]$destinationStats[$i].Path)
+        }
         if ($DryRun) {
             $verb = if ($action -eq 'Overwrite') { 'overwrite' } else { 'copy' }
             Write-Host "Dry run: would $verb $SourcePath -> $DestinationPath"
             $state.Completed++
             return & $summary
         }
+        $createdParents = @()
         try {
+            if ($missingParents.Count -gt 0) {
+                # Recorded before the attempt: a partial creation is still cleaned up below.
+                $createdParents = $missingParents.ToArray()
+                $parentResult = @(Invoke-LabTransferSide $Session $destinationRemote $finalizeSb @(, @(@{ IsDirectory = $true; Destination = $missingParents[0] })))[0]
+                if (-not $parentResult.Ok) {
+                    & $fail "${DestinationPath}: the missing destination parent directory could not be created: $($parentResult.Error)"
+                    return & $summary
+                }
+            }
             & $copyPayload $SourcePath $tempPath $false
             $expected = @(Invoke-LabTransferSide $Session $sourceRemote $statSb @([string[]]@($SourcePath), $VerifyHash))[0]
             $actual = @(Invoke-LabTransferSide $Session $destinationRemote $statSb @([string[]]@($tempPath), $VerifyHash))[0]
@@ -1624,6 +1671,11 @@ function Copy-LabTransferItem {
             & $fail "${DestinationPath}: not transferred: $($_.Exception.Message)"
         } finally {
             if (-not $retainTemp) { & $removeTemp $tempPath }
+            # A failed copy does not leave behind the empty parent directories it created itself.
+            if ($createdParents.Count -gt 0 -and $state.Completed -eq 0) {
+                try { $null = Invoke-LabTransferSide $Session $destinationRemote $removeEmptyCreatedSb @(, [string[]]$createdParents) }
+                catch { Write-Warning "Could not remove the directory created for this transfer above '$DestinationPath': $($_.Exception.Message)" }
+            }
         }
         return & $summary
     }
@@ -1643,22 +1695,54 @@ function Invoke-LabFileTransfer {
         [bool]$NonInteractive,
         [ValidateSet('Default', 'PrivateFiles')][string]$PermissionProfile = 'Default'
     )
-    $null = Assert-LabVMRunning $VMId
-    $resolvedCredential = Resolve-LabWindowsCredential $Credential $NonInteractive
-    # The Invoke-LabAction caller may pass -AllowReadOnly so a dry run's audit record still gets
-    # written; this is still the one place that decides whether a real copy is allowed to happen.
-    if (-not $DryRun -and $script:LabReadOnly) {
-        return [pscustomobject]@{ VMId = $VMId; Completed = 0; Skipped = 0; Failed = 1
-            BytesTransferred = [long]0
-            Errors = [string[]]@('Read-only mode: a real file copy is blocked under -ReadOnly. Retry with a dry run.') }
-    }
+    $vm = $null
+    $result = $null
+    $blockedReadOnly = $false
+    $copyAttempted = $false
+    $transferError = $null
     $session = $null
     try {
+        $vm = Assert-LabVMRunning $VMId
+        # The Invoke-LabAction caller may pass -AllowReadOnly so a dry run's audit record still gets
+        # written; this is still the one place that decides whether a real copy is allowed to happen.
+        # Checked before credentials are resolved, so a blocked attempt never prompts first.
+        if (-not $DryRun -and $script:LabReadOnly) {
+            $blockedReadOnly = $true
+            $result = [pscustomobject]@{ VMId = $VMId; Completed = 0; Skipped = 0; Failed = 1
+                BytesTransferred = [long]0
+                Errors = [string[]]@('Read-only mode: a real file copy is blocked under -ReadOnly. Retry with a dry run.') }
+            return $result
+        }
+        $resolvedCredential = Resolve-LabWindowsCredential $Credential $NonInteractive
         $session = New-LabPSDirectSession $VMId $resolvedCredential
+        $copyAttempted = $true
         $result = Copy-LabTransferItem $session $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun $PermissionProfile
-        return $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
+        $result = $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
+        return $result
+    } catch {
+        $transferError = $_
+        throw
     } finally {
         if ($session) { Remove-PSSession $session }
+        # One record per transfer attempt, whichever entry point called this. Paths, counts and
+        # options only: never credential material or file contents.
+        $status = if ($null -eq $result) { if ($copyAttempted) { 'FAILED_OR_UNCONFIRMED' } else { 'FAILED' } }
+            elseif ($blockedReadOnly) { 'BLOCKED_READONLY' }
+            elseif ($DryRun) { 'DRY_RUN' }
+            elseif ($result.Failed -eq 0) { 'COMPLETED' }
+            elseif ($result.Completed -gt 0) { 'PARTIAL' }
+            else { 'FAILED' }
+        $detail = 'Direction={0}; Source={1}; Destination={2}; Recurse={3}; OnConflict={4}; PermissionProfile={5}; VerifyHash={6}; DryRun={7}' -f
+            $Direction, $SourcePath, $DestinationPath, $Recurse, $OnConflict, $PermissionProfile, $VerifyHash, $DryRun
+        if ($null -ne $result) {
+            $detail += '; Completed={0}; Skipped={1}; Failed={2}; BytesTransferred={3}' -f
+                $result.Completed, $result.Skipped, $result.Failed, $result.BytesTransferred
+        } elseif ($null -ne $transferError) {
+            $detail += '; Error={0}' -f $transferError.Exception.Message
+        }
+        $auditVm = if ($null -ne $vm) { $vm } else { [pscustomobject]@{ Id = $VMId; Name = $null } }
+        try { Write-LabAudit 'file-transfer' $status $auditVm $detail }
+        catch { Write-Warning "Could not write the file-transfer audit record ($status): $($_.Exception.Message)" }
     }
 }
 
@@ -1895,6 +1979,13 @@ function Start-LabVMManager {
     }
 }
 
+function Get-LabTransferOnlyParameter {
+    param([AllowEmptyCollection()][string[]]$BoundParameterNames)
+    $transferOnly = @('VMName', 'VMId', 'SourcePath', 'DestinationPath', 'Recurse', 'OnConflict', 'DryRun',
+        'NonInteractive', 'VerifyHash', 'PermissionProfile', 'Credential')
+    return @($transferOnly | Where-Object { $BoundParameterNames -contains $_ })
+}
+
 function Start-LabFileTransferCli {
     param(
         [bool]$CopyToVM, [bool]$CopyFromVM, [string]$VMName, [Nullable[guid]]$VMId,
@@ -1913,9 +2004,22 @@ function Start-LabFileTransferCli {
     Write-LabAudit 'session' 'STARTED' $null ("ReadOnly={0}" -f $script:LabReadOnly)
     try {
         $resolvedVMId = Resolve-LabVMByNameOrId -VMName $VMName -VMId $VMId
-        $result = Invoke-LabFileTransfer -VMId $resolvedVMId -Direction $direction -SourcePath $SourcePath `
-            -DestinationPath $DestinationPath -Recurse $Recurse -OnConflict $OnConflict -VerifyHash $VerifyHash `
-            -DryRun $DryRun -Credential $Credential -NonInteractive $NonInteractive -PermissionProfile $PermissionProfile
+        # Same per-VM lock as Invoke-LabAction (which the menu's copy options go through), held for the
+        # whole transfer. Taken directly rather than via Invoke-LabAction, which would discard the
+        # summary object the exit code is derived from.
+        $mutex = [Threading.Mutex]::new($false, "Global\LabVmManager-$resolvedVMId")
+        $held = $false
+        try {
+            try { $held = $mutex.WaitOne(0) }
+            catch [Threading.AbandonedMutexException] { $held = $true }
+            if (-not $held) { throw 'Another copy of this script is operating on this VM. No transfer was started here.' }
+            $result = Invoke-LabFileTransfer -VMId $resolvedVMId -Direction $direction -SourcePath $SourcePath `
+                -DestinationPath $DestinationPath -Recurse $Recurse -OnConflict $OnConflict -VerifyHash $VerifyHash `
+                -DryRun $DryRun -Credential $Credential -NonInteractive $NonInteractive -PermissionProfile $PermissionProfile
+        } finally {
+            if ($held) { $mutex.ReleaseMutex() }
+            $mutex.Dispose()
+        }
         Write-Host "Completed: $($result.Completed); Skipped: $($result.Skipped); Failed: $($result.Failed); Bytes transferred: $($result.BytesTransferred)"
         if ($result.Failed -gt 0) {
             foreach ($errorMessage in $result.Errors) { Write-Warning "  $errorMessage" }
@@ -1944,6 +2048,14 @@ if ($MyInvocation.InvocationName -ne '.') {
             exit 1
         }
     } else {
+        # Transfer parameters without a direction switch must not silently open the menu: an
+        # unattended -NonInteractive run would otherwise hang at its first prompt.
+        $orphanTransferParameters = @(Get-LabTransferOnlyParameter @($PSBoundParameters.Keys))
+        if ($orphanTransferParameters.Count -gt 0) {
+            Write-Error -Message ('{0} only apply to file transfer; add -CopyToVM or -CopyFromVM. The menu was not opened.' -f
+                (($orphanTransferParameters | ForEach-Object { "-$_" }) -join ', ')) -ErrorAction Continue
+            exit 1
+        }
         try { Start-LabVMManager -RequestedLogRoot $LogRoot }
         catch {
             Write-Error -Message $_.Exception.Message -ErrorAction Continue

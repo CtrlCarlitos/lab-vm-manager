@@ -6,6 +6,9 @@
     This does NOT run the UI, dot-source the whole manager, or import Hyper-V.
     Only explicitly allowlisted function definitions are evaluated from its AST.
     Get-VM is replaced with an in-memory function for VM-ID/state guard tests.
+    One test launches Lab-VM.ps1 in a child powershell.exe with transfer-only
+    parameters and no direction switch, which exits at the invocation gate
+    before host checks, logging or the UI.
     Run without administrator privileges. This is not a Hyper-V integration test.
 #>
 [CmdletBinding()]
@@ -45,7 +48,8 @@ Write-Host 'PASS: the full script parses in this PowerShell runtime.'
 
 $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointName',
     'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
-    'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff')
+    'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
+    'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -277,6 +281,40 @@ try {
         Assert-Equal $script:CopyCalls 0
         Assert-Equal (Get-LabXferText $dest) 'alpha'
     }
+    Test-Case 'Transfer: single file into a missing nested parent directory creates it' {
+        $dest = Get-LabXferDest 'newparent\.ssh\id_test'
+        $r = Invoke-LabXfer 'ToVM' (Join-Path $script:XferSrc 'a.txt') $dest $false 'Error'
+        Assert-Equal $r.Completed 1
+        Assert-Equal $r.Failed 0
+        Assert-Equal (Get-LabXferText $dest) 'alpha'
+        Assert-Equal (Get-LabXferTempCount) 0
+    }
+    Test-Case 'Transfer: failed single-file copy removes the empty parents it created' {
+        $dest = Get-LabXferDest 'orphan\a\b\id_test'
+        $r = Invoke-LabXfer 'FromVM' (Join-Path $script:XferSrc 'a.txt') $dest $false 'Error' -Mode 'CorruptA'
+        Assert-Equal $r.Failed 1
+        Assert-Equal (Test-Path -LiteralPath (Get-LabXferDest 'orphan')) $false
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $script:XferBase 'dst'))) $true
+    }
+    Test-Case 'Transfer: failed single-file copy never removes a pre-existing parent' {
+        $parent = Get-LabXferDest 'keepme'
+        [void][IO.Directory]::CreateDirectory($parent)
+        $r = Invoke-LabXfer 'ToVM' (Join-Path $script:XferSrc 'a.txt') (Join-Path $parent 'new\id_test') $false 'Error' -Mode 'Throw'
+        Assert-Equal $r.Failed 1
+        Assert-Equal ([IO.Directory]::Exists($parent)) $true
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $parent 'new'))) $false
+    }
+    Test-Case 'Transfer: an invalid destination path is a failed item, not a thrown error' {
+        $r = Invoke-LabXfer 'ToVM' (Join-Path $script:XferSrc 'a.txt') (Get-LabXferDest 'bad|dir\id_test') $false 'Error'
+        Assert-Equal $r.Failed 1
+        Assert-Equal $script:CopyCalls 0
+    }
+    Test-Case 'Transfer: single-file dry run into a missing parent creates nothing' {
+        $r = Invoke-LabXfer 'ToVM' (Join-Path $script:XferSrc 'a.txt') (Get-LabXferDest 'dryparent\id_test') $false 'Error' -DryRun $true
+        Assert-Equal $r.Completed 1
+        Assert-Equal $script:CopyCalls 0
+        Assert-Equal (Test-Path -LiteralPath (Get-LabXferDest 'dryparent')) $false
+    }
     Test-Case 'Transfer: single-file verification failure writes nothing and removes temp' {
         $dest = Get-LabXferDest 'bad.txt'
         $r = Invoke-LabXfer 'ToVM' (Join-Path $script:XferSrc 'a.txt') $dest $false 'Error' -Mode 'CorruptA'
@@ -390,6 +428,208 @@ try {
 } finally {
     Get-ChildItem -LiteralPath $script:XferBase -Recurse -Force | ForEach-Object { $_.Attributes = 'Normal' }
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $script:XferBase -Recurse -Force
+}
+
+# --- Orchestrator (Invoke-LabFileTransfer) audit record ---
+# The real orchestrator and the real Assert-LabVMRunning (over the fake Get-VM) run; the credential
+# prompt, PowerShell Direct session, engine and audit writer are replaced. Defined after the engine
+# tests on purpose: the Copy-LabTransferItem stand-in below replaces the real engine from here on.
+foreach ($name in @('Invoke-LabFileTransfer', 'Start-LabFileTransferCli')) {
+    $matches = @($definitions | Where-Object { $_.Name -ceq $name })
+    if ($matches.Count -ne 1) { throw "Expected one definition of $name." }
+    . ([scriptblock]::Create($matches[0].Extent.Text))
+}
+$script:LabReadOnly = $false
+$script:LabLogFile = 'test-audit.jsonl'
+$script:AuditRecords = [Collections.Generic.List[object]]::new()
+$script:CredentialCalls = 0
+$script:SessionsOpened = 0
+$script:SessionsClosed = 0
+$script:EngineOutcome = $null
+$script:TestCredential = [pscredential]::new('labuser', (ConvertTo-SecureString 'S3cret-Pa55' -AsPlainText -Force))
+function Write-LabAudit {
+    param([string]$Action, [string]$Status, $VM = $null, [string]$Detail = '')
+    $script:AuditRecords.Add([pscustomobject]@{ Action = $Action; Status = $Status
+        VMId = $(if ($null -eq $VM) { $null } else { [string]$VM.Id }); Detail = $Detail })
+}
+function Resolve-LabWindowsCredential { param($Credential, [bool]$NonInteractive) $script:CredentialCalls++; return $script:TestCredential }
+function New-LabPSDirectSession { param($VMId, $Credential) $script:SessionsOpened++; return [pscustomobject]@{ State = 'Opened' } }
+function Remove-PSSession { param($Session) $script:SessionsClosed++ }
+function Copy-LabTransferItem {
+    if ($script:EngineOutcome -is [string]) { throw $script:EngineOutcome }
+    return [pscustomobject]$script:EngineOutcome
+}
+function Invoke-LabXferOrchestrator {
+    param($Outcome, [bool]$DryRun = $false, [bool]$ReadOnly = $false, [string]$State = 'Running')
+    $script:AuditRecords.Clear()
+    $script:CredentialCalls = 0; $script:SessionsOpened = 0; $script:SessionsClosed = 0
+    $script:EngineOutcome = $Outcome
+    $script:LabReadOnly = $ReadOnly
+    $script:FakeVM.State = $State
+    try {
+        return Invoke-LabFileTransfer -VMId $script:FakeId -Direction 'ToVM' -SourcePath 'C:\src\id_test' `
+            -DestinationPath 'C:\Users\dev\.ssh\id_test' -Recurse $false -OnConflict 'Skip' -VerifyHash $true `
+            -DryRun $DryRun -Credential $null -NonInteractive $true -PermissionProfile 'PrivateFiles'
+    } finally { $script:LabReadOnly = $false; $script:FakeVM.State = 'Off' }
+}
+function Get-LabOnlyAuditRecord {
+    if ($script:AuditRecords.Count -ne 1) { throw "Expected exactly one audit record, got $($script:AuditRecords.Count)." }
+    $record = $script:AuditRecords[0]
+    Assert-Equal $record.Action 'file-transfer'
+    Assert-Equal $record.VMId ([string]$script:FakeId)
+    if ($record.Detail -match 'S3cret|labuser|Credential') { throw "Audit detail leaks credential material: $($record.Detail)" }
+    return $record
+}
+function Assert-Contains { param([string]$Text, [string]$Expected) if (-not $Text.Contains($Expected)) { throw "Expected [$Expected] in [$Text]." } }
+
+Test-Case 'Audit: a clean transfer is recorded as COMPLETED with paths, options and counts' {
+    $r = Invoke-LabXferOrchestrator @{ Completed = 1; Skipped = 0; Failed = 0; BytesTransferred = [long]5; Errors = [string[]]@() }
+    Assert-Equal $r.Completed 1
+    Assert-Equal $r.VMId $script:FakeId
+    $record = Get-LabOnlyAuditRecord
+    Assert-Equal $record.Status 'COMPLETED'
+    foreach ($part in @('Direction=ToVM', 'Source=C:\src\id_test', 'Destination=C:\Users\dev\.ssh\id_test', 'OnConflict=Skip',
+            'PermissionProfile=PrivateFiles', 'VerifyHash=True', 'Completed=1; Skipped=0; Failed=0')) { Assert-Contains $record.Detail $part }
+    Assert-Equal $script:SessionsClosed 1
+}
+Test-Case 'Audit: some failed, some completed is PARTIAL' {
+    $null = Invoke-LabXferOrchestrator @{ Completed = 2; Skipped = 0; Failed = 1; BytesTransferred = [long]5; Errors = [string[]]@('x') }
+    Assert-Equal (Get-LabOnlyAuditRecord).Status 'PARTIAL'
+}
+Test-Case 'Audit: failures with nothing completed is FAILED' {
+    $null = Invoke-LabXferOrchestrator @{ Completed = 0; Skipped = 1; Failed = 1; BytesTransferred = [long]0; Errors = [string[]]@('x') }
+    $record = Get-LabOnlyAuditRecord
+    Assert-Equal $record.Status 'FAILED'
+    Assert-Contains $record.Detail 'Completed=0; Skipped=1; Failed=1'
+}
+Test-Case 'Audit: a dry run is DRY_RUN' {
+    $null = Invoke-LabXferOrchestrator @{ Completed = 1; Skipped = 0; Failed = 0; BytesTransferred = [long]0; Errors = [string[]]@() } -DryRun $true
+    Assert-Equal (Get-LabOnlyAuditRecord).Status 'DRY_RUN'
+}
+Test-Case 'Audit: a read-only real copy is BLOCKED_READONLY and never prompts or connects' {
+    $r = Invoke-LabXferOrchestrator @{ Completed = 1; Skipped = 0; Failed = 0; BytesTransferred = [long]0; Errors = [string[]]@() } -ReadOnly $true
+    Assert-Equal $r.Failed 1
+    Assert-Equal (Get-LabOnlyAuditRecord).Status 'BLOCKED_READONLY'
+    Assert-Equal $script:CredentialCalls 0
+    Assert-Equal $script:SessionsOpened 0
+}
+Test-Case 'Audit: a read-only dry run still resolves credentials and runs' {
+    $null = Invoke-LabXferOrchestrator @{ Completed = 1; Skipped = 0; Failed = 0; BytesTransferred = [long]0; Errors = [string[]]@() } -DryRun $true -ReadOnly $true
+    Assert-Equal (Get-LabOnlyAuditRecord).Status 'DRY_RUN'
+    Assert-Equal $script:CredentialCalls 1
+}
+Test-Case 'Audit: an engine failure mid-transfer is still recorded, and rethrown' {
+    Assert-Throws { Invoke-LabXferOrchestrator 'simulated connection loss' } 'simulated connection loss'
+    $record = Get-LabOnlyAuditRecord
+    Assert-Equal $record.Status 'FAILED_OR_UNCONFIRMED'
+    Assert-Contains $record.Detail 'Error=simulated connection loss'
+    Assert-Equal $script:SessionsClosed 1
+}
+Test-Case 'Audit: a VM that is not Running is recorded as FAILED before any prompt' {
+    Assert-Throws { Invoke-LabXferOrchestrator @{ Completed = 1 } -State 'Off' } 'requires Running'
+    Assert-Equal (Get-LabOnlyAuditRecord).Status 'FAILED'
+    Assert-Equal $script:CredentialCalls 0
+}
+
+# --- Parameter mode (Start-LabFileTransferCli) per-VM mutex ---
+# Ownership is probed from another thread: a mutex is re-entrant for the thread that holds it.
+$script:CliVMId = [guid]::NewGuid()
+$script:CliThrow = $false
+$script:TransferCalls = 0
+$script:MutexFreeDuringTransfer = $null
+function Test-LabMutexFreeElsewhere {
+    param([guid]$Id)
+    $ps = [powershell]::Create()
+    try {
+        [void]$ps.AddScript({
+            param([string]$MutexName)
+            $m = [Threading.Mutex]::new($false, $MutexName)
+            try {
+                $got = $false
+                try { $got = $m.WaitOne(0) } catch [Threading.AbandonedMutexException] { $got = $true }
+                if ($got) { $m.ReleaseMutex() }
+                $got
+            } finally { $m.Dispose() }
+        }).AddArgument("Global\LabVmManager-$Id")
+        return ([string](@($ps.EndInvoke($ps.BeginInvoke()))[0]) -eq 'True')
+    } finally { $ps.Dispose() }
+}
+function Assert-LabHost { }
+function Initialize-LabLog { param([string]$Root) }
+function Resolve-LabVMByNameOrId { param([string]$VMName, $VMId) return $script:CliVMId }
+function Invoke-LabFileTransfer {
+    $script:TransferCalls++
+    $script:MutexFreeDuringTransfer = Test-LabMutexFreeElsewhere $script:CliVMId
+    if ($script:CliThrow) { throw 'simulated transfer failure' }
+    return [pscustomobject]@{ VMId = $script:CliVMId; Completed = 1; Skipped = 0; Failed = 2; BytesTransferred = [long]5; Errors = [string[]]@('x', 'y') }
+}
+function Invoke-LabCli {
+    $script:TransferCalls = 0
+    $script:MutexFreeDuringTransfer = $null
+    return Start-LabFileTransferCli -CopyToVM $true -CopyFromVM $false -VMName 'LAB-Test' -VMId $null -SourcePath 'C:\a' `
+        -DestinationPath 'C:\b' -Recurse $false -OnConflict 'Error' -DryRun $false -NonInteractive $true -VerifyHash $false `
+        -PermissionProfile 'Default' -Credential $null -RequestedLogRoot '' 6>$null 3>$null
+}
+
+Test-Case 'CLI: the per-VM mutex is held for the whole transfer, released after, and the summary survives' {
+    Assert-Equal (Test-LabMutexFreeElsewhere $script:CliVMId) $true
+    $failed = Invoke-LabCli
+    Assert-Equal $script:TransferCalls 1
+    Assert-Equal $script:MutexFreeDuringTransfer $false
+    Assert-Equal $failed 2
+    Assert-Equal (Test-LabMutexFreeElsewhere $script:CliVMId) $true
+}
+Test-Case 'CLI: the per-VM mutex is released when the transfer throws' {
+    $script:CliThrow = $true
+    try {
+        Assert-Throws { Invoke-LabCli } 'simulated transfer failure'
+        Assert-Equal $script:MutexFreeDuringTransfer $false
+        Assert-Equal (Test-LabMutexFreeElsewhere $script:CliVMId) $true
+    } finally { $script:CliThrow = $false }
+}
+Test-Case 'CLI: a VM locked by another operation is refused without transferring' {
+    $ready = [Threading.ManualResetEvent]::new($false)
+    $release = [Threading.ManualResetEvent]::new($false)
+    $holder = [powershell]::Create()
+    [void]$holder.AddScript({
+        param([string]$MutexName, $Ready, $Release)
+        $m = [Threading.Mutex]::new($false, $MutexName)
+        [void]$m.WaitOne()
+        try { [void]$Ready.Set(); [void]$Release.WaitOne(30000) }
+        finally { $m.ReleaseMutex(); $m.Dispose() }
+    }).AddArgument("Global\LabVmManager-$script:CliVMId").AddArgument($ready).AddArgument($release)
+    $handle = $holder.BeginInvoke()
+    try {
+        if (-not $ready.WaitOne(30000)) { throw 'The lock-holding thread did not start.' }
+        Assert-Throws { Invoke-LabCli } 'Another copy of this script is operating on this VM'
+        Assert-Equal $script:TransferCalls 0
+    } finally {
+        [void]$release.Set()
+        $null = $holder.EndInvoke($handle)
+        $holder.Dispose(); $ready.Dispose(); $release.Dispose()
+    }
+    Assert-Equal (Test-LabMutexFreeElsewhere $script:CliVMId) $true
+}
+
+# --- Invocation gate: transfer parameters without a direction switch ---
+Test-Case 'Gate: menu-only parameters are not transfer-only' {
+    Assert-Equal @(Get-LabTransferOnlyParameter @('ReadOnly', 'LogRoot', 'ExportRoot', 'TimeoutSeconds')).Count 0
+    Assert-Equal @(Get-LabTransferOnlyParameter @()).Count 0
+}
+Test-Case 'Gate: every transfer-only parameter is reported' {
+    foreach ($name in @('VMName', 'VMId', 'SourcePath', 'DestinationPath', 'Recurse', 'OnConflict', 'DryRun',
+            'NonInteractive', 'VerifyHash', 'PermissionProfile', 'Credential')) {
+        Assert-Equal (@(Get-LabTransferOnlyParameter @('ReadOnly', $name)) -join ',') $name
+    }
+}
+Test-Case 'Gate: the real script refuses -NonInteractive without a direction switch instead of opening the menu' {
+    # Local: under 'Stop', Windows PowerShell turns the child's redirected stderr into a terminating error.
+    $ErrorActionPreference = 'Continue'
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $output = @(& $exe -NoProfile -NonInteractive -File $resolved -VMName 'LAB-x' -NonInteractive 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Equal $LASTEXITCODE 1
+    # Whitespace-insensitive: the child may wrap the error text at its console width.
+    if (-not ($output -replace '\s', '').Contains('-VMName,-NonInteractiveonlyapplytofiletransfer')) { throw "Unexpected output: $output" }
 }
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
