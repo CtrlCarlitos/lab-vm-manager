@@ -8,9 +8,14 @@
     Checkpoint changes and exports require the VM to be Off. Restores offer an
     optional safety checkpoint and never issue an automatic start/resume.
     LAB-* VMs can be created, have settings edited, and be deleted (virtual
-    disks are retained). Guest provisioning, credential copying, and disk
-    file deletion are not implemented. This is an operator tool, not a
-    security boundary against another administrator or an untrusted guest.
+    disks are retained). File transfer to/from a Running VM is available
+    both from the interactive menu and, via -CopyToVM/-CopyFromVM and their
+    related parameters below, as a non-interactive parameter-mode CLI
+    surface that runs one transfer and exits; see README.md ("Parameter
+    mode: file transfer") for the full parameter list and examples. Guest
+    provisioning, credential copying, and disk file deletion are not
+    implemented. This is an operator tool, not a security boundary against
+    another administrator or an untrusted guest.
 .PARAMETER ReadOnly
     Allows inventory, details and checkpoint listing; blocks all VM changes.
     A host-side audit log is still written.
