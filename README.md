@@ -81,6 +81,7 @@ The selected-VM menu provides:
 | 8 | Delete one checkpoint; VM must be Off; never requests subtree deletion |
 | 9 | Export the full VM into a fresh folder; VM must be Off |
 | 10 | Explicitly select Standard checkpoints and disable automatic checkpoints |
+| 11 | Edit VM settings: name, notes, vCPU count, memory, network switch; VM must be Off |
 | X | Emergency power-off, with strong confirmation and data-loss warning |
 | R / B / Q | Refresh / choose another VM / quit |
 
@@ -143,7 +144,7 @@ Deleting a checkpoint removes the return point; it does not restore it. Hyper-V 
 
 ## Intentionally not included
 
-No VM clone/import, OS activation/licensing, post-creation CPU/RAM tuning, network/firewall changes, remote hosts, automatic login, dotfiles execution, guest result collection, automatic checkpoint pruning, or VM/disk deletion. Those can be separate explicit workflows; a restore menu should not silently provision or erase unrelated state.
+No VM clone/import, OS activation/licensing, remote hosts, automatic login, dotfiles execution, guest result collection, automatic checkpoint pruning, or VM/disk deletion. Those can be separate explicit workflows; a restore menu should not silently provision or erase unrelated state.
 
 ## Primary references
 

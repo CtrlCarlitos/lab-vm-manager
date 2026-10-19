@@ -44,7 +44,8 @@ if ($errors.Count -gt 0) {
 Write-Host 'PASS: the full script parses in this PowerShell runtime.'
 
 $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointName',
-    'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec')
+    'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
+    'Get-LabSettingsDiff')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -124,6 +125,30 @@ Test-Case 'Dynamic memory rejects non-multiple-of-2MB value' { Assert-Equal (Tes
 Test-Case 'Dynamic memory accepts valid ordered range' { Assert-Equal (Test-LabMemorySpec 512MB 1GB 4GB $true) $true }
 Test-Case 'Static memory ignores min/max and checks startup only' { Assert-Equal (Test-LabMemorySpec 0 2GB 0 $false) $true }
 Test-Case 'Static memory rejects non-positive startup' { Assert-Equal (Test-LabMemorySpec 0 0 0 $false) $false }
+Test-Case 'No diff when values are identical' {
+    $current = [pscustomobject]@{ Name='LAB-Test'; VCpuCount=2; StartupBytes=2GB }
+    Assert-Equal (Get-LabSettingsDiff $current $current).Count 0
+}
+Test-Case 'Diff reports only changed fields' {
+    $current = [pscustomobject]@{ Name='LAB-Test'; VCpuCount=2; StartupBytes=2GB }
+    $proposed = [pscustomobject]@{ Name='LAB-Test'; VCpuCount=4; StartupBytes=2GB }
+    $diff = Get-LabSettingsDiff $current $proposed
+    Assert-Equal $diff.Count 1
+    Assert-Equal $diff[0].Field 'VCpuCount'
+    Assert-Equal $diff[0].NewValue 4
+}
+Test-Case 'Diff only compares fields shared by both objects' {
+    $current = [pscustomobject]@{ Name='LAB-Test' }
+    $proposed = [pscustomobject]@{ Name='LAB-Test'; Notes='extra field not on current' }
+    Assert-Equal (Get-LabSettingsDiff $current $proposed).Count 0
+}
+Test-Case 'Diff uses exact boolean comparison for DynamicMemoryEnabled' {
+    $current = [pscustomobject]@{ DynamicMemoryEnabled = $false }
+    $proposed = [pscustomobject]@{ DynamicMemoryEnabled = $true }
+    $diff = Get-LabSettingsDiff $current $proposed
+    Assert-Equal $diff.Count 1
+    Assert-Equal $diff[0].Field 'DynamicMemoryEnabled'
+}
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
 if ($script:Failed -gt 0) { exit 1 }

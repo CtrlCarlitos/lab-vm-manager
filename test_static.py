@@ -76,6 +76,21 @@ class SourceContract(unittest.TestCase):
         self.assertRegex(self.s, r'New-VM[^\r\n]*-Generation 2')
     def test_create_vm_name_collision_lock(self):
         self.assertIn('LabVmManager-Create-', self.s)
+    def test_edit_requires_off(self):
+        body = self.s.split('function Edit-LabVMSettings {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Assert-LabVMOff', body)
+    def test_edit_rename_preserves_lab_prefix(self):
+        body = self.s.split('function Set-LabVMSettingsCore {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Test-LabNewVMName', body)
+    def test_edit_no_generation_change(self):
+        body = self.s.split('function Set-LabVMSettingsCore {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn('-Generation', body)
+    def test_edit_diff_is_pure(self):
+        body = self.s.split('function Get-LabSettingsDiff {', 1)[1].split('\nfunction ', 1)[0]
+        for cmd in ['Get-VM', 'Set-VM', 'Rename-VM', 'Connect-VMNetworkAdapter', 'Disconnect-VMNetworkAdapter']:
+            self.assertNotIn(cmd, body)
+    def test_edit_menu_option_eleven(self):
+        self.assertIn("'11' { Invoke-LabAction $VMId 'edit-settings-menu' { param($id) Edit-LabVMSettings $id } }", self.s)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -25,6 +25,18 @@
 - Repeat creation using the same name and storage root as a prior successful create: it must be rejected before any Hyper-V call because the dedicated VM/VHDX destination already exists.
 - Choose "Disconnected" for the switch: verify the new VM's network adapter has no switch attached.
 
+## Edit VM settings
+
+- Select a disposable VM while it is Running or Saved; choose option 11: it must refuse with a message requiring Off, and make no change.
+- Shut down normally, then choose option 11. Verify every prompt shows the VM's current value (name, notes, vCPU count, dynamic/static memory, min/startup/max bytes, current switch or Disconnected) and that pressing Enter on every prompt keeps that field unchanged.
+- Repeat with every field left blank through to the diff screen: it must report no changes and return without a confirmation prompt or any audit `COMPLETED` entry.
+- Enter a new name that does not start with `LAB-`, or that matches another existing VM's name (case-insensitive): it must be rejected with a re-prompt, not accepted.
+- Change only the vCPU count to a valid new value, confirm with the exact `EDIT <name>` phrase, and verify the diff screen listed only that field. After completion, confirm the new vCPU count in Hyper-V Manager or option 1, and that notes/memory/switch are unchanged.
+- Change the memory spec to an invalid combination (e.g. minimum greater than startup under dynamic memory): it must be rejected with a re-prompt, not applied.
+- Change the network switch selection to a different existing switch, then to "Disconnected": verify the adapter's switch updates to match each choice.
+- Cancel at the final `EDIT <name>` confirmation after making a change: verify no setting was altered and no `COMPLETED` audit entry was written for this attempt.
+- If the VM has more than one network adapter, confirm the tool states which adapter it manages and leaves the others untouched.
+
 ## Disposable baseline
 
 - Shut down the guest normally. Select option 10 and cancel the confirmation: policy must not change.

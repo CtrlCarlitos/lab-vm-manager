@@ -757,6 +757,249 @@ function Set-LabCheckpointPolicy {
     return 'COMPLETED'
 }
 
+function Get-LabSettingsDiff {
+    param([pscustomobject]$Current, [pscustomobject]$Proposed)
+    $fields = @('Name', 'Notes', 'VCpuCount', 'StartupBytes', 'MinimumBytes', 'MaximumBytes', 'DynamicMemoryEnabled', 'SwitchName')
+    $diff = @()
+    foreach ($field in $fields) {
+        $currentProperty = $Current.PSObject.Properties[$field]
+        $proposedProperty = $Proposed.PSObject.Properties[$field]
+        if ($null -eq $currentProperty -or $null -eq $proposedProperty) { continue }
+        $oldValue = $currentProperty.Value
+        $newValue = $proposedProperty.Value
+        # DynamicMemoryEnabled is a bool; -ne can misfire on loose equality, so compare it exactly.
+        $changed = $(if ($field -eq 'DynamicMemoryEnabled') { ([bool]$oldValue) -cne ([bool]$newValue) } else { $oldValue -ne $newValue })
+        if ($changed) {
+            $diff += [pscustomobject]@{ Field = $field; OldValue = $oldValue; NewValue = $newValue }
+        }
+    }
+    # Comma forces this out as one array object; plain `return @($diff)` would unwrap a
+    # 0- or 1-element result through the pipeline and strip its array-ness.
+    return ,$diff
+}
+
+function Set-LabVMSettingsCore {
+    param([guid]$VMId, [pscustomobject[]]$Diff)
+    $vm = Assert-LabVMOff $VMId
+    $applied = @()
+    try {
+        foreach ($entry in $Diff) {
+            switch ($entry.Field) {
+                'Name' {
+                    $existingNames = @((Get-VM -ErrorAction Stop).Name | Where-Object { $_ -ne $vm.Name })
+                    if (-not (Test-LabNewVMName $entry.NewValue $existingNames)) {
+                        throw "New name '$($entry.NewValue)' is invalid or already in use."
+                    }
+                    Rename-VM -VM $vm -NewName $entry.NewValue -Confirm:$false -ErrorAction Stop
+                    $vm = Get-LabVM $VMId
+                    if ($vm.Name -cne $entry.NewValue) { throw "Field 'Name' did not verify after applying." }
+                    $applied += 'Name'
+                }
+                'Notes' {
+                    Set-VM -VM $vm -Notes $entry.NewValue -Confirm:$false -ErrorAction Stop
+                    $vm = Get-LabVM $VMId
+                    if ([string]$vm.Notes -cne [string]$entry.NewValue) { throw "Field 'Notes' did not verify after applying." }
+                    $applied += 'Notes'
+                }
+                'VCpuCount' {
+                    Set-VMProcessor -VM $vm -Count $entry.NewValue -Confirm:$false -ErrorAction Stop
+                    $vm = Get-LabVM $VMId
+                    if ($vm.ProcessorCount -ne $entry.NewValue) { throw "Field 'VCpuCount' did not verify after applying." }
+                    $applied += 'VCpuCount'
+                }
+                'SwitchName' {
+                    $adapter = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop)[0]
+                    if ($null -eq $adapter) { throw 'VM has no network adapter to reconnect.' }
+                    if ([string]::IsNullOrEmpty($entry.NewValue)) {
+                        Disconnect-VMNetworkAdapter -VMNetworkAdapter $adapter -Confirm:$false -ErrorAction Stop
+                    } else {
+                        if ((Get-LabSwitchNames) -notcontains $entry.NewValue) { throw "Virtual switch '$($entry.NewValue)' is no longer available." }
+                        Connect-VMNetworkAdapter -VMNetworkAdapter $adapter -SwitchName $entry.NewValue -Confirm:$false -ErrorAction Stop
+                    }
+                    $vm = Get-LabVM $VMId
+                    $actualSwitch = [string]@(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop)[0].SwitchName
+                    $expectedSwitch = $(if ([string]::IsNullOrEmpty($entry.NewValue)) { '' } else { $entry.NewValue })
+                    if ($actualSwitch -cne $expectedSwitch) { throw "Field 'SwitchName' did not verify after applying." }
+                    $applied += 'SwitchName'
+                }
+                default {
+                    # MinimumBytes/StartupBytes/MaximumBytes/DynamicMemoryEnabled are applied together below,
+                    # since Set-VMMemory validates minimum <= startup <= maximum as one consistent set.
+                }
+            }
+        }
+
+        $memoryFieldNames = @('MinimumBytes', 'StartupBytes', 'MaximumBytes', 'DynamicMemoryEnabled')
+        $memoryDiff = @($Diff | Where-Object { $memoryFieldNames -contains $_.Field })
+        if ($memoryDiff.Count -gt 0) {
+            $minimumBytes = [long]$vm.MemoryMinimum
+            $startupBytes = [long]$vm.MemoryStartup
+            $maximumBytes = [long]$vm.MemoryMaximum
+            $isDynamic = [bool]$vm.DynamicMemoryEnabled
+            foreach ($entry in $memoryDiff) {
+                switch ($entry.Field) {
+                    'MinimumBytes' { $minimumBytes = $entry.NewValue }
+                    'StartupBytes' { $startupBytes = $entry.NewValue }
+                    'MaximumBytes' { $maximumBytes = $entry.NewValue }
+                    'DynamicMemoryEnabled' { $isDynamic = $entry.NewValue }
+                }
+            }
+            Set-VMMemory -VM $vm -DynamicMemoryEnabled $isDynamic -MinimumBytes $minimumBytes `
+                -StartupBytes $startupBytes -MaximumBytes $maximumBytes -Confirm:$false -ErrorAction Stop
+            $vm = Get-LabVM $VMId
+            foreach ($entry in $memoryDiff) {
+                $actual = switch ($entry.Field) {
+                    'MinimumBytes' { [long]$vm.MemoryMinimum }
+                    'StartupBytes' { [long]$vm.MemoryStartup }
+                    'MaximumBytes' { [long]$vm.MemoryMaximum }
+                    'DynamicMemoryEnabled' { [bool]$vm.DynamicMemoryEnabled }
+                }
+                if ($actual -ne $entry.NewValue) { throw "Field '$($entry.Field)' did not verify after applying." }
+                $applied += $entry.Field
+            }
+        }
+    } catch [Management.Automation.PipelineStoppedException] {
+        throw
+    } catch {
+        $appliedText = $(if ($applied.Count -eq 0) { '(none)' } else { $applied -join ', ' })
+        throw "$($_.Exception.Message) Fields applied before this failure: $appliedText."
+    }
+    return (Get-LabVM $VMId)
+}
+
+function Edit-LabVMSettings {
+    param([guid]$VMId)
+    $vm = Assert-LabVMOff $VMId
+    $adapters = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop)
+    if ($adapters.Count -eq 0) {
+        $adapter = $null
+    } else {
+        if ($adapters.Count -gt 1) {
+            Write-Host "Multiple network adapters found; this tool manages only '$($adapters[0].Name)'. Use Hyper-V Manager directly for the others."
+        }
+        $adapter = $adapters[0]
+    }
+    $currentSwitchName = $(if ($null -eq $adapter -or [string]::IsNullOrEmpty($adapter.SwitchName)) { $null } else { [string]$adapter.SwitchName })
+    $current = [pscustomobject]@{
+        Name = $vm.Name
+        Notes = [string]$vm.Notes
+        VCpuCount = [int]$vm.ProcessorCount
+        StartupBytes = [long]$vm.MemoryStartup
+        MinimumBytes = [long]$vm.MemoryMinimum
+        MaximumBytes = [long]$vm.MemoryMaximum
+        DynamicMemoryEnabled = [bool]$vm.DynamicMemoryEnabled
+        SwitchName = $currentSwitchName
+    }
+    Write-Host "`n=== Current settings ==="
+    $current | Format-List | Out-Host
+
+    $existingNames = @((Get-VM -ErrorAction Stop).Name | Where-Object { $_ -ne $vm.Name })
+    while ($true) {
+        $nameInput = Read-LabText "Name [$($current.Name)] (blank keeps current; C cancels)"
+        if ($nameInput -ieq 'C') { return 'CANCELLED' }
+        $newName = $(if ($nameInput -eq '') { $current.Name } else { $nameInput })
+        if ($newName -eq $current.Name -or (Test-LabNewVMName $newName $existingNames)) { break }
+        Write-Host 'Name must start with LAB- (case-insensitive) and not match an existing VM name.'
+    }
+
+    $notesInput = Read-LabText "Notes [$($current.Notes)] (blank keeps current)"
+    $newNotes = $(if ($notesInput -eq '') { $current.Notes } else { $notesInput })
+
+    $defaults = Get-LabHostDefaults
+    while ($true) {
+        $vCpuInput = Read-LabText "vCPU count [$($current.VCpuCount)], 1-$($defaults.LogicalProcessorCount) (blank keeps current; C cancels)"
+        if ($vCpuInput -ieq 'C') { return 'CANCELLED' }
+        if ($vCpuInput -eq '') { $newVCpuCount = $current.VCpuCount; break }
+        $parsedVCpu = 0
+        if ([int]::TryParse($vCpuInput, [ref]$parsedVCpu) -and (Test-LabVCpuCount $parsedVCpu $defaults.LogicalProcessorCount)) {
+            $newVCpuCount = $parsedVCpu; break
+        }
+        Write-Host "Enter a whole number from 1 to $($defaults.LogicalProcessorCount), or blank to keep current."
+    }
+
+    while ($true) {
+        $dynInput = (Read-LabText "Dynamic memory, Y/N [currently $($current.DynamicMemoryEnabled)] (blank keeps current; C cancels)").ToUpperInvariant()
+        if ($dynInput -eq 'C') { return 'CANCELLED' }
+        if ($dynInput -eq '') { $newIsDynamic = $current.DynamicMemoryEnabled; break }
+        if ($dynInput -eq 'Y' -or $dynInput -eq 'YES') { $newIsDynamic = $true; break }
+        if ($dynInput -eq 'N' -or $dynInput -eq 'NO') { $newIsDynamic = $false; break }
+        Write-Host 'Enter Y, N, blank to keep current, or C to cancel.'
+    }
+
+    if ($newIsDynamic) {
+        while ($true) {
+            $minInput = Read-LabText "Minimum memory bytes [$($current.MinimumBytes)] (blank keeps current; C cancels)"
+            if ($minInput -ieq 'C') { return 'CANCELLED' }
+            $startupInput = Read-LabText "Startup memory bytes [$($current.StartupBytes)] (blank keeps current; C cancels)"
+            if ($startupInput -ieq 'C') { return 'CANCELLED' }
+            $maxInput = Read-LabText "Maximum memory bytes [$($current.MaximumBytes)] (blank keeps current; C cancels)"
+            if ($maxInput -ieq 'C') { return 'CANCELLED' }
+            $newMinimumBytes = $current.MinimumBytes; $newStartupBytes = $current.StartupBytes; $newMaximumBytes = $current.MaximumBytes
+            $parsedOk = $true
+            if ($minInput -ne '') { $parsedValue = 0L; if ([long]::TryParse($minInput, [ref]$parsedValue)) { $newMinimumBytes = $parsedValue } else { $parsedOk = $false } }
+            if ($startupInput -ne '') { $parsedValue = 0L; if ([long]::TryParse($startupInput, [ref]$parsedValue)) { $newStartupBytes = $parsedValue } else { $parsedOk = $false } }
+            if ($maxInput -ne '') { $parsedValue = 0L; if ([long]::TryParse($maxInput, [ref]$parsedValue)) { $newMaximumBytes = $parsedValue } else { $parsedOk = $false } }
+            if ($parsedOk -and (Test-LabMemorySpec $newMinimumBytes $newStartupBytes $newMaximumBytes $true)) { break }
+            Write-Host 'Enter whole-byte values, multiples of 2MB, with minimum <= startup <= maximum, or blank to keep current.'
+        }
+    } else {
+        while ($true) {
+            $startupInput = Read-LabText "Startup (static) memory bytes [$($current.StartupBytes)] (blank keeps current; C cancels)"
+            if ($startupInput -ieq 'C') { return 'CANCELLED' }
+            $newStartupBytes = $current.StartupBytes
+            $parsedOk = $true
+            if ($startupInput -ne '') { $parsedValue = 0L; if ([long]::TryParse($startupInput, [ref]$parsedValue)) { $newStartupBytes = $parsedValue } else { $parsedOk = $false } }
+            if ($parsedOk -and (Test-LabMemorySpec 0 $newStartupBytes 0 $false)) { break }
+            Write-Host 'Enter a whole-byte value that is a multiple of 2MB, or blank to keep current.'
+        }
+        $newMinimumBytes = $newStartupBytes
+        $newMaximumBytes = $newStartupBytes
+    }
+
+    $newSwitchName = $current.SwitchName
+    if ($null -eq $adapter) {
+        Write-Host 'No network adapter found; switch assignment is not editable.'
+    } else {
+        $switchNames = @(Get-LabSwitchNames)
+        $rows = for ($i = 0; $i -lt $switchNames.Count; $i++) { [pscustomobject]@{ No = $i + 1; Switch = $switchNames[$i] } }
+        $rows += [pscustomobject]@{ No = $switchNames.Count + 1; Switch = 'Disconnected' }
+        $rows | Format-Table -AutoSize | Out-Host
+        $currentLabel = $(if ([string]::IsNullOrEmpty($current.SwitchName)) { 'Disconnected' } else { $current.SwitchName })
+        while ($true) {
+            $switchAnswer = Read-LabText "Switch number [currently $currentLabel] (blank keeps current; C cancels)"
+            if ($switchAnswer -ieq 'C') { return 'CANCELLED' }
+            if ($switchAnswer -eq '') { break }
+            $switchIndex = ConvertTo-LabMenuIndex $switchAnswer $rows.Count
+            if ($switchIndex -ge 0) {
+                $newSwitchName = $(if ($switchIndex -eq $switchNames.Count) { $null } else { $switchNames[$switchIndex] })
+                break
+            }
+            Write-Host 'Choose a listed number, or blank to keep current.'
+        }
+    }
+
+    $proposed = [pscustomobject]@{
+        Name = $newName
+        Notes = $newNotes
+        VCpuCount = $newVCpuCount
+        StartupBytes = $newStartupBytes
+        MinimumBytes = $newMinimumBytes
+        MaximumBytes = $newMaximumBytes
+        DynamicMemoryEnabled = $newIsDynamic
+        SwitchName = $newSwitchName
+    }
+    $diff = @(Get-LabSettingsDiff $current $proposed)
+    if ($diff.Count -eq 0) { Write-Host 'No changes.'; return 'NO_CHANGE' }
+
+    Write-Host "`n=== Proposed changes ==="
+    $diff | Format-Table -AutoSize -Wrap | Out-Host
+    if (-not (Confirm-LabText "EDIT $($vm.Name)")) { return 'CANCELLED' }
+
+    $updated = Set-LabVMSettingsCore -VMId $VMId -Diff $diff
+    Write-Host "Updated '$($updated.Name)' [$($updated.Id)]."
+    return 'COMPLETED'
+}
+
 function Stop-LabVMPower {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId
@@ -835,6 +1078,7 @@ READ-ONLY: VM-changing operations are disabled.
   8  Delete ONE checkpoint                     [requires Off]
   9  Export full VM to a new folder            [requires Off]
  10  Configure lab checkpoint policy           [requires Off]
+ 11  Edit VM settings                          [requires Off]
   X  EMERGENCY power-off                       [risk of data loss]
   R  Refresh
   B  Choose another VM
@@ -854,6 +1098,7 @@ READ-ONLY: VM-changing operations are disabled.
                 '8'  { Invoke-LabAction $VMId 'delete-checkpoint-menu' { param($id) Remove-LabCheckpoint $id } }
                 '9'  { Invoke-LabAction $VMId 'export-vm-menu' { param($id) Export-LabVM $id } }
                 '10' { Invoke-LabAction $VMId 'configure-policy' { param($id) Set-LabCheckpointPolicy $id } }
+                '11' { Invoke-LabAction $VMId 'edit-settings-menu' { param($id) Edit-LabVMSettings $id } }
                 'X'  { Invoke-LabAction $VMId 'emergency-power-off' { param($id) Stop-LabVMPower $id } }
                 'R'  { continue vmMenu }
                 'B'  { return 'BACK' }
