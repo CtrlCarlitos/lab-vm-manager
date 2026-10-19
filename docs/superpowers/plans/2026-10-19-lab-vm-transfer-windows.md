@@ -341,7 +341,7 @@ git commit -m "feat: add Copy file/directory to/from VM menu options"
 - Consumes: `Invoke-LabFileTransfer` (Task 4); `Get-LabVM`, `Assert-LabHost`, `Initialize-LabLog`, `Write-LabAudit` (existing).
 - Produces:
   - `Resolve-LabVMByNameOrId([AllowEmptyString()][string]$VMName, [Nullable[guid]]$VMId)` → `guid`: exactly one of the two must be supplied (both-or-neither throws); for `$VMName`, matches case-insensitively against `(Get-VM -ErrorAction Stop).Name` with no wildcard expansion, throws naming the ambiguity if more than one match, throws "no matching VM" if zero.
-  - New top-level script parameters (all optional, default unset): `[switch]$CopyToVM`, `[switch]$CopyFromVM` (mutually exclusive — validate in the invocation gate, not via `[CmdletBinding(DefaultParameterSetName=...)]`, to keep the existing `param()` block's style consistent with its current flat structure), `[string]$VMName`, `[Nullable[guid]]$VMId`, `[string]$SourcePath`, `[string]$DestinationPath`, `[switch]$Recurse`, `[ValidateSet('Error','Skip','Overwrite')][string]$OnConflict = 'Error'`, `[switch]$DryRun`, `[switch]$NonInteractive`, `[switch]$VerifyHash`, `[ValidateSet('Default','PrivateFiles')][string]$PermissionProfile = 'Default'`, `[PSCredential]$Credential`.
+  - New top-level script parameters (all optional, default unset): `[switch]$CopyToVM`, `[switch]$CopyFromVM` (mutually exclusive — validate in the invocation gate, not via `[CmdletBinding(DefaultParameterSetName=...)]`, to keep the existing `param()` block's style consistent with its current flat structure), `[string]$VMName`, `[Nullable[guid]]$VMId`, `[string]$SourcePath`, `[string]$DestinationPath`, `[switch]$Recurse`, `[ValidateSet('Error','Skip','Overwrite')][string]$OnConflict = 'Error'`, `[switch]$DryRun`, `[switch]$NonInteractive`, `[switch]$VerifyHash`, `[PSCredential]$Credential`. **Not added here:** `-PermissionProfile` — deliberately deferred to Task 7, which is the only task that can plumb it all the way through `Invoke-LabFileTransfer` into `Copy-LabTransferItem`; adding the CLI switch here would create a parameter that silently does nothing until Task 7 lands.
 
 - [ ] **Step 1: Write failing `test_static.py` cases**
 
@@ -362,7 +362,7 @@ def test_credential_never_passed_as_plaintext_arg(self):
 - [ ] **Step 2: Run `test_static.py` and confirm it fails**
 
 Run: `python test_static.py`
-Expected: FAIL on all four new cases.
+Expected: FAIL on the first three cases (`test_transfer_params_exist`, `test_copyto_and_copyfrom_mutually_exclusive`, `test_parameter_mode_does_not_launch_menu`) — none of those parameters/branches exist yet. `test_credential_never_passed_as_plaintext_arg` is a standing invariant, not a red/green case: it asserts an absence that's already true on unmodified code, so it already passes here and must *stay* passing after Step 4/5 — it isn't expected to go red.
 
 - [ ] **Step 3: Implement `Resolve-LabVMByNameOrId`**
 
@@ -401,25 +401,29 @@ git commit -m "feat: add parameter-mode CLI surface for file transfer"
 
 ---
 
-### Task 7: Private-file permission profile (Windows)
+### Task 7: Private-file permission profile (Windows) — full vertical slice
 
 **Files:**
-- Modify: `Lab-VM.ps1` (extend `Copy-LabTransferItem`'s finalize step; add a small ACL helper)
+- Modify: `Lab-VM.ps1` (extend `Copy-LabTransferItem`'s finalize step and signature; add a small ACL helper; extend `Invoke-LabFileTransfer`'s signature; extend `Copy-LabVMItemInteractive`'s prompts; extend the top `param()` block and the bottom invocation gate)
 - Modify: `test_static.py`
 - Modify: `README.md`, `MANUAL-TESTS.md`
 
 **Interfaces:**
-- Consumes: the finalize step inside `Copy-LabTransferItem` (Task 3) — this task adds a parameter and a hook, it does not restructure the engine.
+- Consumes: the finalize step inside `Copy-LabTransferItem` (Task 3); `Invoke-LabFileTransfer` (Task 4); `Copy-LabVMItemInteractive` (Task 5); the top `param()` block and invocation gate (Task 6). This task is the single place `-PermissionProfile` is threaded through every layer, end to end — it was deliberately kept out of Tasks 4-6 (see Task 6's note) to avoid a parameter that silently does nothing until this task lands.
 - Produces:
   - `Copy-LabTransferItem` gains `[ValidateSet('Default','PrivateFiles')][string]$PermissionProfile = 'Default'`.
-  - `Set-LabTransferPrivateAcl([System.Management.Automation.Runspaces.PSSession]$Session, [AllowNull()]$Session, [string]$Path, [bool]$IsDirectory)`: when `$Session` is `$null` (host-side, `FromVM` finalize), uses `Get-Acl`/`Set-Acl` (or `icacls.exe "$Path" /inheritance:r /grant:r "$($env:USERDOMAIN)\$($env:USERNAME):(F)"`, your choice, document which) to restrict the file/directory to the current host user only; when `$Session` is supplied (guest-side, `ToVM` finalize), runs the equivalent inside `Invoke-Command -Session $Session { ... }` against the *executing guest account* (the account the PS Direct session authenticated as), never an owner inferred from the path. Applied **after** the temp-to-real finalize move, to exactly the finalized file/directory and, when the destination directory root was newly created by this transfer, that root directory too — never recursively re-touches pre-existing sibling files.
+  - `Set-LabTransferPrivateAcl([AllowNull()][System.Management.Automation.Runspaces.PSSession]$Session, [string]$Path, [bool]$IsDirectory)`: when `$Session` is `$null` (host-side, `FromVM` finalize), uses `Get-Acl`/`Set-Acl` (or `icacls.exe "$Path" /inheritance:r /grant:r "$($env:USERDOMAIN)\$($env:USERNAME):(F)"`, your choice, document which) to restrict the file/directory to the current host user only; when `$Session` is supplied (guest-side, `ToVM` finalize), runs the equivalent inside `Invoke-Command -Session $Session { ... }` against the *executing guest account* (the account the PS Direct session authenticated as), never an owner inferred from the path. Applied **after** the temp-to-real finalize move, to exactly the finalized file/directory and, when the destination directory root was newly created by this transfer, that root directory too — never recursively re-touches pre-existing sibling files.
+  - `Invoke-LabFileTransfer` (Task 4) gains `[ValidateSet('Default','PrivateFiles')][string]$PermissionProfile = 'Default'`, forwarded straight to `Copy-LabTransferItem`.
+  - `Copy-LabVMItemInteractive` (Task 5) gains a prompt — "Private files (SSH keys / private configuration)? [y/N]" — mapping to `'PrivateFiles'`/`'Default'`, shown in the preview, passed to `Invoke-LabFileTransfer`.
+  - The top `param()` block gains `[ValidateSet('Default','PrivateFiles')][string]$PermissionProfile = 'Default'`; the invocation gate's transfer branch (Task 6) forwards it to `Invoke-LabFileTransfer`.
 
 - [ ] **Step 1: Write failing `test_static.py` cases**
 
 ```python
-def test_private_permission_profile_param_exists(self):
-    body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
-    self.assertIn("'PrivateFiles'", body)
+def test_private_permission_profile_threaded_through_every_layer(self):
+    self.assertIn("'PrivateFiles'", self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0])
+    self.assertIn('$PermissionProfile', self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0])
+    self.assertIn('PermissionProfile', self.s.split('param(', 1)[1].split(')\n\n', 1)[0])
 def test_private_acl_applied_after_finalize_not_before(self):
     body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
     idx_move = body.index('Move-Item')
@@ -438,16 +442,20 @@ Expected: FAIL on all three new cases.
 
 Per the Interfaces block. Call it immediately after each successful `'Proceed'`/`'Overwrite'` finalize move, only when `$PermissionProfile -eq 'PrivateFiles'`; a failure to establish the ACL turns that item's result into `Failed` (with a message), even though the byte copy itself succeeded — per the issue's "a successful byte copy with failed final permission setup is a failed/partial result" requirement.
 
-- [ ] **Step 4: Run `test_static.py` and confirm it passes**
+- [ ] **Step 4: Thread `$PermissionProfile` through `Invoke-LabFileTransfer`, `Copy-LabVMItemInteractive`, the top `param()` block, and the invocation gate**
+
+Per the Interfaces block — four small, mechanical edits to code that already exists from Tasks 3-6; none of them need new branching logic beyond passing the value one layer further down.
+
+- [ ] **Step 5: Run `test_static.py` and confirm it passes**
 
 Run: `python test_static.py`
 Expected: PASS on all cases.
 
-- [ ] **Step 5: Update `README.md` and `MANUAL-TESTS.md`**
+- [ ] **Step 6: Update `README.md` and `MANUAL-TESTS.md`**
 
-Document the `-PermissionProfile PrivateFiles` option and its Windows-ACL behavior (chmod-style Linux behavior is explicitly future work — see Out of Scope). Add a `MANUAL-TESTS.md` step: copy a synthetic private file both directions with `PrivateFiles`, and verify (via `icacls`/`Get-Acl` on whichever side is the destination) that only the receiving account has access, and that an unrelated pre-existing sibling file in the destination directory is untouched.
+Document the `-PermissionProfile PrivateFiles` option (both the menu prompt and the CLI switch) and its Windows-ACL behavior (chmod-style Linux behavior is explicitly future work — see Out of Scope). Add a `MANUAL-TESTS.md` step: copy a synthetic private file both directions with `PrivateFiles` via both the menu and the CLI, and verify (via `icacls`/`Get-Acl` on whichever side is the destination) that only the receiving account has access, and that an unrelated pre-existing sibling file in the destination directory is untouched.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add Lab-VM.ps1 test_static.py README.md MANUAL-TESTS.md
