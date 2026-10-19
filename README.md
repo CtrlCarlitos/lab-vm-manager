@@ -82,6 +82,7 @@ The selected-VM menu provides:
 | 9 | Export the full VM into a fresh folder; VM must be Off |
 | 10 | Explicitly select Standard checkpoints and disable automatic checkpoints |
 | 11 | Edit VM settings: name, notes, vCPU count, memory, network switch; VM must be Off |
+| 12 | Delete the VM (retain virtual disks); VM must be Off; blocked by non-Standard checkpoints |
 | X | Emergency power-off, with strong confirmation and data-loss warning |
 | R / B / Q | Refresh / choose another VM / quit |
 
@@ -142,9 +143,13 @@ Use independent storage and import-test a copy before depending on an export for
 
 Deleting a checkpoint removes the return point; it does not restore it. Hyper-V owns the disk merging. Never remove `.avhdx` or `.vhdx` files manually. Baseline-like names beginning `00-`, `10-` or `20-` require the longer `DELETE BASELINE ...` confirmation; other names still require exact confirmation. Recovery/backup checkpoint objects are excluded from modification.
 
+## Delete VM
+
+Option `12` calls Hyper-V's `Remove-VM`, which unregisters the VM and its configuration but **never deletes virtual disk files**. A removal preview (name, GUID, VM path, disk paths, checkpoint count) is shown first. Removal is blocked while the VM has any recovery/backup (non-Standard) checkpoint, since this tool does not manage merging those. You are then offered an export of the full VM before deletion; declining the export is allowed, but if you accept and the export does not reach `COMPLETE`, deletion does not proceed. A host-side `<VM ID>-removal-manifest.json` (listing the VM name/ID/path, retained disk paths, checkpoint count and whether an export was performed) is written next to the audit log **before** `Remove-VM` is called, and its `RemovedUtc` field is filled in only after Hyper-V confirms the VM is gone. The strong `DELETE VM <name> <ID prefix>` confirmation is required. After removal, the manager reports the retained disk paths from the preview; use Hyper-V Manager or File Explorer to purge them yourself once you are sure they are not needed.
+
 ## Intentionally not included
 
-No VM clone/import, OS activation/licensing, remote hosts, automatic login, dotfiles execution, guest result collection, automatic checkpoint pruning, or VM/disk deletion. Those can be separate explicit workflows; a restore menu should not silently provision or erase unrelated state.
+No VM clone/import, OS activation/licensing, remote hosts, automatic login, dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool.
 
 ## Primary references
 
@@ -153,4 +158,5 @@ No VM clone/import, OS activation/licensing, remote hosts, automatic login, dotf
 - Microsoft: InitiateShutdown — https://learn.microsoft.com/en-us/windows/win32/hyperv_v2/msvm-shutdowncomponent-initiateshutdown
 - Microsoft: Stop-VM — https://learn.microsoft.com/en-us/powershell/module/hyper-v/stop-vm
 - Microsoft: Export-VM — https://learn.microsoft.com/en-us/powershell/module/hyper-v/export-vm
+- Microsoft: Remove-VM — https://learn.microsoft.com/en-us/powershell/module/hyper-v/remove-vm
 - Microsoft: Execution policies — https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies

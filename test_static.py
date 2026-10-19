@@ -21,13 +21,13 @@ class SourceContract(unittest.TestCase):
     def test_shutdown_is_never_forced(self):
         self.assertIn('Force = $false', self.s)
         self.assertNotRegex(self.s, r'Stop-VM[^\r\n]*-Force')
-    def test_no_vm_deletion_or_disk_unlink(self):
-        for cmd in ['Remove-VM ', 'Remove-VMSavedState ', 'Remove-Item ', 'Invoke-Expression ']:
+    def test_no_manual_disk_file_deletion(self):
+        for cmd in ['Remove-VMSavedState ', 'Remove-Item ', 'Invoke-Expression ']:
             self.assertNotIn(cmd, self.s)
     def test_no_subtree_delete(self):
         self.assertNotRegex(self.s, r'Remove-VMSnapshot[^\r\n]*-IncludeAllChildSnapshots')
     def test_mutations_use_objects(self):
-        for cmd in ['Start-VM', 'Resume-VM', 'Stop-VM', 'Set-VM', 'Checkpoint-VM', 'Export-VM']:
+        for cmd in ['Start-VM', 'Resume-VM', 'Stop-VM', 'Set-VM', 'Checkpoint-VM', 'Export-VM', 'Remove-VM']:
             for line in self.s.splitlines():
                 if re.match(r'\s*'+re.escape(cmd)+r'\s', line):
                     self.assertIn('-VM ', line, line)
@@ -95,6 +95,24 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Edit-LabVMSettings {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('$diff = Get-LabSettingsDiff', body)
         self.assertNotIn('$diff = @(Get-LabSettingsDiff', body)
+    def test_delete_requires_off(self):
+        body = self.s.split('function Remove-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Assert-LabVMOff', body)
+    def test_delete_stops_on_nonstandard_checkpoints(self):
+        body = self.s.split('function Remove-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('HasNonStandardCheckpoints', body)
+    def test_delete_offers_export_first(self):
+        body = self.s.split('function Remove-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Export-LabVM', body)
+    def test_delete_uses_remove_vm_object(self):
+        self.assertRegex(self.s, r'Remove-VM -VM ')
+    def test_delete_strong_confirmation(self):
+        self.assertIn('DELETE VM ', self.s)
+    def test_delete_manifest_before_removal(self):
+        body = self.s.split('function Remove-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        idx_manifest = body.index("'removal-manifest.json'")
+        idx_remove = body.index('Remove-VM -VM ')
+        self.assertLess(idx_manifest, idx_remove)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

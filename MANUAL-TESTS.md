@@ -85,4 +85,15 @@
 - Repeat to the same root: the earlier export must not be overwritten.
 - Preserve any failed export and confirm the manifest is INCOMPLETE or IN_PROGRESS, not trusted COMPLETE.
 - Import a COPY using Hyper-V Manager's copy/new-unique-ID option into an isolated test location. Do not start both copies on a sensitive network with duplicate guest identity. Validate actual boot/recovery before trusting the export as a backup.
-- Delete test VMs/exports manually only after confirming they are disposable and no longer needed; the script does not provide VM/disk deletion.
+- Delete test VMs/exports manually only after confirming they are disposable and no longer needed, or use option 12 (see "Delete VM" below) for the VM itself; either way the script never purges virtual disk files on its own.
+
+## Delete VM
+
+- Select a disposable VM, note its removal preview (name, GUID, path, disk paths, checkpoint count), and cancel at the "Export this VM before deletion?" prompt by choosing `C`: verify the VM, its checkpoints and its disk files are all untouched, and that no `delete-vm` audit entry was written.
+- Repeat, this time answering `N` to skip the export, then cancel at the final `DELETE VM <name> <ID prefix>` confirmation (type anything else, or press Enter): verify nothing changed and no removal manifest was written.
+- Create a non-Standard (recovery/backup) checkpoint on a disposable VM — for example via a backup application, or `Checkpoint-VM -SnapshotType ... ` outside this tool — and attempt option 12: verify it refuses immediately with a message about unresolved recovery/backup checkpoints, before any export/confirmation prompt, and that the VM is unaffected. Remove that checkpoint afterward.
+- On a VM with only Standard checkpoints (or none), choose option 12, answer `Y` to export, and complete the export normally: verify the export reaches `COMPLETE`, then the removal preview is re-shown, and the final `DELETE VM <name> <ID prefix>` confirmation is required before anything is removed.
+- Type the exact `DELETE VM <name> <ID prefix>` confirmation: verify the VM disappears from Hyper-V Manager/inventory, a `<VM ID>-removal-manifest.json` file exists next to the host audit log with `ExportPerformed: true` and a populated `RemovedUtc`, and the console reports the retained disk paths. Confirm those `.vhdx`/`.avhdx` files are still present on disk at the reported paths.
+- Repeat on a different disposable VM, this time answering `N` to skip the export, and complete the deletion: verify the removal manifest shows `ExportPerformed: false`, disk files are still retained on disk, and the VM is gone from inventory.
+- Start a manager session, select a disposable VM while it is Running or Saved, and choose option 12: verify it refuses with a message requiring Off, and makes no change.
+- Confirm no script operation directly deletes `.vhdx`/`.avhdx` files during any of the above; only `Remove-VM` (through the Hyper-V API) is used, never manual file deletion.

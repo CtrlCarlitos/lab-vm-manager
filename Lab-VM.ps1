@@ -741,6 +741,81 @@ function Export-LabVM {
     return 'COMPLETED'
 }
 
+function Get-LabVMRemovalPreview {
+    param([guid]$VMId)
+    $vm = Get-LabVM $VMId
+    $disks = @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Select-Object -ExpandProperty Path)
+    $snapshots = @(Get-LabSnapshots $VMId)
+    $nonStandard = @($snapshots | Where-Object { [string]$_.SnapshotType -ne 'Standard' })
+    return [pscustomobject]@{
+        Name = $vm.Name
+        Id = $vm.Id
+        Path = $vm.Path
+        DiskPaths = $disks
+        CheckpointCount = $snapshots.Count
+        HasNonStandardCheckpoints = ($nonStandard.Count -gt 0)
+    }
+}
+
+function Remove-LabVM {
+    param([guid]$VMId)
+    $vm = Assert-LabVMOff $VMId
+    $preview = Get-LabVMRemovalPreview $VMId
+    Write-Host "`n=== Removal preview: $($preview.Name) [$($preview.Id)] ==="
+    Write-Host "Path: $($preview.Path)"
+    Write-Host ('Disk paths: {0}' -f $(if ($preview.DiskPaths.Count -eq 0) { '(none found)' } else { $preview.DiskPaths -join '; ' }))
+    Write-Host "Checkpoint count: $($preview.CheckpointCount)"
+    if ($preview.HasNonStandardCheckpoints) {
+        throw 'This VM has one or more recovery/backup (non-Standard) checkpoints. Resolve/merge those outside this tool before deletion; removal is blocked while they exist.'
+    }
+    Write-Warning 'Deleting a VM removes it from Hyper-V inventory and configuration. Its virtual disk files are retained on disk, never deleted automatically.'
+    Write-Host 'Never manually delete AVHDX/VHDX files; Hyper-V may still need to finish merging checkpoint storage.'
+    $exportChoice = Read-LabYesNoCancel 'Export this VM before deletion?'
+    if ($exportChoice -eq 'C') { return 'CANCELLED' }
+    $exportPerformed = $false
+    if ($exportChoice -eq 'Y') {
+        $exportStatus = Export-LabVM $VMId
+        # A throw here propagates untouched; only a non-COMPLETED return needs handling.
+        if ($exportStatus -ne 'COMPLETED') { return 'CANCELLED' }
+        $exportPerformed = $true
+    }
+    # State may have changed during export; re-resolve before the strong confirmation.
+    $vm = Assert-LabVMOff $VMId
+    $preview = Get-LabVMRemovalPreview $VMId
+    if ($preview.HasNonStandardCheckpoints) {
+        throw 'This VM now has one or more recovery/backup (non-Standard) checkpoints. Resolve/merge those outside this tool before deletion.'
+    }
+    if (-not (Confirm-LabText "DELETE VM $($vm.Name) $($vm.Id.ToString().Substring(0, 8))")) { return 'CANCELLED' }
+
+    $manifestFileName = 'removal-manifest.json'
+    $manifestPath = Join-Path (Split-Path $script:LabLogFile) ("{0}-{1}" -f $vm.Id, $manifestFileName)
+    $manifest = [ordered]@{
+        VMName = $preview.Name
+        VMId = [string]$preview.Id
+        Path = $preview.Path
+        DiskPaths = @($preview.DiskPaths)
+        CheckpointCount = $preview.CheckpointCount
+        ExportPerformed = $exportPerformed
+        RemovedUtc = $null
+    }
+    $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8 -ErrorAction Stop
+
+    $vm = Assert-LabVMOff $VMId
+    Write-LabAudit 'delete-vm' 'STARTED' $vm ("Disks: {0}; Checkpoints: {1}; ExportPerformed: {2}" -f ($preview.DiskPaths -join '; '), $preview.CheckpointCount, $exportPerformed)
+    Remove-VM -VM $vm -Confirm:$false -ErrorAction Stop
+    if (@(Get-VM -Id $VMId -ErrorAction SilentlyContinue).Count -ne 0) {
+        throw 'VM still appears in inventory after removal. Inspect Hyper-V before retrying.'
+    }
+    $manifest.RemovedUtc = [DateTime]::UtcNow.ToString('o')
+    $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8 -ErrorAction Stop
+
+    Write-Host 'VM removed from Hyper-V inventory. Retained disk file(s), never deleted by this tool:'
+    if ($preview.DiskPaths.Count -eq 0) { Write-Host '  (none found)' }
+    else { $preview.DiskPaths | ForEach-Object { Write-Host "  $_" } }
+    Write-Host "Removal manifest: $manifestPath"
+    return 'COMPLETED'
+}
+
 function Set-LabCheckpointPolicy {
     param([guid]$VMId)
     $vm = Assert-LabVMOff $VMId
@@ -1079,6 +1154,7 @@ READ-ONLY: VM-changing operations are disabled.
   9  Export full VM to a new folder            [requires Off]
  10  Configure lab checkpoint policy           [requires Off]
  11  Edit VM settings                          [requires Off]
+ 12  Delete VM (retain virtual disks)          [requires Off]
   X  EMERGENCY power-off                       [risk of data loss]
   R  Refresh
   B  Choose another VM
@@ -1099,6 +1175,7 @@ READ-ONLY: VM-changing operations are disabled.
                 '9'  { Invoke-LabAction $VMId 'export-vm-menu' { param($id) Export-LabVM $id } }
                 '10' { Invoke-LabAction $VMId 'configure-policy' { param($id) Set-LabCheckpointPolicy $id } }
                 '11' { Invoke-LabAction $VMId 'edit-settings-menu' { param($id) Edit-LabVMSettings $id } }
+                '12' { Invoke-LabAction $VMId 'delete-vm-menu' { param($id) Remove-LabVM $id } }
                 'X'  { Invoke-LabAction $VMId 'emergency-power-off' { param($id) Stop-LabVMPower $id } }
                 'R'  { continue vmMenu }
                 'B'  { return 'BACK' }
