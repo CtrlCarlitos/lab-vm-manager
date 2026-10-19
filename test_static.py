@@ -221,6 +221,17 @@ class SourceContract(unittest.TestCase):
     def test_credential_never_passed_as_plaintext_arg(self):
         self.assertNotIn('-Password ', self.s)
         self.assertNotRegex(self.s, r'\$Credential\.GetNetworkCredential\(\)\.Password')
+    def test_private_permission_profile_threaded_through_every_layer(self):
+        self.assertIn("'PrivateFiles'", self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0])
+        self.assertIn('$PermissionProfile', self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0])
+        self.assertIn('PermissionProfile', self.s.split('param(', 1)[1].split(')\n\n', 1)[0])
+    def test_private_acl_applied_after_finalize_not_before(self):
+        body = self.s.split('function Copy-LabTransferItem {', 1)[1].split('\nfunction ', 1)[0]
+        idx_move = body.index('Move-Item')
+        idx_acl = body.index('Set-LabTransferPrivateAcl')
+        self.assertLess(idx_move, idx_acl)
+    def test_private_acl_helper_exists(self):
+        self.assertIn('function Set-LabTransferPrivateAcl', self.s)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

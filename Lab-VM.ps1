@@ -47,6 +47,9 @@
     Parameter mode: never prompt; -Credential must be supplied when it is needed.
 .PARAMETER VerifyHash
     Parameter mode: verify a SHA-256 hash of each copied file after the copy.
+.PARAMETER PermissionProfile
+    Parameter mode: Default (no permission change) or PrivateFiles, which restricts each
+    finalized item to the receiving account only (Windows ACLs; see README.md).
 .PARAMETER Credential
     Guest Windows credential for parameter-mode transfer. Only pass an existing
     PSCredential object (dot-source this script or build one in the calling
@@ -79,6 +82,8 @@ param(
     [switch]$DryRun,
     [switch]$NonInteractive,
     [switch]$VerifyHash,
+    [ValidateSet('Default', 'PrivateFiles')]
+    [string]$PermissionProfile = 'Default',
     [PSCredential]$Credential
 )
 
@@ -1257,6 +1262,33 @@ function Resolve-LabTransferItemAction {
     return $action
 }
 
+function Set-LabTransferPrivateAcl {
+    param(
+        [AllowNull()][System.Management.Automation.Runspaces.PSSession]$Session,
+        [string]$Path,
+        [bool]$IsDirectory
+    )
+    # icacls, not Get-Acl/Set-Acl: one external call both strips inherited ACEs and grants the
+    # owner, non-recursively (no /T) against exactly this path -- never a parent or a child.
+    $applySb = {
+        param([string]$TargetPath, [bool]$TargetIsDirectory)
+        # Local, not inherited: a caller-set -Stop preference would otherwise turn icacls's own
+        # stderr (captured below via 2>&1) into an immediate throw before $LASTEXITCODE is checked.
+        $ErrorActionPreference = 'Continue'
+        $account = "$env:USERDOMAIN\$env:USERNAME"
+        $kind = if ($TargetIsDirectory) { 'directory' } else { 'file' }
+        $output = & icacls.exe $TargetPath /inheritance:r /grant:r "${account}:(F)" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict the $kind '$TargetPath' to '$account' (exit ${LASTEXITCODE}): $output" }
+    }
+    if ($null -eq $Session) {
+        & $applySb $Path $IsDirectory
+    } else {
+        # $env:USERNAME inside this scriptblock resolves in the guest runspace, i.e. the account the
+        # PS Direct session authenticated as -- never an owner inferred from the (host-relative) path.
+        Invoke-Command -Session $Session -ScriptBlock $applySb -ArgumentList $Path, $IsDirectory -ErrorAction Stop
+    }
+}
+
 function Copy-LabTransferItem {
     param(
         [System.Management.Automation.Runspaces.PSSession]$Session,
@@ -1266,7 +1298,8 @@ function Copy-LabTransferItem {
         [bool]$Recurse,
         [ValidateSet('Error', 'Skip', 'Overwrite')][string]$OnConflict,
         [bool]$VerifyHash,
-        [bool]$DryRun
+        [bool]$DryRun,
+        [ValidateSet('Default', 'PrivateFiles')][string]$PermissionProfile = 'Default'
     )
     if ($null -eq $Session -or [string]$Session.State -ne 'Opened') {
         throw 'The PowerShell Direct session is not open. No transfer was attempted.'
@@ -1395,6 +1428,12 @@ function Copy-LabTransferItem {
         if ($VerifyHash -and (-not $Expected.Hash -or $Actual.Hash -ne $Expected.Hash)) { return 'SHA-256 mismatch after copy' }
         return $null
     }
+    # Runs on the destination side, same as $finalizeSb -- the executing session there is the guest
+    # account that owns a ToVM destination, or $null (host) for a FromVM destination.
+    $applyPrivateAcl = {
+        param([string]$Path, [bool]$IsDirectory)
+        Set-LabTransferPrivateAcl -Session $(if ($destinationRemote) { $Session } else { $null }) -Path $Path -IsDirectory $IsDirectory
+    }
     # Unique sibling name: same volume as the destination (so finalize is a rename) and never
     # mistaken for, or colliding with, a real item.
     $tempPath = "$DestinationPath.labxfer-$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
@@ -1499,15 +1538,27 @@ function Copy-LabTransferItem {
             for ($i = 0; $i -lt $finalEntries.Count; $i++) {
                 $entry = $finalEntries[$i]
                 $label = if ($null -eq $entry) { $DestinationPath } else { $entry.Destination }
+                $isDirectory = ($null -eq $entry) -or $entry.IsDirectory
                 if ($null -ne $entry -and -not $entry.IsDirectory) { $entry.Done = $true }
                 if (-not $results[$i].Ok) {
                     if ($results[$i].TempRetained) {
                         $retainTemp = $true
                         & $fail "${label}: the existing file was removed but the verified copy could not be moved into place ($($results[$i].Error)); the copy was kept in '$tempPath'."
                     } else { & $fail "${label}: could not be finalized: $($results[$i].Error)" }
-                } elseif ($null -ne $entry -and -not $entry.IsDirectory) {
-                    $state.Completed++
-                    $state.BytesTransferred += $entry.Length
+                } else {
+                    # A directory is only re-secured when this transfer itself created it: re-touching
+                    # an already-existing directory would reach pre-existing siblings inside it.
+                    $newlyCreatedDirectory = if ($null -eq $entry) { -not $destinationRoot.Exists }
+                        elseif ($entry.IsDirectory) { -not [bool]$destinationStats[$entry.Destination].Exists } else { $false }
+                    $aclOk = $true
+                    if ($PermissionProfile -eq 'PrivateFiles' -and (-not $isDirectory -or $newlyCreatedDirectory)) {
+                        try { & $applyPrivateAcl $label $isDirectory }
+                        catch { $aclOk = $false; & $fail "${label}: copied successfully but the private-file permission could not be applied: $($_.Exception.Message)" }
+                    }
+                    if ($aclOk -and $null -ne $entry -and -not $entry.IsDirectory) {
+                        $state.Completed++
+                        $state.BytesTransferred += $entry.Length
+                    }
                 }
             }
         } catch {
@@ -1549,8 +1600,15 @@ function Copy-LabTransferItem {
                 $move = @{ IsDirectory = $false; Temp = $tempPath; Destination = $DestinationPath; Overwrite = ($action -eq 'Overwrite') }
                 $result = @(Invoke-LabTransferSide $Session $destinationRemote $finalizeSb @(, @($move)))[0]
                 if ($result.Ok) {
-                    $state.Completed++
-                    $state.BytesTransferred += [long]$actual.Length
+                    $aclOk = $true
+                    if ($PermissionProfile -eq 'PrivateFiles') {
+                        try { & $applyPrivateAcl $DestinationPath $false }
+                        catch { $aclOk = $false; & $fail "${DestinationPath}: copied successfully but the private-file permission could not be applied: $($_.Exception.Message)" }
+                    }
+                    if ($aclOk) {
+                        $state.Completed++
+                        $state.BytesTransferred += [long]$actual.Length
+                    }
                 } elseif ($result.TempRetained) {
                     $retainTemp = $true
                     & $fail "${DestinationPath}: the existing file was removed but the verified copy could not be moved into place ($($result.Error)); the copy was kept at '$tempPath'."
@@ -1577,7 +1635,8 @@ function Invoke-LabFileTransfer {
         [bool]$VerifyHash,
         [bool]$DryRun,
         [AllowNull()][PSCredential]$Credential,
-        [bool]$NonInteractive
+        [bool]$NonInteractive,
+        [ValidateSet('Default', 'PrivateFiles')][string]$PermissionProfile = 'Default'
     )
     $null = Assert-LabVMRunning $VMId
     $resolvedCredential = Resolve-LabWindowsCredential $Credential $NonInteractive
@@ -1591,7 +1650,7 @@ function Invoke-LabFileTransfer {
     $session = $null
     try {
         $session = New-LabPSDirectSession $VMId $resolvedCredential
-        $result = Copy-LabTransferItem $session $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun
+        $result = Copy-LabTransferItem $session $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun $PermissionProfile
         return $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
     } finally {
         if ($session) { Remove-PSSession $session }
@@ -1652,6 +1711,16 @@ function Copy-LabVMItemInteractive {
     if ($verifyAnswer -eq 'C') { return 'CANCELLED' }
     $verifyHash = ($verifyAnswer -eq 'Y')
 
+    # Defaults to No: restricting permissions is an opt-in choice, not the safe default.
+    $permissionProfile = 'Default'
+    while ($true) {
+        $privateAnswer = (Read-LabText 'Private files (SSH keys / private configuration)? [y/N] (C cancels)').ToUpperInvariant()
+        if ($privateAnswer -in @('C', 'CANCEL')) { return 'CANCELLED' }
+        if ($privateAnswer -in @('', 'N', 'NO')) { $permissionProfile = 'Default'; break }
+        if ($privateAnswer -in @('Y', 'YES')) { $permissionProfile = 'PrivateFiles'; break }
+        Write-Host 'Enter Y, N, or C.'
+    }
+
     Write-Host "`n=== Copy preview ==="
     [pscustomobject]@{
         Direction = $Direction
@@ -1662,13 +1731,15 @@ function Copy-LabVMItemInteractive {
         Recurse = $recurse
         OnConflict = $onConflict
         VerifyHash = $verifyHash
+        PermissionProfile = $permissionProfile
     } | Format-List | Out-Host
 
     $confirmPhrase = $(if ($Direction -eq 'ToVM') { "COPY TO VM $($vm.Name)" } else { "COPY FROM VM $($vm.Name)" })
     if (-not (Confirm-LabText $confirmPhrase)) { return 'CANCELLED' }
 
     $result = Invoke-LabFileTransfer -VMId $VMId -Direction $Direction -SourcePath $sourcePath -DestinationPath $destinationPath `
-        -Recurse $recurse -OnConflict $onConflict -VerifyHash $verifyHash -DryRun $false -Credential $credential -NonInteractive $false
+        -Recurse $recurse -OnConflict $onConflict -VerifyHash $verifyHash -DryRun $false -Credential $credential -NonInteractive $false `
+        -PermissionProfile $permissionProfile
 
     Write-Host "Completed: $($result.Completed); Skipped: $($result.Skipped); Failed: $($result.Failed); Bytes transferred: $($result.BytesTransferred)"
     # Completed/Skipped/Failed counts are independent outcomes per item; a partial failure is still a
@@ -1823,7 +1894,7 @@ function Start-LabFileTransferCli {
     param(
         [bool]$CopyToVM, [bool]$CopyFromVM, [string]$VMName, [Nullable[guid]]$VMId,
         [string]$SourcePath, [string]$DestinationPath, [bool]$Recurse, [string]$OnConflict,
-        [bool]$DryRun, [bool]$NonInteractive, [bool]$VerifyHash,
+        [bool]$DryRun, [bool]$NonInteractive, [bool]$VerifyHash, [string]$PermissionProfile,
         [AllowNull()][PSCredential]$Credential, [string]$RequestedLogRoot
     )
     if ($CopyToVM -and $CopyFromVM) { throw 'Supply exactly one of -CopyToVM or -CopyFromVM, not both.' }
@@ -1839,7 +1910,7 @@ function Start-LabFileTransferCli {
         $resolvedVMId = Resolve-LabVMByNameOrId -VMName $VMName -VMId $VMId
         $result = Invoke-LabFileTransfer -VMId $resolvedVMId -Direction $direction -SourcePath $SourcePath `
             -DestinationPath $DestinationPath -Recurse $Recurse -OnConflict $OnConflict -VerifyHash $VerifyHash `
-            -DryRun $DryRun -Credential $Credential -NonInteractive $NonInteractive
+            -DryRun $DryRun -Credential $Credential -NonInteractive $NonInteractive -PermissionProfile $PermissionProfile
         Write-Host "Completed: $($result.Completed); Skipped: $($result.Skipped); Failed: $($result.Failed); Bytes transferred: $($result.BytesTransferred)"
         if ($result.Failed -gt 0) {
             foreach ($errorMessage in $result.Errors) { Write-Warning "  $errorMessage" }
@@ -1859,8 +1930,8 @@ if ($MyInvocation.InvocationName -ne '.') {
             $failedCount = Start-LabFileTransferCli -CopyToVM ([bool]$CopyToVM) -CopyFromVM ([bool]$CopyFromVM) `
                 -VMName $VMName -VMId $VMId -SourcePath $SourcePath -DestinationPath $DestinationPath `
                 -Recurse ([bool]$Recurse) -OnConflict $OnConflict -DryRun ([bool]$DryRun) `
-                -NonInteractive ([bool]$NonInteractive) -VerifyHash ([bool]$VerifyHash) -Credential $Credential `
-                -RequestedLogRoot $LogRoot
+                -NonInteractive ([bool]$NonInteractive) -VerifyHash ([bool]$VerifyHash) -PermissionProfile $PermissionProfile `
+                -Credential $Credential -RequestedLogRoot $LogRoot
             exit $(if ($failedCount -eq 0) { 0 } else { 1 })
         }
         catch {
