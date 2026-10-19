@@ -328,6 +328,55 @@ function Assert-LabVMRunning {
     return $vm
 }
 
+function Get-LabSshConnectionSettingsPath {
+    param([guid]$VMId)
+    return Join-Path $env:LOCALAPPDATA "LabVmManager\SshConnections\$VMId.json"
+}
+
+function Get-LabSshConnectionSettings {
+    param([guid]$VMId)
+    $path = Get-LabSshConnectionSettingsPath $VMId
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $saved = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+    return [pscustomobject]@{
+        HostNameOrAddress = [string]$saved.HostNameOrAddress
+        Port = [int]$saved.Port
+        UserName = [string]$saved.UserName
+        IdentityFilePath = [string]$saved.IdentityFilePath
+    }
+}
+
+function Set-LabSshConnectionSettings {
+    param(
+        [guid]$VMId,
+        [string]$HostNameOrAddress,
+        [int]$Port,
+        [string]$UserName,
+        # A path reference to a private key file, not the key/secret contents themselves.
+        [AllowNull()][AllowEmptyString()][string]$IdentityFilePath
+    )
+    $path = Get-LabSshConnectionSettingsPath $VMId
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+    $settings = [ordered]@{
+        HostNameOrAddress = $HostNameOrAddress
+        Port = $Port
+        UserName = $UserName
+        IdentityFilePath = $IdentityFilePath
+    }
+    ($settings | ConvertTo-Json) | Set-Content -LiteralPath $path
+}
+
+function Get-LabGuestAddressCandidates {
+    param([guid]$VMId)
+    $addresses = @(Get-VMNetworkAdapter -VM (Get-LabVM $VMId) -ErrorAction Stop |
+        Select-Object -ExpandProperty IPAddresses)
+    return @($addresses | Where-Object { $_ -notmatch '^169\.254\.' -and $_ -notmatch '^fe80:' })
+}
+
 function Resolve-LabWindowsCredential {
     param([AllowNull()][PSCredential]$Credential, [bool]$NonInteractive)
     if ($null -ne $Credential) { return $Credential }
