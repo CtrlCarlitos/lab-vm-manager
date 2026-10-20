@@ -3362,6 +3362,269 @@ Test-Case 'New-LabPatchedBootableIso: a Mount-DiskImage failure propagates as it
     }
 }
 
+# --- Windows unattended install, Task 6: "Provision Windows VM" orchestrator ---
+# End-to-end over FAKES of every function the orchestrator consumes (Tasks 1-5 and Plan 1): these
+# tests prove the orchestrator's sequencing and failure behavior, not each piece's own internals,
+# which their own sections above already cover. Every fake records its name into $script:ProvCalls,
+# so the exact call order is asserted. Only pure helpers (Test-LabNewVMName, Test-LabVCpuCount,
+# Test-LabMemorySpec, ConvertTo-LabMenuIndex) run for real. Everything runs in a child scope, so no
+# fake leaks into the Hyper-V drift guard below.
+$script:ProvWorkspace = Join-Path ([IO.Path]::GetTempPath()) 'labprov-test-workspace'
+$script:ProvSourceIso = 'C:\labprov-test\Win11.iso'
+function New-LabProvImage {
+    param([int]$Index, [string]$Name, [string]$Type = 'Client', [int]$Build = 26100)
+    [pscustomobject]@{ Index = $Index; Name = $Name; InstallationType = $Type; BuildNumber = $Build
+        IsWindows11Client = ($Type -eq 'Client' -and $Build -ge 22000) }
+}
+function Invoke-LabProvisioningScenario {
+    # Runs the REAL Start-LabWindowsVMProvisioning against fakes. Returns a result object with the
+    # status (or the thrown message), the ordered call log, and the arguments the key fakes received.
+    param(
+        [hashtable]$Options,
+        [object[]]$Images = @((New-LabProvImage 1 'Windows 11 Home'), (New-LabProvImage 2 'Windows 11 Education'), (New-LabProvImage 3 'Windows 11 Pro')),
+        [string[]]$Answers = @(),
+        [string]$ThrowIn = '',
+        [bool]$Patched = $true
+    )
+    $script:ProvCalls = [Collections.Generic.List[string]]::new()
+    $script:ProvArgs = @{}
+    $script:ProvAnswers = [Collections.Generic.Queue[string]]::new([string[]]$Answers)
+    $script:ProvAudit = [Collections.Generic.List[string]]::new()
+    $script:ProvImages = $Images
+    $script:ProvThrowIn = $ThrowIn
+    $script:ProvPatched = $Patched
+    $result = [pscustomobject]@{ Status = $null; Error = $null; Calls = $null; Args = $null; Audit = $null }
+    & {
+        function Record { param([string]$Name) $script:ProvCalls.Add($Name); if ($script:ProvThrowIn -eq $Name) { throw "simulated $Name failure" } }
+        function Read-LabText { param([string]$Prompt) if ($script:ProvAnswers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:ProvAnswers.Dequeue() }
+        function Read-LabYesNoCancel { param([string]$Prompt) Record 'Read-LabYesNoCancel'; return 'Y' }
+        function Write-LabAudit { param([string]$Action, [string]$Status, $VM = $null, [string]$Detail = '') $script:ProvAudit.Add("$Action|$Status|$Detail") }
+        function Select-LabIsoPath { param([string]$IsoRoot) Record 'Select-LabIsoPath'; return $script:ProvSourceIso }
+        function Get-LabWindowsInstallImages { param([string]$IsoPath) Record 'Get-LabWindowsInstallImages'; return $script:ProvImages }
+        function Test-LabWindowsIsoInScope { param([object[]]$Images) Record 'Test-LabWindowsIsoInScope'; return @($Images | Where-Object IsWindows11Client).Count -gt 0 }
+        function Get-LabHostDefaults {
+            Record 'Get-LabHostDefaults'
+            $temp = [IO.Path]::GetTempPath()
+            [pscustomobject]@{ VirtualMachinePath = $temp; VirtualHardDiskPath = $temp; LogicalProcessorCount = 8; TotalPhysicalMemoryBytes = 32GB }
+        }
+        function Get-LabSwitchNames { return @('Default Switch') }
+        function New-LabVMCore {
+            param([string]$Name, [string]$VmStoragePath, [int]$VCpuCount, [long]$MinimumBytes, [long]$StartupBytes,
+                [long]$MaximumBytes, [bool]$IsDynamic, [string]$VhdxPath, [long]$VhdxMaximumBytes, [string]$SwitchName)
+            Record 'New-LabVMCore'
+            $script:ProvArgs['New-LabVMCore'] = $PSBoundParameters
+            return [pscustomobject]@{ Id = [guid]'00000000-0000-0000-0000-00000000c0de'; Name = $Name }
+        }
+        function Resolve-LabWindowsCredential {
+            param($Credential, [bool]$NonInteractive)
+            Record 'Resolve-LabWindowsCredential'
+            if ($null -ne $Credential) { return $Credential }
+            return [pscredential]::new('dev', (ConvertTo-SecureString 'p@ss' -AsPlainText -Force))
+        }
+        function Get-LabProvisioningWorkspacePath { param([guid]$VMId) Record 'Get-LabProvisioningWorkspacePath'; return $script:ProvWorkspace }
+        function New-LabPatchedBootableIso {
+            param([string]$SourceIsoPath, [string]$OutputPath)
+            Record 'New-LabPatchedBootableIso'
+            if ($script:ProvPatched) { return [pscustomobject]@{ Patched = $true; Reason = $null; OutputPath = $OutputPath } }
+            return [pscustomobject]@{ Patched = $false; Reason = 'simulated: layout not understood'; OutputPath = $null }
+        }
+        function New-LabWindowsAnswerFileXml {
+            param([string]$ComputerName, [string]$Locale, [string]$TimeZone, [int]$ImageIndex, [string]$UserName, [securestring]$Password)
+            Record 'New-LabWindowsAnswerFileXml'
+            $script:ProvArgs['New-LabWindowsAnswerFileXml'] = $PSBoundParameters
+            return '<unattend/>'
+        }
+        function New-LabSeedIso { param([hashtable]$Files, [string]$OutputPath) Record 'New-LabSeedIso'; $script:ProvArgs['New-LabSeedIso'] = $PSBoundParameters }
+        function Set-LabVMUnattendedInstallMedia {
+            param([guid]$VMId, [string]$WindowsIsoPath, [string]$SeedIsoPath)
+            Record 'Set-LabVMUnattendedInstallMedia'
+            $script:ProvArgs['Set-LabVMUnattendedInstallMedia'] = $PSBoundParameters
+        }
+        function Set-LabVMBootProfile {
+            param([guid]$VMId, [string]$OsProfile)
+            Record 'Set-LabVMBootProfile'
+            $script:ProvArgs['Set-LabVMBootProfile'] = $OsProfile
+            return [pscustomobject]@{ SecureBootTemplateChanged = $false; SecureBootEnabled = $false; KeyProtectorAdded = $true; TpmEnabled = $true }
+        }
+        function Start-LabVM { param([guid]$VMId) Record 'Start-LabVM'; return 'COMPLETED' }
+        function Wait-LabPSDirectSession {
+            param([guid]$VMId, $Credential, [int]$TimeoutSeconds)
+            Record 'Wait-LabPSDirectSession'
+            $script:ProvArgs['Wait-LabPSDirectSession'] = $TimeoutSeconds
+            return [pscustomobject]@{ State = 'Opened' }
+        }
+        function Write-LabProvisioningNote { param($Session, [string]$Content) Record 'Write-LabProvisioningNote' }
+        function Remove-PSSession { [CmdletBinding()] param($Session) }
+        function Request-LabVMGuestShutdown { param([guid]$VMId) Record 'Request-LabVMGuestShutdown' }
+        function Wait-LabVMState { param([guid]$VMId, [string]$State) Record "Wait-LabVMState:$State" }
+        function Complete-LabWindowsProvisioning {
+            param([guid]$VMId, [string]$WindowsIsoPath, [string]$SeedIsoPath)
+            Record 'Complete-LabWindowsProvisioning'
+            $script:ProvArgs['Complete-LabWindowsProvisioning'] = $PSBoundParameters
+        }
+        function Remove-LabProvisioningWorkspace { param([guid]$VMId) Record 'Remove-LabProvisioningWorkspace' }
+        foreach ($sb in (Import-LabRealFunction 'Start-LabWindowsVMProvisioning', 'Select-LabWindowsEdition', 'ConvertTo-LabLocalAccountName')) { . $sb }
+        try { $result.Status = Start-LabWindowsVMProvisioning $Options 6>$null 3>$null }
+        catch { $result.Error = $_.Exception.Message }
+    }
+    $result.Calls = @($script:ProvCalls)
+    $result.Args = $script:ProvArgs
+    $result.Audit = @($script:ProvAudit)
+    return $result
+}
+$script:ProvHappyOrder = @('Select-LabIsoPath', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope', 'Get-LabHostDefaults',
+    'Read-LabYesNoCancel', 'New-LabVMCore', 'Resolve-LabWindowsCredential', 'Get-LabProvisioningWorkspacePath',
+    'New-LabPatchedBootableIso', 'New-LabWindowsAnswerFileXml', 'New-LabSeedIso', 'Set-LabVMUnattendedInstallMedia',
+    'Set-LabVMBootProfile', 'Start-LabVM', 'Wait-LabPSDirectSession', 'Write-LabProvisioningNote',
+    'Request-LabVMGuestShutdown', 'Wait-LabVMState:Off', 'Complete-LabWindowsProvisioning', 'Remove-LabProvisioningWorkspace',
+    'Start-LabVM', 'Wait-LabPSDirectSession')
+$script:LabReadOnly = $false
+
+Test-Case 'Provision: happy path runs every phase once, in the documented order, and returns COMPLETED' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11' } -Answers @('')
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Status 'COMPLETED'
+    Assert-Equal ($r.Calls -join ' > ') ($script:ProvHappyOrder -join ' > ')
+    Assert-Equal @($r.Calls | Where-Object { $_ -eq 'Remove-LabProvisioningWorkspace' }).Count 1
+    Assert-Equal @($r.Calls | Where-Object { $_ -eq 'Wait-LabPSDirectSession' }).Count 2
+    # Defaults: blank picker answer = Pro (index 3); dynamic memory 2/4/8 GB; 150 GB VHDX; Disconnected; 2 vCPUs.
+    Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ImageIndex 3
+    Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].UserName 'dev'
+    $core = $r.Args['New-LabVMCore']
+    Assert-Equal $core.Name 'LAB-Win11'
+    Assert-Equal $core.VCpuCount 2
+    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]4GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.IsDynamic $true
+    Assert-Equal $core.VhdxMaximumBytes ([long]150GB)
+    Assert-Equal $core.SwitchName ''
+    Assert-Equal $r.Args['Set-LabVMBootProfile'] 'Windows11'
+    Assert-Equal $r.Args['Wait-LabPSDirectSession'] 1800
+    # The patched copy is what gets attached AND what cleanup later ejects.
+    $patchedPath = Join-Path $script:ProvWorkspace 'windows-noprompt.iso'
+    Assert-Equal $r.Args['Set-LabVMUnattendedInstallMedia'].WindowsIsoPath $patchedPath
+    Assert-Equal $r.Args['Complete-LabWindowsProvisioning'].WindowsIsoPath $patchedPath
+    Assert-Equal $r.Args['Complete-LabWindowsProvisioning'].SeedIsoPath $r.Args['Set-LabVMUnattendedInstallMedia'].SeedIsoPath
+    Assert-Equal (@($r.Args['New-LabSeedIso'].Files.Keys) -join ',') 'Autounattend.xml'
+    Assert-Equal ($r.Audit[0] -like 'provision-windows-vm|STARTED|*') $true
+    Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|COMPLETED|*Win11.iso*Windows 11 Pro*ComputerName=LAB-Win11*ElapsedSeconds=*') $true
+}
+Test-Case 'Provision: an unpatched ISO falls back to the ORIGINAL source path for attach and cleanup' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' } -Patched $false
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Status 'COMPLETED'
+    Assert-Equal $r.Args['Set-LabVMUnattendedInstallMedia'].WindowsIsoPath $script:ProvSourceIso
+    Assert-Equal $r.Args['Complete-LabWindowsProvisioning'].WindowsIsoPath $script:ProvSourceIso
+}
+Test-Case 'Provision: an ISO with no Windows 11 client edition is refused, listing what was found, before any VM is created' {
+    $images = @((New-LabProvImage 1 'Windows Server 2025 Datacenter' 'Server' 26100), (New-LabProvImage 2 'Windows 10 Pro' 'Client' 19045))
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11' } -Images $images
+    Assert-Equal $r.Status $null
+    if ($r.Error -notmatch 'Windows 11' -or $r.Error -notmatch 'Windows Server 2025 Datacenter' -or $r.Error -notmatch 'Windows 10 Pro') { throw "Unclear refusal: $($r.Error)" }
+    Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    Assert-Equal $r.Audit.Count 0
+}
+Test-Case 'Provision: an -OsEdition not on the ISO re-prompts interactively and proceeds with the second, valid answer' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Enterprise' } -Answers @('2')
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Status 'COMPLETED'
+    Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ImageIndex 2
+}
+Test-Case 'Provision: an -OsEdition not on the ISO throws under -NonInteractive, naming what IS available, without creating a VM' {
+    $cred = [pscredential]::new('dev', (ConvertTo-SecureString 'p@ss' -AsPlainText -Force))
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Enterprise'; NonInteractive = $true
+        WindowsIsoPath = $PSCommandPath; Credential = $cred }
+    if ($r.Error -notmatch 'Enterprise' -or $r.Error -notmatch 'Windows 11 Home' -or $r.Error -notmatch 'Windows 11 Pro') { throw "Unclear error: $($r.Error)" }
+    Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    Assert-Equal ($r.Calls -contains 'Select-LabIsoPath') $false
+}
+Test-Case 'Provision: a failure partway reports completed steps, the kept workspace and its password, and runs nothing after' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' } -ThrowIn 'New-LabPatchedBootableIso'
+    Assert-Equal $r.Status $null
+    Assert-Equal ($r.Calls -contains 'New-LabVMCore') $true
+    Assert-Equal $r.Calls[-1] 'New-LabPatchedBootableIso'
+    foreach ($later in @('New-LabWindowsAnswerFileXml', 'New-LabSeedIso', 'Set-LabVMUnattendedInstallMedia', 'Set-LabVMBootProfile',
+            'Start-LabVM', 'Wait-LabPSDirectSession', 'Remove-LabProvisioningWorkspace')) {
+        if ($r.Calls -contains $later) { throw "$later ran after the failing step." }
+    }
+    if ($r.Error -notmatch 'simulated New-LabPatchedBootableIso failure') { throw "Error lost the cause: $($r.Error)" }
+    if ($r.Error -notmatch 'Steps already applied: .*created.*credential.*workspace') { throw "Error did not name the completed steps: $($r.Error)" }
+    if (-not $r.Error.Contains($script:ProvWorkspace)) { throw "Error did not name the workspace path: $($r.Error)" }
+    if ($r.Error -notmatch 'password') { throw "Error did not mention the password: $($r.Error)" }
+    Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|FAILED_OR_UNCONFIRMED|*') $true
+}
+Test-Case 'Provision: -NonInteractive without -Credential is refused before any ISO is read or VM created' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; NonInteractive = $true; WindowsIsoPath = $PSCommandPath }
+    if ($r.Error -notmatch '-Credential') { throw "Unexpected error: $($r.Error)" }
+    Assert-Equal $r.Calls.Count 0
+}
+Test-Case 'Provision: read-only mode refuses without prompting or creating anything' {
+    $script:LabReadOnly = $true
+    try {
+        $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11' }
+        Assert-Equal $r.Status 'CANCELLED'
+        Assert-Equal $r.Calls.Count 0
+    } finally { $script:LabReadOnly = $false }
+}
+function Invoke-LabSelectVMMenu {
+    param([string[]]$Answers)
+    $script:SelectPrompts = [Collections.Generic.List[string]]::new()
+    $script:SelectAnswers = [Collections.Generic.Queue[string]]::new([string[]]$Answers)
+    $script:ProvisionMenuCalls = 0
+    & {
+        function Clear-Host { }
+        function Read-LabText { param([string]$Prompt) $script:SelectPrompts.Add($Prompt); if ($script:SelectAnswers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:SelectAnswers.Dequeue() }
+        function New-LabVM { throw 'TRIPWIRE: N was dispatched.' }
+        function Start-LabWindowsVMProvisioning { param([hashtable]$Options) $script:ProvisionMenuCalls++; return 'COMPLETED' }
+        foreach ($sb in (Import-LabRealFunction 'Select-LabVM')) { . $sb }
+        $out = @(Select-LabVM 6>$null 3>$null)
+        Assert-Equal $out.Count 1
+        Assert-Equal $out[0] $null
+    }
+}
+Test-Case 'Menu: W (provision Windows VM) is offered and dispatched when not read-only' {
+    $script:LabReadOnly = $false
+    Invoke-LabSelectVMMenu @('W', '', 'Q')
+    Assert-Equal $script:ProvisionMenuCalls 1
+    Assert-Equal ($script:SelectPrompts[0] -match '\bW\b') $true
+}
+Test-Case 'Menu: under -ReadOnly, W is neither offered nor dispatched' {
+    $script:LabReadOnly = $true
+    try {
+        Invoke-LabSelectVMMenu @('W', 'Q')
+        Assert-Equal $script:ProvisionMenuCalls 0
+        Assert-Equal ($script:SelectPrompts[0] -match '\bW\b') $false
+    } finally { $script:LabReadOnly = $false }
+}
+Test-Case 'Gate: provisioning-only parameters are reported, and menu/transfer parameters are not' {
+    foreach ($sb in (Import-LabRealFunction 'Get-LabProvisioningOnlyParameter')) { . $sb }
+    Assert-Equal @(Get-LabProvisioningOnlyParameter @('ReadOnly', 'LogRoot', 'IsoRoot', 'TimeoutSeconds', 'VMName', 'NonInteractive', 'Credential')).Count 0
+    foreach ($name in @('NewVMName', 'WindowsIsoPath', 'ComputerName', 'Locale', 'TimeZone', 'OsEdition', 'VhdxSizeGB', 'VCpuCount',
+            'MemoryMinimumGB', 'MemoryStartupGB', 'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot', 'VhdxStorageRoot', 'ProvisioningTimeoutSeconds')) {
+        Assert-Equal (@(Get-LabProvisioningOnlyParameter @('ReadOnly', $name)) -join ',') $name
+    }
+}
+Test-Case 'Gate: the real script refuses a provisioning-only parameter without -ProvisionWindowsVM instead of opening the menu' {
+    $ErrorActionPreference = 'Continue'
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $output = @(& $exe -NoProfile -NonInteractive -File $resolved -NewVMName 'LAB-x' 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Equal $LASTEXITCODE 1
+    if (-not ($output -replace '\s', '').Contains('-NewVMNameonlyapplyto-ProvisionWindowsVM')) { throw "Unexpected output: $output" }
+}
+Test-Case 'Gate: the real script refuses -ProvisionWindowsVM combined with another action' {
+    $ErrorActionPreference = 'Continue'
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $output = @(& $exe -NoProfile -NonInteractive -File $resolved -ProvisionWindowsVM -ConfigureSsh 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Equal $LASTEXITCODE 1
+    if (-not ($output -replace '\s', '').Contains('oneactionperinvocation')) { throw "Unexpected output: $output" }
+}
+Test-Case 'Gate: the real script refuses -VMName with -ProvisionWindowsVM, pointing at -NewVMName' {
+    $ErrorActionPreference = 'Continue'
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $output = @(& $exe -NoProfile -NonInteractive -File $resolved -ProvisionWindowsVM -VMName 'LAB-x' 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Equal $LASTEXITCODE 1
+    if (-not ($output -replace '\s', '').Contains('-VMNamedonotapplyto-ProvisionWindowsVM(namethenewVMwith-NewVMName)')) { throw "Unexpected output: $output" }
+}
+
 # --- Hyper-V shape drift guard (final-review fix) ---
 # Every fake above stands in for a real Hyper-V cmdlet, and once a fake invented an output shape
 # (Get-VMKeyProtector returning a RawKeyProtector wrapper) that no real host produces, so every test
