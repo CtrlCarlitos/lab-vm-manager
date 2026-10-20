@@ -666,6 +666,16 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Get-LabVMInstallMediaPath {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('InstallMedia', body)
         self.assertIn('$VMId', body)
+    def test_seed_iso_builder_function_exists(self):
+        self.assertIn('function New-LabSeedIso', self.s)
+        self.assertIn('IMAPI2FS', self.s)
+    def test_provisioning_workspace_never_under_iso_root(self):
+        self.assertIn('function Get-LabProvisioningWorkspacePath', self.s)
+        body = self.s.split('function Get-LabProvisioningWorkspacePath {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('LOCALAPPDATA', body)
+        self.assertNotIn('$IsoRoot', body)
+    def test_provisioning_workspace_cleanup_function_exists(self):
+        self.assertIn('function Remove-LabProvisioningWorkspace', self.s)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

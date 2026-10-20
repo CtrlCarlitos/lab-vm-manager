@@ -1405,6 +1405,135 @@ function Select-LabIsoPath {
     }
 }
 
+# --- Native seed-ISO builder and provisioning workspace (Task 5) ---
+# Per-VM scratch space for files a future installer plan (Windows Autounattend.xml, Linux
+# cloud-init user-data/meta-data) builds before handing them to New-LabSeedIso below. Deliberately
+# never resolves under the configured -IsoRoot: that root is scanned read-only by
+# Get-LabIsoCandidates above as a library to browse, and a generated, per-VM scratch folder has no
+# business living inside it.
+function Get-LabProvisioningWorkspacePath {
+    param([guid]$VMId)
+    $path = Join-Path $env:LOCALAPPDATA "LabVmManager\Provisioning\$VMId"
+    [void][IO.Directory]::CreateDirectory($path)
+    return $path
+}
+
+function Remove-LabProvisioningWorkspace {
+    param([guid]$VMId)
+    $path = Join-Path $env:LOCALAPPDATA "LabVmManager\Provisioning\$VMId"
+    if ([IO.Directory]::Exists($path)) {
+        [IO.Directory]::Delete($path, $true)
+    }
+}
+
+# IMAPI2FS hands the finished image back as a raw COM IStream (CreateResultImage().ImageStream), not
+# a .NET Stream -- a naive [IO.Stream] cast does not work against it, and PowerShell's own '-as
+# [Runtime.InteropServices.ComTypes.IStream]' operator silently returns $null against it too (tried
+# and confirmed against a real IMAPI2FS result image while building this function -- PowerShell's
+# dynamic COM wrapper does not QueryInterface the way a statically compiled cast does). A tiny
+# compiled C# helper performs the same cast at compile time, where it works, then reads the stream
+# block-by-block through the interop IStream.Read(byte[], int, IntPtr) signature -- its third
+# parameter is a raw pointer the COM method itself writes the actual bytes-read count through,
+# rather than a normal .NET out/ref parameter, so unmanaged memory is allocated to receive it. This
+# whole approach is the well-documented community workaround (search "IMAPI2FS PowerShell
+# ImageStream write to file") for pulling bytes out of an IMAPI2FS result image from PowerShell, and
+# is verified here against a real, mountable ISO in this task's MANUAL-TESTS.md step.
+if (-not ('LabIsoStreamWriter' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+public static class LabIsoStreamWriter
+{
+    public static void WriteToFile(object imageStream, string path)
+    {
+        IStream stream = (IStream)imageStream;
+        IntPtr bytesReadPtr = Marshal.AllocHGlobal(4);
+        try
+        {
+            byte[] buffer = new byte[65536];
+            using (FileStream output = new FileStream(path, FileMode.Create, FileAccess.Write))
+            {
+                while (true)
+                {
+                    stream.Read(buffer, buffer.Length, bytesReadPtr);
+                    int bytesRead = Marshal.ReadInt32(bytesReadPtr);
+                    if (bytesRead <= 0) { break; }
+                    output.Write(buffer, 0, bytesRead);
+                }
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(bytesReadPtr);
+        }
+    }
+}
+'@
+}
+
+function Write-LabIStreamToFile {
+    param($Stream, [string]$Path)
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $Path))
+    [LabIsoStreamWriter]::WriteToFile($Stream, $Path)
+}
+
+# Builds a plain, non-bootable data ISO at $OutputPath. $Files keys are relative in-image paths;
+# each value is either the path to an existing local file to copy in, or -- when it is not itself an
+# existing file -- literal string content written to a throwaway temp file first. Deliberately knows
+# nothing about Autounattend.xml or cloud-init: the Windows/Linux unattended-install plans decide
+# that content and pass it through this one generic function. BootImageOptions is never set, so the
+# image stays non-bootable; FileSystemsToCreate is left at IMAPI2FS's own default (which includes
+# Joliet) so exact long/mixed-case file names such as the ones future plans will need actually
+# survive, not just 8.3-safe ones.
+#
+# IFsiDirectoryItem (the image's Root) has no method to fetch back an item it just created -- its
+# AddDirectory/AddFile return nothing, and it has no GetFilesystemEntry/Items lookup at all (confirmed
+# against the live COM object; both are DISP_E_UNKNOWNNAME). Building nested paths by walking that
+# interface by hand is therefore not viable. Root.AddTree(path, $false) with $false (do not wrap in
+# an extra folder named after $path) exists for exactly this, so every entry is first staged for real
+# on local disk, in its final relative layout, and the whole tree is added in one call.
+#
+# Not independently unit-testable through Test-LabVM.ps1's fake-cmdlet harness: this instantiates a
+# real COM object (IMAPI2FS.MsftFileSystemImage) rather than calling a mockable PowerShell cmdlet,
+# so there is no fake for it there. Checked by source review (test_static.py) instead, and verified
+# against a real, mounted ISO -- see MANUAL-TESTS.md, "ISO/installer provisioning".
+function New-LabSeedIso {
+    param([hashtable]$Files, [string]$OutputPath, [string]$VolumeLabel = 'LAB_SEED')
+    if ($null -eq $Files -or $Files.Count -eq 0) {
+        throw 'New-LabSeedIso requires at least one entry in -Files.'
+    }
+    try {
+        $image = New-Object -ComObject IMAPI2FS.MsftFileSystemImage -ErrorAction Stop
+    } catch {
+        throw "IMAPI2FS.MsftFileSystemImage (Windows Image Mastering API) could not be instantiated: $($_.Exception.Message). This COM component ships with Windows; a stripped-down install may be missing it."
+    }
+    $image.VolumeName = $VolumeLabel
+    $stagingDir = Join-Path ([IO.Path]::GetTempPath()) ('labseediso-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($stagingDir)
+    try {
+        foreach ($entry in $Files.GetEnumerator()) {
+            $relativePath = ([string]$entry.Key).Replace('/', '\').TrimStart('\')
+            if ([string]::IsNullOrWhiteSpace($relativePath)) { throw "Invalid in-image path '$($entry.Key)'." }
+            $value = $entry.Value
+            $destinationPath = Join-Path $stagingDir $relativePath
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $destinationPath))
+            if ($value -is [string] -and (Test-Path -LiteralPath $value -PathType Leaf)) {
+                [IO.File]::Copy($value, $destinationPath, $true)
+            } else {
+                [IO.File]::WriteAllText($destinationPath, [string]$value)
+            }
+        }
+        $image.Root.AddTree($stagingDir, $false)
+        $resultImage = $image.CreateResultImage()
+        Write-LabIStreamToFile $resultImage.ImageStream $OutputPath
+    } finally {
+        if ([IO.Directory]::Exists($stagingDir)) { [IO.Directory]::Delete($stagingDir, $true) }
+    }
+}
+
 function Test-LabVMHasKeyProtector {
     param([guid]$VMId)
     # Pure, read-only presence check -- it must never mutate. Set-LabVMBootProfile below calls this
