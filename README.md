@@ -11,7 +11,7 @@ A standalone menu-driven PowerShell script for managing **local Hyper-V VMs whos
 - `MANUAL-TESTS.md`: acceptance checklist for a disposable VM.
 - `test_static.py`: source-level regression checks; optional, requires Python.
 
-The script has been source-reviewed: all 112 `test_static.py` source-contract checks pass, and all 196 `Test-LabVM.ps1` helper tests pass in Windows PowerShell 5.1. An earlier version (before the Create, Edit and Delete VM workflows were added) was exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, checkpoint deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM, Edit VM settings and Delete VM workflows — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
+The script has been source-reviewed: all 114 `test_static.py` source-contract checks pass, and all 197 `Test-LabVM.ps1` helper tests pass in Windows PowerShell 5.1. An earlier version (before the Create, Edit and Delete VM workflows were added) was exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, checkpoint deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM, Edit VM settings and Delete VM workflows — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
 
 ## Start
 

@@ -554,7 +554,9 @@ function Invoke-LabSshCommand {
     $target = "$UserName@$HostNameOrAddress"
     switch ($AuthMode) {
         'KeyAgent' {
-            $arguments = @('-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-p', $Port)
+            # -n: redirect ssh's stdin from /dev/null so a BatchMode=yes call never reads from (or hangs
+            # on) this process's own stdin, which belongs to whatever unrelated stream launched it.
+            $arguments = @('-n', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-p', $Port)
             if (-not [string]::IsNullOrEmpty($IdentityFilePath)) { $arguments += @('-i', $IdentityFilePath) }
             $arguments += @($target, $RemoteCommand)
             $raw = & ssh.exe @arguments 2>&1
@@ -2350,13 +2352,25 @@ function Copy-LabTransferItemSftp {
         return [pscustomobject]@{ Exists = $info.Exists; Mode = $info.Mode; Size = $info.Size; Error = $info.Error
             MissingParents = [string[]]$missingParents.ToArray() }
     }
-    # Guest-side size/hash check, answered by exit code: 0 match, 20 size, 21 no sha256sum, 22 hash.
+    # Guest-side size/hash check, answered by exit code: 0 match, 20 size mismatch, 21 no sha256sum,
+    # 22 hash mismatch, 23 the size check itself could not run (stat produced no usable number -- e.g.
+    # the file is missing or unreadable -- so no size comparison happened at all).
     # A negative $Size skips the size test; an empty $Hash skips the hash test.
     $verifyRemote = {
         param([string]$Path, [long]$Size, [AllowEmptyString()][string]$Hash)
         $p = & $shellQuote $Path
         $parts = [Collections.Generic.List[string]]::new()
-        if ($Size -ge 0) { $parts.Add('[ $(stat -c %s ' + $p + ' 2>/dev/null) -eq ' + $Size + ' ] 2>/dev/null || exit 20') }
+        if ($Size -ge 0) {
+            # stat's own failure (missing file, permission denied, ...) must not be mistaken for a real
+            # size disagreement: the old one-line '[ $(stat ...) -eq N ]' sent a stat error (an empty
+            # command substitution) down the same exit-20 path as a genuinely differing size. $s is
+            # captured and validated as pure digits first, so exit 20 now only fires once a real number
+            # was compared against $Size. (No double quotes: Invoke-LabSshCommand rejects any remote
+            # command containing one, and none are needed here since stat's output is digits-only.)
+            $parts.Add('s=$(stat -c %s ' + $p + ' 2>/dev/null)')
+            $parts.Add('case ${s:-X} in *[!0-9]*) exit 23 ;; esac')
+            $parts.Add('[ $s -eq ' + $Size + ' ] || exit 20')
+        }
         if ($Hash) {
             $parts.Add('command -v sha256sum >/dev/null 2>&1 || exit 21')
             $parts.Add('h=$(sha256sum ' + $p + ' 2>/dev/null) || exit 22')
@@ -2369,6 +2383,7 @@ function Copy-LabTransferItemSftp {
             20 { return "size mismatch after copy (expected $Size bytes)" }
             21 { return 'SHA-256 could not be checked: sha256sum is not available on the guest' }
             22 { return 'SHA-256 mismatch after copy' }
+            23 { return "the guest-side size check could not be completed for '$Path' (stat returned no usable size, e.g. the file is missing or unreadable); this is not a confirmed size mismatch." }
         }
         return "the guest-side size/hash check failed (ssh exit $($result.ExitCode)); it needs a POSIX-compatible login shell on the guest."
     }
