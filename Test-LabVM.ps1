@@ -2597,6 +2597,7 @@ $script:FakeInstallEsdExists = $false
 $script:FakeWindowsImageSummaries = @()
 $script:FakeWindowsImageDetailsByIndex = @{}
 $script:FakeGetWindowsImageThrows = $null
+$script:FakeMountDiskImageThrows = $null
 
 function Get-Module {
     [CmdletBinding()]
@@ -2611,6 +2612,7 @@ function Mount-DiskImage {
     [CmdletBinding()]
     param([string]$ImagePath, [switch]$PassThru)
     $script:MountDiskImageCalls++
+    if ($null -ne $script:FakeMountDiskImageThrows) { throw $script:FakeMountDiskImageThrows }
     if ($PassThru) { return [pscustomobject]@{ ImagePath = $ImagePath } }
 }
 function Get-Volume {
@@ -2652,6 +2654,7 @@ function Reset-LabWindowsImageFakes {
     $script:FakeInstallWimExists = $true
     $script:FakeInstallEsdExists = $false
     $script:FakeGetWindowsImageThrows = $null
+    $script:FakeMountDiskImageThrows = $null
 }
 
 Test-Case 'Get-LabWindowsInstallImages: two Windows 11 client editions are both returned and in scope' {
@@ -2706,6 +2709,13 @@ Test-Case 'Get-LabWindowsInstallImages: a missing Dism module throws a clear, sp
     $script:FakeDismModuleAvailable = $false
     Assert-Throws { Get-LabWindowsInstallImages 'C:\iso\x.iso' } 'Dism'
     Assert-Equal $script:MountDiskImageCalls 0
+    Assert-Equal $script:DismountDiskImageCalls 0
+}
+Test-Case 'Get-LabWindowsInstallImages: a Mount-DiskImage failure propagates as itself, not masked by a dismount error' {
+    Reset-LabWindowsImageFakes
+    $script:FakeMountDiskImageThrows = 'simulated Mount-DiskImage failure'
+    Assert-Throws { Get-LabWindowsInstallImages 'C:\iso\bad-mount.iso' } 'simulated Mount-DiskImage failure'
+    Assert-Equal $script:MountDiskImageCalls 1
     Assert-Equal $script:DismountDiskImageCalls 0
 }
 Test-Case 'Test-LabWindowsIsoInScope: true as soon as one image in the list is a Windows 11 client edition' {
