@@ -398,6 +398,28 @@ class SourceContract(unittest.TestCase):
         self.assertNotIn('BatchMode', password_branch)
         self.assertIn('StrictHostKeyChecking=yes', password_branch)
         self.assertNotIn('2>&1', password_branch)
+    def test_ssh_keyagent_call_passes_n_to_avoid_stdin_interference(self):
+        # Final-review fix: -n (stdin from /dev/null) stops a BatchMode=yes ssh.exe call from reading,
+        # or hanging on, this process's own stdin. Only the ssh.exe KeyAgent branch needs it: the
+        # InteractivePassword branch needs real stdin for OpenSSH's own password prompt, sftp.exe has
+        # its own stdin handling via -b, and Add-LabSshKnownHost needs stdin for the interactive
+        # fingerprint prompt (StrictHostKeyChecking=ask), so none of those three gets -n.
+        ssh_body = self.s.split('function Invoke-LabSshCommand {', 1)[1].split('\nfunction ', 1)[0]
+        key_branch = ssh_body.split("'KeyAgent' {", 1)[1].split("'InteractivePassword' {", 1)[0]
+        password_branch = ssh_body.split("'InteractivePassword' {", 1)[1].split('default {', 1)[0]
+        self.assertIn("'-n'", key_branch)
+        self.assertNotIn("'-n'", password_branch)
+        sftp_body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn("'-n'", sftp_body)
+        known_host_body = self.s.split('function Add-LabSshKnownHost {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn("'-n'", known_host_body)
+    def test_sftp_size_check_distinguishes_mismatch_from_check_failure(self):
+        # Final-review fix: a stat failure on the guest (missing/unreadable file, etc.) must not be
+        # reported with the same "size mismatch" wording as a genuine, confirmed size disagreement.
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('exit 23', body)
+        self.assertIn('could not be completed', body)
+        self.assertIn('not a confirmed size mismatch', body)
     def test_sftp_engine_routes_every_process_through_helpers(self):
         # The engine never launches ssh.exe/sftp.exe itself: every connection goes through the two
         # helpers that own the flag rules and the tooling check. Comment lines are ignored.

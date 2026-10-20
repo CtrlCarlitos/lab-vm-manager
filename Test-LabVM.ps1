@@ -616,12 +616,20 @@ function Invoke-LabSshCommand {
         }
         return [pscustomobject]@{ ExitCode = $code; Output = [string[]]@() }
     }
-    $size = [regex]::Match($RemoteCommand, "stat -c %s '(?<p>[^']*)' 2>/dev/null\) -eq (?<n>\d+) \]")
+    # The size check is now two statements: 's=$(stat ...)' captures the value, then '[ $s -eq N ]'
+    # compares it once a 'case' guard (matched separately below, not re-parsed here) has confirmed $s
+    # is pure digits. Matching them separately keeps this fake tolerant of that guard's exact text.
+    $size = [regex]::Match($RemoteCommand, "stat -c %s '(?<p>[^']*)' 2>/dev/null\)")
+    $sizeEq = [regex]::Match($RemoteCommand, '\[ \$s -eq (?<n>\d+) \]')
     $hash = [regex]::Match($RemoteCommand, "h=\`$\(sha256sum '(?<p>[^']*)' 2>/dev/null\).*\[ \`$\{h%% \*\} = (?<h>[0-9a-f]{64}) \]")
     if (-not $size.Success -and -not $hash.Success) { throw "fake ssh: unparsed remote command [$RemoteCommand]" }
     if ($size.Success) {
+        if (-not $sizeEq.Success) { throw "fake ssh: size check command missing its comparison [$RemoteCommand]" }
         $p = ConvertTo-FakeGuestPath $size.Groups['p'].Value
-        if (-not [IO.File]::Exists($p) -or ([IO.FileInfo]::new($p)).Length -ne [long]$size.Groups['n'].Value) { return [pscustomobject]@{ ExitCode = 20; Output = [string[]]@() } }
+        # StatCheckFails: the guest-side stat itself could not produce a usable size (e.g. permission
+        # denied) -- exit 23, distinct from exit 20's genuine, confirmed size disagreement.
+        if ($script:SftpFault -eq 'StatCheckFails') { return [pscustomobject]@{ ExitCode = 23; Output = [string[]]@() } }
+        if (-not [IO.File]::Exists($p) -or ([IO.FileInfo]::new($p)).Length -ne [long]$sizeEq.Groups['n'].Value) { return [pscustomobject]@{ ExitCode = 20; Output = [string[]]@() } }
     }
     if ($hash.Success) {
         if ($script:SftpFault -eq 'NoSha256sum') { return [pscustomobject]@{ ExitCode = 21; Output = [string[]]@() } }
@@ -1063,6 +1071,26 @@ try {
             $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' (Join-Path $script:HostRoot 'g.txt') -DryRun $true -AuthMode $mode -PermissionProfile 'PrivateFiles'
             Assert-Equal $r.Completed 1; Assert-Equal $script:AclCalls.Count 0
         }
+    }
+    Test-Case 'SFTP (InteractivePassword): a stat failure during verification is reported as incomplete, not as a size mismatch' {
+        Reset-FakeGuest
+        $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt' -AuthMode 'InteractivePassword' -Fault 'StatCheckFails'
+        Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+        # The confirmed-mismatch wording is "size mismatch after copy"; this message intentionally
+        # contains the words "size mismatch" too (to explicitly deny being one), so match the longer,
+        # more specific phrase rather than the bare substring both messages share.
+        if (($r.Errors -join ' ') -match 'size mismatch after copy') { throw "A stat failure was misreported as a confirmed size mismatch: $($r.Errors)" }
+        if (-not (($r.Errors -join ' ') -match 'could not be completed')) { throw "Unexpected error: $($r.Errors)" }
+        Assert-Equal ((Get-SftpBatchText) -match 'rename ') $false
+        Assert-Equal ([IO.File]::Exists((ConvertTo-FakeGuestPath '/home/dev/a.txt'))) $false
+        Assert-Equal (Get-FakeTempCount) 0
+        # Download side goes through the same $verifyRemote size check in password mode.
+        Reset-FakeGuest
+        $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' (Join-Path $script:HostRoot 'g.txt') -AuthMode 'InteractivePassword' -Fault 'StatCheckFails'
+        Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+        if (($r.Errors -join ' ') -match 'size mismatch after copy') { throw "A stat failure was misreported as a confirmed size mismatch: $($r.Errors)" }
+        if (-not (($r.Errors -join ' ') -match 'could not be completed')) { throw "Unexpected error: $($r.Errors)" }
+        Assert-Equal ([IO.File]::Exists((Join-Path $script:HostRoot 'g.txt'))) $false
     }
     Test-Case 'SFTP (KeyAgent): a setstat error line demotes the item even when sftp exits 0' {
         Reset-FakeGuest
