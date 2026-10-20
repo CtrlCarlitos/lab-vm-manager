@@ -52,7 +52,9 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath',
     'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind', 'Test-LabSshHostName', 'Test-LabSshUserName',
     'Test-LabVMHasKeyProtector', 'Set-LabVMBootProfile', 'Get-LabVMInstallMediaPath',
-    'Set-LabVMInstallMedia', 'Remove-LabVMInstallMedia', 'Set-LabVMBootOrder')
+    'Set-LabVMInstallMedia', 'Remove-LabVMInstallMedia', 'Set-LabVMBootOrder', 'Get-LabProperty',
+    'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
+    'Get-LabVMInstallationMediaPreview')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -1965,6 +1967,260 @@ Test-Case 'Select-LabIsoPath filter always matches the full scan, not the previo
         if ([IO.Directory]::Exists($tempRoot)) { [IO.Directory]::Delete($tempRoot, $true) }
     }
 }
+
+# --- Installation media menu action (Task 6) ---
+# Read-side fakes the preview/inspect need. No real Hyper-V cmdlet is invoked. Every mutating Hyper-V
+# cmdlet the apply step can reach is one of the counting fakes above, so "nothing changed" is checked by
+# summing their counters rather than trusting the code under test.
+$script:FakeSnapshots = @()
+$script:FakeHardDisks = @()
+$script:FakeVhdParents = @{}
+$script:FakeTpmEnabled = $false
+function Get-VMSnapshot { [CmdletBinding()] param($VM) return @($script:FakeSnapshots) }
+function Get-VMHardDiskDrive { [CmdletBinding()] param($VM) return @($script:FakeHardDisks) }
+function Get-VHD {
+    [CmdletBinding()]
+    param([string]$Path)
+    return [pscustomobject]@{ Path = $Path; ParentPath = $script:FakeVhdParents[$Path] }
+}
+function Get-VMSecurity { [CmdletBinding()] param($VM) return [pscustomobject]@{ TpmEnabled = $script:FakeTpmEnabled } }
+function Get-LabMutationCount {
+    return $script:SetVMFirmwareCalls.Count + $script:SetVMFirmwareBootOrderCalls.Count + $script:SetVMKeyProtectorCalls +
+        $script:EnableVMTPMCalls + $script:AddVMDvdDriveCalls + $script:SetVMDvdDriveCalls.Count
+}
+function Reset-LabMediaFakes {
+    $script:FakeVM.State = 'Off'; $script:FakeVM.Generation = 2; $script:FakeVM.Name = 'LAB-Test'
+    $script:FakeHasKeyProtector = $false
+    $script:FakeTpmEnabled = $false
+    $script:FakeFirmware.SecureBootTemplate = 'MicrosoftUEFICertificateAuthority'
+    $script:FakeFirmware.BootOrder = @([VMHardDiskDrive]::new(), [VMDvdDrive]::new())
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $script:FakeSnapshots = @()
+    $script:FakeHardDisks = @()
+    $script:FakeVhdParents = @{}
+    $script:SetVMFirmwareCalls.Clear(); $script:SetVMFirmwareBootOrderCalls.Clear()
+    $script:SetVMKeyProtectorCalls = 0; $script:EnableVMTPMCalls = 0
+    $script:AddVMDvdDriveCalls = 0; $script:SetVMDvdDriveCalls.Clear()
+    $script:LabReadOnly = $false
+}
+function New-LabMediaTempDir {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ('labmedia-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void][IO.Directory]::CreateDirectory($dir)
+    return $dir
+}
+$script:LabIsoRoot = 'C:\labmedia-test-iso-root'
+
+Test-Case 'Boot entry kind: a VMBootSource-style wrapper is classified by its Device' {
+    Assert-Equal (Get-LabBootEntryKind ([pscustomobject]@{ BootType = 'Drive'; Device = [VMDvdDrive]::new() })) 'Dvd'
+    Assert-Equal (Get-LabBootEntryKind ([pscustomobject]@{ BootType = 'Drive'; Device = [VMHardDiskDrive]::new() })) 'Disk'
+    Assert-Equal (Get-LabBootEntryKind ([pscustomobject]@{ BootType = 'Network'; Device = [VMNetworkAdapter]::new() })) 'Other'
+    Assert-Equal (Get-LabBootEntryKind ([VMDvdDrive]::new())) 'Dvd'
+}
+Test-Case 'Set-LabVMBootOrder reorders wrapper entries and passes the original wrappers back' {
+    Reset-LabMediaFakes
+    $nic = [pscustomobject]@{ BootType = 'Network'; Device = [VMNetworkAdapter]::new() }
+    $hdd = [pscustomobject]@{ BootType = 'Drive'; Device = [VMHardDiskDrive]::new() }
+    $dvd = [pscustomobject]@{ BootType = 'Drive'; Device = [VMDvdDrive]::new() }
+    $script:FakeFirmware.BootOrder = @($nic, $hdd, $dvd)
+    Set-LabVMBootOrder $script:FakeId 'Dvd'
+    $applied = @($script:SetVMFirmwareBootOrderCalls[-1])
+    Assert-Equal $applied.Count 3
+    Assert-Equal ([object]::ReferenceEquals($applied[0], $dvd)) $true
+    Assert-Equal ([object]::ReferenceEquals($applied[1], $nic)) $true
+    Assert-Equal ([object]::ReferenceEquals($applied[2], $hdd)) $true
+}
+Test-Case 'Set-LabVMBootOrder fails loudly, without writing, when no matching entry is recognized' {
+    Reset-LabMediaFakes
+    $script:FakeFirmware.BootOrder = @([VMHardDiskDrive]::new(), [VMNetworkAdapter]::new())
+    Assert-Throws { Set-LabVMBootOrder $script:FakeId 'Dvd' } 'no Dvd entry was recognized'
+    Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 0
+}
+Test-Case 'Media preview: existing key protector and a checkpoint are reported without any mutation' {
+    Reset-LabMediaFakes
+    $script:FakeHasKeyProtector = $true
+    $script:FakeSnapshots = @([pscustomobject]@{ Name = 'cp1' })
+    $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'Windows11' 'C:\x.iso'
+    Assert-Equal $preview.HasKeyProtector $true
+    Assert-Equal $preview.ExistingDataRisk $true
+    Assert-Equal $preview.CheckpointCount 1
+    Assert-Equal (Get-LabMutationCount) 0
+}
+Test-Case 'Media preview: a fresh VM with a tiny VHDX has no data risk and lists the profile changes, still without mutating' {
+    Reset-LabMediaFakes
+    $dir = New-LabMediaTempDir
+    try {
+        $vhdx = Join-Path $dir 'fresh.vhdx'
+        [IO.File]::WriteAllBytes($vhdx, [byte[]]::new(4096))
+        $script:FakeHardDisks = @([pscustomobject]@{ Path = $vhdx; DiskNumber = $null })
+        $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'Windows11' 'C:\x.iso'
+        Assert-Equal $preview.ExistingDataRisk $false
+        Assert-Equal $preview.HasKeyProtector $false
+        Assert-Equal $preview.BootProfileChanges.Count 2
+        Assert-Equal (Get-LabMutationCount) 0
+        # The key-protector check must stay read-only: no protector was created by previewing.
+        Assert-Equal $script:FakeHasKeyProtector $false
+    } finally { [IO.Directory]::Delete($dir, $true) }
+}
+Test-Case 'Media preview: a small differencing disk over a large parent counts the real parent size' {
+    Reset-LabMediaFakes
+    $dir = New-LabMediaTempDir
+    try {
+        $parent = Join-Path $dir 'parent.vhdx'
+        $child = Join-Path $dir 'child.avhdx'
+        $fs = [IO.File]::Create($parent); try { $fs.SetLength(300MB) } finally { $fs.Close() }
+        [IO.File]::WriteAllBytes($child, [byte[]]::new(4096))
+        $script:FakeVhdParents = @{ $child = $parent }
+        $script:FakeHardDisks = @([pscustomobject]@{ Path = $child; DiskNumber = $null })
+        $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'UbuntuDesktop' 'C:\x.iso'
+        Assert-Equal $preview.ExistingDataRisk $true
+        Assert-Equal ($preview.ExistingDataReasons[0] -match 'GiB on disk') $true
+    } finally { [IO.Directory]::Delete($dir, $true) }
+}
+Test-Case 'Media preview: a disk that cannot be measured is treated as a data risk, not as empty' {
+    Reset-LabMediaFakes
+    $script:FakeHardDisks = @([pscustomobject]@{ Path = 'C:\labmedia-missing\gone.vhdx'; DiskNumber = $null })
+    $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'UbuntuDesktop' 'C:\x.iso'
+    Assert-Equal $preview.ExistingDataRisk $true
+    Assert-Equal ($preview.ExistingDataReasons[0] -match 'could not be measured') $true
+}
+Test-Case 'Media menu under -ReadOnly only inspects: no prompt, no mutation' {
+    Reset-LabMediaFakes
+    $script:FakeDvdDrives[0].Path = 'E:\ISO\a.iso'
+    $savedLocal = $env:LOCALAPPDATA
+    $dir = New-LabMediaTempDir
+    try {
+        $env:LOCALAPPDATA = $dir
+        $script:LabReadOnly = $true
+        & {
+            function Read-LabText { param([string]$Prompt) throw "TRIPWIRE: prompted under -ReadOnly: $Prompt" }
+            function Select-LabIsoPath { throw 'TRIPWIRE: ISO selection under -ReadOnly.' }
+            foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+            $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+            Assert-Equal $out.Count 1
+            Assert-Equal $out[0] 'NO_CHANGE'
+        }
+        Assert-Equal (Get-LabMutationCount) 0
+    } finally {
+        $script:LabReadOnly = $false
+        $env:LOCALAPPDATA = $savedLocal
+        [IO.Directory]::Delete($dir, $true)
+    }
+}
+Test-Case 'Media attach: declining the confirmation leaves the VM untouched (no key protector created by the preview)' {
+    Reset-LabMediaFakes
+    & {
+        $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('A', '1'))
+        function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+        function Select-LabIsoPath { param([string]$IsoRoot) $script:IsoRootSeen = $IsoRoot; return 'C:\labmedia-test\win.iso' }
+        function Read-LabYesNoCancel { param([string]$Prompt) return 'N' }
+        function Confirm-LabText { throw 'TRIPWIRE: extra confirmation requested without a data risk.' }
+        foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+        $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+        Assert-Equal $out.Count 1
+        Assert-Equal $out[0] 'CANCELLED'
+        Assert-Equal $script:IsoRootSeen $script:LabIsoRoot
+    }
+    Assert-Equal (Get-LabMutationCount) 0
+    Assert-Equal $script:FakeHasKeyProtector $false
+}
+Test-Case 'Media attach: existing data needs the typed confirmation; a wrong phrase cancels with no change' {
+    Reset-LabMediaFakes
+    $script:FakeSnapshots = @([pscustomobject]@{ Name = 'cp1' })
+    & {
+        $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('A', '2'))
+        $script:ConfirmPhrase = $null
+        function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+        function Select-LabIsoPath { param([string]$IsoRoot) return 'C:\labmedia-test\ubuntu.iso' }
+        function Read-LabYesNoCancel { param([string]$Prompt) return 'Y' }
+        function Confirm-LabText { param([string]$Expected) $script:ConfirmPhrase = $Expected; return $false }
+        foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+        $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+        Assert-Equal $out[0] 'CANCELLED'
+        Assert-Equal $script:ConfirmPhrase 'INSTALL OVER LAB-Test'
+    }
+    Assert-Equal (Get-LabMutationCount) 0
+}
+Test-Case 'Media attach: a Generation 1 VM is refused before any prompt for profile or ISO' {
+    Reset-LabMediaFakes
+    $script:FakeVM.Generation = 1
+    try {
+        & {
+            $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('A'))
+            function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+            function Select-LabIsoPath { throw 'TRIPWIRE: ISO selection for a Generation 1 VM.' }
+            foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+            $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+            Assert-Equal $out[0] 'CANCELLED'
+        }
+        Assert-Equal (Get-LabMutationCount) 0
+    } finally { $script:FakeVM.Generation = 2 }
+}
+Test-Case 'Media attach: after confirmation applies boot profile, then media, then DVD-first boot order' {
+    Reset-LabMediaFakes
+    & {
+        $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('A', '1'))
+        $script:ApplyLog = [Collections.Generic.List[string]]::new()
+        function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+        function Select-LabIsoPath { param([string]$IsoRoot) return 'C:\labmedia-test\win.iso' }
+        function Read-LabYesNoCancel { param([string]$Prompt) return 'Y' }
+        function Set-LabVMBootProfile { param([guid]$VMId, [string]$OsProfile) $script:ApplyLog.Add("profile:$OsProfile"); [pscustomobject]@{ SecureBootTemplateChanged = $true; KeyProtectorAdded = $true; TpmEnabled = $true } }
+        function Set-LabVMInstallMedia { param([guid]$VMId, [string]$IsoPath) $script:ApplyLog.Add("media:$IsoPath"); [pscustomobject]@{ PreviousAttachment = ''; DvdDriveAdded = $false } }
+        function Set-LabVMBootOrder { param([guid]$VMId, [string]$Preference) $script:ApplyLog.Add("order:$Preference") }
+        foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+        $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+        Assert-Equal $out.Count 1
+        Assert-Equal $out[0] 'COMPLETED'
+        Assert-Equal ($script:ApplyLog -join '|') 'profile:Windows11|media:C:\labmedia-test\win.iso|order:Dvd'
+    }
+}
+Test-Case 'Media attach end-to-end through the real apply functions: Windows11 VM ends up configured' {
+    Reset-LabMediaFakes
+    $dir = New-LabMediaTempDir
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $dir
+        $iso = Join-Path $dir 'win.iso'
+        [IO.File]::WriteAllBytes($iso, [byte[]]@(1, 2, 3))
+        & {
+            $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('A', '1'))
+            $script:TestIso = $iso
+            function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+            function Select-LabIsoPath { param([string]$IsoRoot) return $script:TestIso }
+            function Read-LabYesNoCancel { param([string]$Prompt) return 'Y' }
+            foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+            $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+            Assert-Equal $out[0] 'COMPLETED'
+        }
+        Assert-Equal $script:FakeFirmware.SecureBootTemplate 'MicrosoftWindows'
+        Assert-Equal $script:FakeHasKeyProtector $true
+        Assert-Equal $script:EnableVMTPMCalls 1
+        Assert-Equal $script:FakeDvdDrives[0].Path $iso
+        Assert-Equal ((@($script:FakeFirmware.BootOrder))[0] -is [VMDvdDrive]) $true
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        [IO.Directory]::Delete($dir, $true)
+    }
+}
+Test-Case 'Media eject: confirmed eject clears the media; nothing attached is NO_CHANGE with no write' {
+    Reset-LabMediaFakes
+    $script:FakeDvdDrives[0].Path = 'E:\ISO\a.iso'
+    & {
+        $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('E', 'E'))
+        function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+        function Read-LabYesNoCancel { param([string]$Prompt) return 'Y' }
+        foreach ($sb in (Import-LabRealFunction 'Remove-LabVMInstallMedia', 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+        $first = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+        Assert-Equal $first[0] 'COMPLETED'
+        Assert-Equal $script:FakeDvdDrives[0].Path ''
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+        $second = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+        Assert-Equal $second[0] 'NO_CHANGE'
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+    }
+}
+Reset-LabMediaFakes
+$script:FakeDvdDrives.Clear()
 
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'

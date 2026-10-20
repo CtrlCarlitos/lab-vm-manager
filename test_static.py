@@ -676,6 +676,39 @@ class SourceContract(unittest.TestCase):
         self.assertNotIn('$IsoRoot', body)
     def test_provisioning_workspace_cleanup_function_exists(self):
         self.assertIn('function Remove-LabProvisioningWorkspace', self.s)
+    def test_installation_media_function_exists(self):
+        self.assertIn('function Set-LabVMInstallationMediaInteractive', self.s)
+    def test_installation_media_requires_confirmation(self):
+        body = self.s.split('function Set-LabVMInstallationMediaInteractive {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Read-LabYesNoCancel', body)
+    def test_installation_media_menu_entry_exists(self):
+        body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Set-LabVMInstallationMediaInteractive', body)
+    def test_installation_media_routed_through_invoke_lab_action(self):
+        body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
+        idx = body.index('Set-LabVMInstallationMediaInteractive')
+        nearby = body[max(0, idx - 200):idx]
+        self.assertIn('Invoke-LabAction', nearby)
+    def test_installation_media_warns_on_existing_key_protector(self):
+        body = self.s.split('function Set-LabVMInstallationMediaInteractive {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('recovery', body.lower())
+    def test_installation_media_warns_before_overwriting_existing_data(self):
+        body = self.s.split('function Set-LabVMInstallationMediaInteractive {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Checkpoint', body)
+    def test_installation_media_gates_mutation_internally_under_readonly(self):
+        body = self.s.split('function Set-LabVMInstallationMediaInteractive {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$script:LabReadOnly', body)
+    def test_installation_media_preview_is_read_only(self):
+        # The preview runs before any confirmation, so it must decide the encryption warning via the
+        # read-only Test-LabVMHasKeyProtector and never call anything that changes the VM.
+        body = self.s.split('function Get-LabVMInstallationMediaPreview {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Test-LabVMHasKeyProtector', body)
+        for mutating in ('Set-LabVMBootProfile', 'Set-LabVMInstallMedia', 'Set-LabVMBootOrder',
+                         'Set-VM', 'Add-VM', 'Enable-VM', 'Remove-'):
+            self.assertNotIn(mutating, body)
+    def test_installation_media_menu_letter_in_both_menu_blocks(self):
+        body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertEqual(body.count('  M  Installation media'), 2)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -34,7 +34,8 @@
     Each export goes into a new, unique subfolder. Otherwise prompts at export.
 .PARAMETER IsoRoot
     Local ISO library folder to scan for installer media, e.g. E:\ISO.
-    Default: E:\ISO. Scanned recursively via Get-LabIsoCandidates.
+    Default: E:\ISO. Scanned recursively via Get-LabIsoCandidates, read-only,
+    when menu option M (installation media) asks you to pick an ISO.
 .PARAMETER TimeoutSeconds
     Maximum polling interval for VM start/shutdown state (default 180 seconds).
     Does not impose a timeout on Hyper-V checkpoint/export/merge operations.
@@ -141,6 +142,7 @@ $script:LabVersion = '1.0.0'
 $script:LabReadOnly = [bool]$ReadOnly
 $script:LabLogFile = $null
 $script:LabExportRoot = $ExportRoot
+$script:LabIsoRoot = $IsoRoot
 $script:LabTimeout = $TimeoutSeconds
 
 function Test-LabVMName {
@@ -1648,6 +1650,21 @@ function Remove-LabVMInstallMedia {
     Set-VMDvdDrive -VMDvdDrive $drives[0] -Path $null -Confirm:$false -ErrorAction Stop
 }
 
+function Get-LabBootEntryKind {
+    param($Entry)
+    # Get-VMFirmware's BootOrder may hold the device objects themselves or VMBootSource wrappers whose
+    # Device property is the device (not yet verified on a live host, see MANUAL-TESTS.md), and the
+    # device class may surface as VMDvdDrive or DvdDrive. Classify by the underlying device's type
+    # name either way; anything unrecognized is 'Other' and is never dropped by a reorder.
+    $device = $Entry
+    $deviceProperty = $Entry.PSObject.Properties['Device']
+    if ($null -ne $deviceProperty -and $null -ne $deviceProperty.Value) { $device = $deviceProperty.Value }
+    $typeName = $device.GetType().Name
+    if ($typeName -match 'DvdDrive$') { return 'Dvd' }
+    if ($typeName -match 'HardDiskDrive$') { return 'Disk' }
+    return 'Other'
+}
+
 function Set-LabVMBootOrder {
     param([guid]$VMId, [ValidateSet('Dvd', 'Disk')][string]$Preference)
     # Deliberately generic: puts the chosen device class first without deleting any other existing
@@ -1656,11 +1673,251 @@ function Set-LabVMBootOrder {
     $vm = Assert-LabVMOff $VMId
     $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
     $currentOrder = @($firmware.BootOrder)
-    $targetTypeName = if ($Preference -eq 'Dvd') { 'VMDvdDrive' } else { 'VMHardDiskDrive' }
-    $preferred = @($currentOrder | Where-Object { $_.GetType().Name -eq $targetTypeName })
-    $rest = @($currentOrder | Where-Object { $_.GetType().Name -ne $targetTypeName })
+    $preferred = @($currentOrder | Where-Object { (Get-LabBootEntryKind $_) -eq $Preference })
+    $rest = @($currentOrder | Where-Object { (Get-LabBootEntryKind $_) -ne $Preference })
+    if ($preferred.Count -eq 0) {
+        # Fail loudly rather than "succeed" with an unchanged order the operator would assume was set.
+        throw "'$($vm.Name)': no $Preference entry was recognized in the firmware boot order, so it was left unchanged. Check Firmware > Boot order in Hyper-V Manager and set it manually."
+    }
     $newOrder = @($preferred + $rest)
     Set-VMFirmware -VM $vm -BootOrder $newOrder -Confirm:$false -ErrorAction Stop
+}
+
+function Format-LabBootEntry {
+    param($Entry)
+    $kind = Get-LabBootEntryKind $Entry
+    $device = $Entry
+    $deviceProperty = $Entry.PSObject.Properties['Device']
+    if ($null -ne $deviceProperty -and $null -ne $deviceProperty.Value) { $device = $deviceProperty.Value }
+    $detail = [string](Get-LabProperty $device 'Path' '')
+    if ([string]::IsNullOrEmpty($detail)) { $detail = [string](Get-LabProperty $Entry 'Description' '') }
+    if ([string]::IsNullOrEmpty($detail)) { $detail = [string](Get-LabProperty $device 'Name' '') }
+    if ($kind -eq 'Dvd' -and [string]::IsNullOrEmpty([string](Get-LabProperty $device 'Path' ''))) { $detail = '(no media)' }
+    return ('{0} [{1}] {2}' -f $kind, $device.GetType().Name, $detail).TrimEnd()
+}
+
+function Show-LabVMInstallMediaConfiguration {
+    param([guid]$VMId)
+    # Read-only: nothing here changes the VM, so this is the one sub-action offered under -ReadOnly.
+    $vm = Get-LabVM $VMId
+    Write-Host "--- Installation media: $($vm.Name) | Generation $($vm.Generation) | $($vm.State) ---"
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    if ($drives.Count -eq 0) { Write-Host 'DVD drives: none.' }
+    else {
+        $drives | Select-Object ControllerType, ControllerNumber, ControllerLocation,
+            @{n='Media'; e={ $p = [string](Get-LabProperty $_ 'Path' ''); if ($p) { $p } else { '(empty)' } }} |
+            Format-Table -AutoSize -Wrap | Out-Host
+        if ($drives.Count -gt 1) {
+            Write-Host 'More than one DVD drive: this version cannot choose among them for attach/eject.'
+        }
+    }
+    $recordPath = Get-LabVMInstallMediaPath $VMId
+    if ([IO.File]::Exists($recordPath)) {
+        try {
+            $record = Get-Content -LiteralPath $recordPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            $previous = [string](Get-LabProperty $record 'PreviousAttachment' '')
+            if ([string]::IsNullOrEmpty($previous)) { $previous = '(empty)' }
+            Write-Host "Attachment before this tool last attached an ISO: $previous"
+        } catch { Write-Warning "Could not read the previous-attachment record '$recordPath': $($_.Exception.Message)" }
+    }
+    if ([int]$vm.Generation -ne 2) {
+        Write-Host 'Generation 1 VM: Secure Boot, vTPM and the UEFI boot order do not apply.'
+        return
+    }
+    $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
+    Write-Host "Secure Boot: $(Get-LabProperty $firmware 'SecureBoot' '-'); template: $(Get-LabProperty $firmware 'SecureBootTemplate' '-')"
+    try { $tpm = Get-LabProperty (Get-VMSecurity -VM $vm -ErrorAction Stop) 'TpmEnabled' '-' } catch { $tpm = 'unknown' }
+    Write-Host "Key protector configured: $(Test-LabVMHasKeyProtector $VMId); vTPM enabled: $tpm"
+    Write-Host 'Firmware boot order (persistent; checked on every boot):'
+    $order = @($firmware.BootOrder)
+    if ($order.Count -eq 0) { Write-Host '  (empty)' }
+    for ($i = 0; $i -lt $order.Count; $i++) { Write-Host ('  {0}. {1}' -f ($i + 1), (Format-LabBootEntry $order[$i])) }
+}
+
+function Get-LabVMInstallationMediaPreview {
+    param([guid]$VMId, [ValidateSet('Windows11', 'UbuntuDesktop')][string]$OsProfile, [string]$IsoPath)
+    # READ-ONLY. This runs before the operator confirms anything, so every fact here comes from a
+    # Get-* cmdlet or a file-system read. In particular the encryption warning is decided by the
+    # read-only Test-LabVMHasKeyProtector, never by running the boot-profile apply step to find out.
+    $vm = Get-LabVM $VMId
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    $dvdPlan = if ($drives.Count -eq 0) { 'A new DVD drive will be added (none exists yet).' }
+        elseif ($drives.Count -eq 1) {
+            $current = [string](Get-LabProperty $drives[0] 'Path' '')
+            'The existing DVD drive ({0} {1}:{2}) will be used; current media: {3}.' -f
+                (Get-LabProperty $drives[0] 'ControllerType' '?'), (Get-LabProperty $drives[0] 'ControllerNumber' '?'),
+                (Get-LabProperty $drives[0] 'ControllerLocation' '?'), $(if ($current) { $current } else { '(empty)' })
+        } else { 'More than one DVD drive exists; this version cannot choose among them.' }
+
+    # Mirrors the boot-profile apply step's own decisions so the preview states exactly what it will do.
+    $hasKeyProtector = Test-LabVMHasKeyProtector $VMId
+    $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
+    $currentTemplate = [string](Get-LabProperty $firmware 'SecureBootTemplate' '')
+    $profileChanges = [Collections.Generic.List[string]]::new()
+    $targetTemplate = if ($OsProfile -eq 'Windows11') { 'MicrosoftWindows' } else { 'MicrosoftUEFICertificateAuthority' }
+    if ($currentTemplate -ne $targetTemplate) {
+        $profileChanges.Add("Secure Boot template: '$currentTemplate' -> '$targetTemplate'.")
+    }
+    if ($OsProfile -eq 'Windows11' -and -not $hasKeyProtector) {
+        $profileChanges.Add('A new local key protector will be created and vTPM enabled.')
+    }
+    try { $tpmEnabled = Get-LabProperty (Get-VMSecurity -VM $vm -ErrorAction Stop) 'TpmEnabled' $null } catch { $tpmEnabled = $null }
+    $order = @($firmware.BootOrder)
+    $firstBoot = if ($order.Count -gt 0) { Format-LabBootEntry $order[0] } else { '(empty)' }
+
+    # Existing-data check: real checkpoints and real on-disk sizes, never names. A differencing disk's
+    # parent chain is followed, since the attached file alone can be tiny while its parent holds an OS.
+    $thresholdBytes = 256MB
+    $reasons = [Collections.Generic.List[string]]::new()
+    $checkpointCount = @(Get-VMSnapshot -VM $vm -ErrorAction Stop).Count
+    if ($checkpointCount -gt 0) { $reasons.Add("The VM has $checkpointCount checkpoint(s).") }
+    foreach ($disk in @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop)) {
+        $diskPath = [string](Get-LabProperty $disk 'Path' '')
+        if ([string]::IsNullOrEmpty($diskPath)) {
+            $reasons.Add("A physical/pass-through disk is attached (disk number $(Get-LabProperty $disk 'DiskNumber' '?')); its contents cannot be sized here.")
+            continue
+        }
+        $total = [long]0
+        $current = $diskPath
+        $measured = $true
+        for ($depth = 0; -not [string]::IsNullOrEmpty($current); $depth++) {
+            if ($depth -ge 64 -or -not [IO.File]::Exists($current)) { $measured = $false; break }
+            $total += ([IO.FileInfo]::new($current)).Length
+            try { $current = [string](Get-LabProperty (Get-VHD -Path $current -ErrorAction Stop) 'ParentPath' '') }
+            catch { $measured = $false; break }
+        }
+        if (-not $measured) { $reasons.Add("Virtual disk '$diskPath' (or its parent chain) could not be measured.") }
+        elseif ($total -ge $thresholdBytes) {
+            $reasons.Add(("Virtual disk '{0}' already uses {1:N1} GiB on disk." -f $diskPath, ($total / 1GB)))
+        }
+    }
+
+    return [pscustomobject]@{
+        VMName = $vm.Name
+        OsProfile = $OsProfile
+        IsoPath = $IsoPath
+        DvdDriveCount = $drives.Count
+        DvdPlan = $dvdPlan
+        BootProfileChanges = [string[]]$profileChanges.ToArray()
+        HasKeyProtector = $hasKeyProtector
+        TpmEnabled = $tpmEnabled
+        CurrentFirstBoot = $firstBoot
+        CheckpointCount = $checkpointCount
+        ExistingDataRisk = ($reasons.Count -gt 0)
+        ExistingDataReasons = [string[]]$reasons.ToArray()
+    }
+}
+
+function Set-LabVMInstallationMediaInteractive {
+    param([guid]$VMId)
+    # Self-gating, like New-LabVM, but narrower: the menu wrapper lets this run under -ReadOnly because
+    # it has a genuinely read-only sub-action, so this function itself refuses everything else there.
+    # Under $script:LabReadOnly it never prompts for an OS profile, an ISO, attach or eject.
+    if ($script:LabReadOnly) {
+        Write-Host 'Read-only mode: showing the current DVD/boot configuration only; attach, eject and boot-profile changes are disabled.'
+        Show-LabVMInstallMediaConfiguration $VMId
+        return 'NO_CHANGE'
+    }
+    while ($true) {
+        Write-Host @'
+  A  Attach an installer ISO and prepare the VM to boot it   [requires Off]
+  E  Eject the current DVD media                             [requires Off]
+  I  Inspect current DVD/boot configuration (read-only)
+  B  Back
+'@
+        $choice = (Read-LabText 'Installation media').ToUpperInvariant()
+        if ($choice -eq 'I') { Show-LabVMInstallMediaConfiguration $VMId; return 'NO_CHANGE' }
+        if ($choice -eq 'B' -or $choice -eq '') { return 'CANCELLED' }
+        if ($choice -eq 'E') {
+            $vm = Assert-LabVMOff $VMId
+            $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+            if ($drives.Count -gt 1) {
+                Write-Warning "'$($vm.Name)': more than one DVD drive exists; this version doesn't choose among them. Eject the ISO manually in Hyper-V Manager."
+                return 'CANCELLED'
+            }
+            $attached = if ($drives.Count -eq 1) { [string](Get-LabProperty $drives[0] 'Path' '') } else { '' }
+            if ([string]::IsNullOrEmpty($attached)) { Write-Host 'No media is attached; nothing to eject.'; return 'NO_CHANGE' }
+            Write-Host "Eject '$attached' from '$($vm.Name)'. The DVD drive itself stays; the firmware boot order is not changed (an empty DVD entry is skipped at boot)."
+            if ((Read-LabYesNoCancel 'Eject now?') -ne 'Y') { return 'CANCELLED' }
+            Remove-LabVMInstallMedia $VMId
+            Write-Host 'Media ejected.'
+            return 'COMPLETED'
+        }
+        if ($choice -eq 'A') { break }
+        Write-Host 'Choose A, E, I or B.'
+    }
+
+    # --- Attach: gather choices, then a READ-ONLY preview; nothing below changes the VM until confirmed.
+    $vm = Assert-LabVMOff $VMId
+    if ([int]$vm.Generation -ne 2) {
+        Write-Warning "'$($vm.Name)' is Generation $($vm.Generation). Secure Boot and vTPM boot profiles require Generation 2; nothing was changed."
+        return 'CANCELLED'
+    }
+    $osProfile = $null
+    while ($null -eq $osProfile) {
+        $answer = Read-LabText 'OS profile: 1 Windows11; 2 UbuntuDesktop; B cancel'
+        if ($answer -eq '1') { $osProfile = 'Windows11' }
+        elseif ($answer -eq '2') { $osProfile = 'UbuntuDesktop' }
+        elseif ($answer -ieq 'B' -or $answer -eq '') { return 'CANCELLED' }
+        else { Write-Host 'Choose 1, 2 or B.' }
+    }
+    $isoPath = Select-LabIsoPath $script:LabIsoRoot
+    if ($null -eq $isoPath) { return 'CANCELLED' }
+
+    $preview = Get-LabVMInstallationMediaPreview $VMId $osProfile $isoPath
+    if ($preview.DvdDriveCount -gt 1) {
+        Write-Warning "'$($preview.VMName)': more than one DVD drive exists; this version doesn't choose among them. Attach the ISO manually in Hyper-V Manager. Nothing was changed."
+        return 'CANCELLED'
+    }
+    Write-Host "`n=== Installation media preview (nothing has been changed yet) ==="
+    Write-Host "Target VM:   $($preview.VMName) [$VMId]"
+    Write-Host "OS profile:  $($preview.OsProfile)"
+    Write-Host "ISO:         $($preview.IsoPath)"
+    Write-Host "DVD drive:   $($preview.DvdPlan)"
+    if ($preview.BootProfileChanges.Count -eq 0) { Write-Host 'Boot profile: already matches; no Secure Boot/vTPM change.' }
+    else { Write-Host 'Boot profile changes:'; foreach ($line in $preview.BootProfileChanges) { Write-Host "  - $line" } }
+    if ($preview.OsProfile -eq 'Windows11' -and $preview.HasKeyProtector -and $preview.TpmEnabled -eq $false) {
+        Write-Host '  - Note: a key protector exists but vTPM is disabled; it is left as-is (never rotated), so enable vTPM manually if Windows 11 setup needs it.'
+    }
+    Write-Host 'Boot order:  DVD will be moved to the FIRST position in the firmware boot order. This is a'
+    Write-Host '             PERSISTENT firmware preference, not a one-time boot: it applies to every later boot'
+    Write-Host "             until changed back. Currently first: $($preview.CurrentFirstBoot)"
+    if ($preview.HasKeyProtector) {
+        Write-Warning ('This VM already has encryption-related state configured (a key protector exists). Security/firmware ' +
+            'changes on an already-encrypted guest (e.g. BitLocker) can require recovery material (a recovery key) at next boot. ' +
+            'Make sure you have it before continuing.')
+    }
+    if ($preview.ExistingDataRisk) {
+        Write-Warning 'This VM may already contain an operating system or data. Booting installer media can overwrite it:'
+        foreach ($reason in $preview.ExistingDataReasons) { Write-Host "  - $reason" }
+        Write-Host 'Consider taking a Checkpoint (menu 5) or a full export (menu 9) first.'
+    }
+
+    if ((Read-LabYesNoCancel 'Apply these changes') -ne 'Y') { return 'CANCELLED' }
+    if ($preview.ExistingDataRisk) {
+        # Extra, typed confirmation that defaults to cancel: anything but the exact phrase cancels.
+        Write-Host 'Existing data may be overwritten. A second, explicit confirmation is required.'
+        if (-not (Confirm-LabText "INSTALL OVER $($preview.VMName)")) { return 'CANCELLED' }
+    }
+
+    # --- Apply, in this order. Each function re-asserts the VM is Off before it changes anything.
+    $done = [Collections.Generic.List[string]]::new()
+    try {
+        $profileResult = Set-LabVMBootProfile $VMId $osProfile
+        $done.Add(('boot profile (template changed: {0}; key protector added: {1}; vTPM enabled: {2})' -f
+            $profileResult.SecureBootTemplateChanged, $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled))
+        $mediaResult = Set-LabVMInstallMedia $VMId $isoPath
+        $previous = if ([string]::IsNullOrEmpty($mediaResult.PreviousAttachment)) { '(empty)' } else { $mediaResult.PreviousAttachment }
+        $done.Add(('ISO attached (DVD drive added: {0}; previous media: {1})' -f $mediaResult.DvdDriveAdded, $previous))
+        Set-LabVMBootOrder $VMId 'Dvd'
+        $done.Add('DVD first in firmware boot order')
+    } catch {
+        $completedText = if ($done.Count -eq 0) { 'none' } else { $done -join '; ' }
+        throw "Installation media setup stopped partway: $($_.Exception.Message) Steps already applied: $completedText. Use I to inspect the VM before retrying."
+    }
+    foreach ($line in $done) { Write-Host "Done: $line" }
+    Write-Host 'Start the VM to boot the installer. No OS is installed automatically by this action.'
+    return 'COMPLETED'
 }
 
 function Get-LabVMRemovalPreview {
@@ -3433,6 +3690,7 @@ function Show-LabVMMenu {
   C  Configure SSH connection for this VM
   K  Trust this VM's SSH host key (first connection; OpenSSH asks you)
   U  Clear this VM's stale SSH host key (after the guest's key changed)
+  M  Installation media: inspect DVD/boot configuration (read-only)
   R  Refresh
   B  Choose another VM
   Q  Quit
@@ -3458,6 +3716,7 @@ READ-ONLY: VM-changing operations are disabled.
   C  Configure SSH connection for this VM
   K  Trust this VM's SSH host key (first connection; OpenSSH asks you) [requires Running]
   U  Clear this VM's stale SSH host key (after the guest's key changed)
+  M  Installation media: attach ISO + boot profile, eject, inspect [attach/eject require Off]
   X  EMERGENCY power-off                       [risk of data loss]
   R  Refresh
   B  Choose another VM
@@ -3494,6 +3753,8 @@ READ-ONLY: VM-changing operations are disabled.
                     if ($null -eq $sshSettings) { Write-Host 'SSH connection is not configured for this VM. Use Configure SSH connection first.' }
                     else { Update-LabSshKnownHost $sshSettings.HostNameOrAddress $sshSettings.Port }
                 }
+                # M self-gates under -ReadOnly (inspect only); -AllowReadOnly just lets that sub-action through.
+                'M'  { Invoke-LabAction $VMId 'install-media-menu' -AllowReadOnly { param($id) Set-LabVMInstallationMediaInteractive $id } }
                 'X'  { Invoke-LabAction $VMId 'emergency-power-off' { param($id) Stop-LabVMPower $id } }
                 'R'  { continue vmMenu }
                 'B'  { return 'BACK' }
