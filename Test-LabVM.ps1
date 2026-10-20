@@ -59,7 +59,7 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Test-LabVMHasKeyProtector', 'Set-LabVMBootProfile', 'Get-LabVMInstallMediaPath',
     'Set-LabVMInstallMedia', 'Remove-LabVMInstallMedia', 'Set-LabVMBootOrder', 'Get-LabProperty',
     'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
-    'Get-LabVMInstallationMediaPreview')
+    'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -2579,6 +2579,145 @@ Test-Case 'New-LabSeedIso: unsupported values and duplicate in-image paths are r
     $files['a\B.TXT'] = 'two'
     Assert-Throws { Invoke-LabSeedIsoWithFakeImage $files } 'same file'
     Assert-Equal $script:SeedComCreated 0
+}
+
+# --- Windows unattended install, Task 1: Get-LabWindowsInstallImages / Test-LabWindowsIsoInScope ---
+# Fakes for Mount-DiskImage, Get-Volume, Get-WindowsImage, Dismount-DiskImage, Get-Module and
+# Test-Path, standing in for the Storage/Dism cmdlets Get-LabWindowsInstallImages calls.
+# Mount-DiskImage/Get-Volume pairing: -PassThru from Mount-DiskImage, piped into Get-Volume, is the
+# exact pairing Plan 1 already live-verified against a real ISO (MANUAL-TESTS.md, "Seed-ISO round
+# trip (verified live)": "Mount-DiskImage -ImagePath <iso> -PassThru | Get-Volume"), so the fake
+# here matches that, not the untried Get-DiskImage-by-path alternative.
+$script:MountDiskImageCalls = 0
+$script:DismountDiskImageCalls = 0
+$script:FakeDismModuleAvailable = $true
+$script:FakeIsoDriveLetter = 'Z'
+$script:FakeInstallWimExists = $true
+$script:FakeInstallEsdExists = $false
+$script:FakeWindowsImageSummaries = @()
+$script:FakeWindowsImageDetailsByIndex = @{}
+$script:FakeGetWindowsImageThrows = $null
+
+function Get-Module {
+    [CmdletBinding()]
+    param([switch]$ListAvailable, [string]$Name)
+    if ($Name -eq 'Dism' -and $ListAvailable) {
+        if ($script:FakeDismModuleAvailable) { return [pscustomobject]@{ Name = 'Dism' } }
+        return $null
+    }
+    return $null
+}
+function Mount-DiskImage {
+    [CmdletBinding()]
+    param([string]$ImagePath, [switch]$PassThru)
+    $script:MountDiskImageCalls++
+    if ($PassThru) { return [pscustomobject]@{ ImagePath = $ImagePath } }
+}
+function Get-Volume {
+    [CmdletBinding()]
+    param($DiskImage)
+    return [pscustomobject]@{ DriveLetter = $script:FakeIsoDriveLetter }
+}
+function Dismount-DiskImage {
+    [CmdletBinding()]
+    param([string]$ImagePath)
+    $script:DismountDiskImageCalls++
+}
+function Test-Path {
+    # Forwards every path except the fake ISO's own sources\install.wim/.esd to the real cmdlet, so
+    # the many unrelated real-filesystem Test-Path tests elsewhere in this file are unaffected.
+    [CmdletBinding()]
+    param([string]$LiteralPath, [string]$Path, [string]$PathType, [switch]$IsValid)
+    $target = if ($PSBoundParameters.ContainsKey('LiteralPath')) { $LiteralPath } elseif ($PSBoundParameters.ContainsKey('Path')) { $Path } else { $null }
+    $sourcesRoot = "$($script:FakeIsoDriveLetter):\sources"
+    if ($target -eq "$sourcesRoot\install.wim") { return $script:FakeInstallWimExists }
+    if ($target -eq "$sourcesRoot\install.esd") { return $script:FakeInstallEsdExists }
+    return Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+}
+function Get-WindowsImage {
+    [CmdletBinding()]
+    param([string]$ImagePath, [int]$Index)
+    if ($null -ne $script:FakeGetWindowsImageThrows) { throw $script:FakeGetWindowsImageThrows }
+    if ($PSBoundParameters.ContainsKey('Index')) {
+        $detail = $script:FakeWindowsImageDetailsByIndex[$Index]
+        if ($null -eq $detail) { throw "No fake Get-WindowsImage detail for index $Index." }
+        return $detail
+    }
+    return @($script:FakeWindowsImageSummaries)
+}
+function Reset-LabWindowsImageFakes {
+    $script:MountDiskImageCalls = 0
+    $script:DismountDiskImageCalls = 0
+    $script:FakeDismModuleAvailable = $true
+    $script:FakeInstallWimExists = $true
+    $script:FakeInstallEsdExists = $false
+    $script:FakeGetWindowsImageThrows = $null
+}
+
+Test-Case 'Get-LabWindowsInstallImages: two Windows 11 client editions are both returned and in scope' {
+    Reset-LabWindowsImageFakes
+    $script:FakeWindowsImageSummaries = @(
+        [pscustomobject]@{ ImageIndex = 1; ImageName = 'Windows 11 Home' }
+        [pscustomobject]@{ ImageIndex = 2; ImageName = 'Windows 11 Pro' }
+    )
+    $script:FakeWindowsImageDetailsByIndex = @{
+        1 = [pscustomobject]@{ InstallationType = 'Client'; Version = '10.0.26300.1000' }
+        2 = [pscustomobject]@{ InstallationType = 'Client'; Version = '10.0.26300.1000' }
+    }
+    $images = @(Get-LabWindowsInstallImages 'C:\iso\win11.iso')
+    Assert-Equal $images.Count 2
+    Assert-Equal $images[0].Name 'Windows 11 Home'
+    Assert-Equal $images[1].Name 'Windows 11 Pro'
+    foreach ($image in $images) {
+        Assert-Equal $image.InstallationType 'Client'
+        Assert-Equal $image.BuildNumber 26300
+        Assert-Equal $image.IsWindows11Client $true
+    }
+    Assert-Equal $script:MountDiskImageCalls 1
+    Assert-Equal $script:DismountDiskImageCalls 1
+}
+Test-Case 'Get-LabWindowsInstallImages: a Windows 10 client edition is reported out of scope' {
+    Reset-LabWindowsImageFakes
+    $script:FakeWindowsImageSummaries = @([pscustomobject]@{ ImageIndex = 1; ImageName = 'Windows 10 Pro' })
+    $script:FakeWindowsImageDetailsByIndex = @{ 1 = [pscustomobject]@{ InstallationType = 'Client'; Version = '10.0.19045.1' } }
+    $images = @(Get-LabWindowsInstallImages 'C:\iso\win10.iso')
+    Assert-Equal $images.Count 1
+    Assert-Equal $images[0].BuildNumber 19045
+    Assert-Equal $images[0].IsWindows11Client $false
+}
+Test-Case 'Get-LabWindowsInstallImages: a Server edition is out of scope even though its build number alone would pass' {
+    Reset-LabWindowsImageFakes
+    $script:FakeWindowsImageSummaries = @([pscustomobject]@{ ImageIndex = 1; ImageName = 'Windows Server 2022 Standard' })
+    $script:FakeWindowsImageDetailsByIndex = @{ 1 = [pscustomobject]@{ InstallationType = 'Server'; Version = '10.0.26300.1000' } }
+    $images = @(Get-LabWindowsInstallImages 'C:\iso\server.iso')
+    Assert-Equal $images.Count 1
+    Assert-Equal $images[0].BuildNumber 26300
+    Assert-Equal $images[0].IsWindows11Client $false
+}
+Test-Case 'Get-LabWindowsInstallImages: Dismount-DiskImage still runs, in a finally, when the image probe throws' {
+    Reset-LabWindowsImageFakes
+    $script:FakeGetWindowsImageThrows = 'simulated DISM probe failure'
+    Assert-Throws { Get-LabWindowsInstallImages 'C:\iso\bad.iso' } 'simulated DISM probe failure'
+    Assert-Equal $script:MountDiskImageCalls 1
+    Assert-Equal $script:DismountDiskImageCalls 1
+}
+Test-Case 'Get-LabWindowsInstallImages: a missing Dism module throws a clear, specific message before any mount' {
+    Reset-LabWindowsImageFakes
+    $script:FakeDismModuleAvailable = $false
+    Assert-Throws { Get-LabWindowsInstallImages 'C:\iso\x.iso' } 'Dism'
+    Assert-Equal $script:MountDiskImageCalls 0
+    Assert-Equal $script:DismountDiskImageCalls 0
+}
+Test-Case 'Test-LabWindowsIsoInScope: true as soon as one image in the list is a Windows 11 client edition' {
+    $images = @(
+        [pscustomobject]@{ IsWindows11Client = $false }
+        [pscustomobject]@{ IsWindows11Client = $true }
+    )
+    Assert-Equal (Test-LabWindowsIsoInScope $images) $true
+}
+Test-Case 'Test-LabWindowsIsoInScope: false when no image qualifies, or the list is empty' {
+    Assert-Equal (Test-LabWindowsIsoInScope @([pscustomobject]@{ IsWindows11Client = $false })) $false
+    Assert-Equal (Test-LabWindowsIsoInScope @()) $false
 }
 
 # --- Hyper-V shape drift guard (final-review fix) ---
