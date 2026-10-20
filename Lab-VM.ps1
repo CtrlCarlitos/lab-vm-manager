@@ -1765,6 +1765,19 @@ function New-LabPatchedBootableIso {
     }
     $catalogSector = [BitConverter]::ToUInt32($brvd, 71)
     $catalog = & $readIsoBytes $SourceIsoPath ([int64]$catalogSector * $sectorSize) $sectorSize
+    # Validation Entry (bytes 0-31): byte 1 is the platform id. This plan is Windows 11 client ISOs
+    # only, whose catalogs -- confirmed against a real one, see the design doc -- carry a single,
+    # EFI-only Validation Entry followed immediately by one Initial/Default Entry (bytes 32-63,
+    # Load RBA at local offset 8). A hybrid BIOS+EFI catalog with Section Header Entries would not
+    # match this fixed layout; the EFI platform-id check here, plus the byte comparison below,
+    # together make sure a layout this technique does not understand is refused, never patched blind.
+    $platformIdMatches = ($catalog[1] -eq 0xEF)
+    $boundsReason = "'$SourceIsoPath': the El Torito boot catalog did not point where expected " +
+        "-- its EFI entry's Load RBA does not point at $bootDirName\efisys.bin's own content. " +
+        'Refusing to patch blind.'
+    if (-not $platformIdMatches) {
+        return [pscustomobject]@{ Patched = $false; Reason = $boundsReason; OutputPath = $null }
+    }
     $loadRba = [BitConverter]::ToUInt32($catalog, 40)
     $offset = [int64]$loadRba * $sectorSize
     $actualBytes = & $readIsoBytes $SourceIsoPath $offset $efisysBytes.Length
@@ -1773,13 +1786,7 @@ function New-LabPatchedBootableIso {
         if ($actualBytes[$i] -ne $efisysBytes[$i]) { $bytesMatch = $false; break }
     }
     if (-not $bytesMatch) {
-        return [pscustomobject]@{
-            Patched = $false
-            Reason = "'$SourceIsoPath': the El Torito boot catalog did not point where expected " +
-                "-- the bytes at its EFI entry's Load RBA (byte offset $offset) do not match " +
-                "$bootDirName\efisys.bin's own content. Refusing to patch blind."
-            OutputPath = $null
-        }
+        return [pscustomobject]@{ Patched = $false; Reason = $boundsReason; OutputPath = $null }
     }
 
     # Only once every check above holds: copy the whole source file, then overwrite exactly
