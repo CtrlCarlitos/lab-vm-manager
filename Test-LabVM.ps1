@@ -59,7 +59,8 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Test-LabVMHasKeyProtector', 'Set-LabVMBootProfile', 'Get-LabVMInstallMediaPath',
     'Set-LabVMInstallMedia', 'Remove-LabVMInstallMedia', 'Set-LabVMBootOrder', 'Get-LabProperty',
     'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
-    'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope')
+    'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope',
+    'New-LabPatchedBootableIso')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -2728,6 +2729,246 @@ Test-Case 'Test-LabWindowsIsoInScope: true as soon as one image in the list is a
 Test-Case 'Test-LabWindowsIsoInScope: false when no image qualifies, or the list is empty' {
     Assert-Equal (Test-LabWindowsIsoInScope @([pscustomobject]@{ IsWindows11Client = $false })) $false
     Assert-Equal (Test-LabWindowsIsoInScope @()) $false
+}
+
+# --- Windows unattended install, Task 2: New-LabPatchedBootableIso ---
+# Mount-DiskImage/Get-Volume/Dismount-DiskImage are redefined here, overriding Task 1's versions
+# above for every statement from this point on (Task 1's own Test-Case blocks already ran against
+# its own fakes before this redefinition executes -- PowerShell functions take effect in the order
+# their "function" statements run, not by position in the file).
+#
+# Unlike Task 1's fakes, these back a REAL temporary directory: New-LabPatchedBootableIso reads
+# efi\microsoft\boot\efisys.bin/efisys_noprompt.bin through ordinary filesystem cmdlets
+# (Test-Path/Get-Content), and the byte-for-byte comparison this task exists to prove needs their
+# REAL content, not a canned value. A New-PSDrive mapping gives "<letter>:\..." a real backing
+# directory without requiring Mount-DiskImage/Get-Volume themselves to be real or elevated. The El
+# Torito parsing itself runs separately, against a real, hand-built fixture ISO file on disk
+# (see New-LabFakeElToritoIso below), never touched by any of these fakes.
+$script:BootPatchMountCalls = 0
+$script:BootPatchDismountCalls = 0
+$script:BootPatchMountThrows = $null
+$script:BootPatchDriveName = @('Z', 'Y', 'X', 'W', 'V', 'U') | Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) } | Select-Object -First 1
+if (-not $script:BootPatchDriveName) { throw 'No unused drive letter (Z..U) was available to stage the New-LabPatchedBootableIso fixture mount.' }
+
+function Mount-DiskImage {
+    [CmdletBinding()]
+    param([string]$ImagePath, [switch]$PassThru)
+    $script:BootPatchMountCalls++
+    if ($null -ne $script:BootPatchMountThrows) { throw $script:BootPatchMountThrows }
+    if ($PassThru) { return [pscustomobject]@{ ImagePath = $ImagePath } }
+}
+function Get-Volume {
+    [CmdletBinding()]
+    param($DiskImage)
+    return [pscustomobject]@{ DriveLetter = $script:BootPatchDriveName }
+}
+function Dismount-DiskImage {
+    [CmdletBinding()]
+    param([string]$ImagePath)
+    $script:BootPatchDismountCalls++
+}
+
+function Reset-LabBootPatchFakes {
+    $script:BootPatchMountCalls = 0
+    $script:BootPatchDismountCalls = 0
+    $script:BootPatchMountThrows = $null
+    $script:CopyCalls = 0
+    $script:CopyMode = 'Normal'
+}
+
+# Stages a real temp directory holding the two loose boot-loader files (or just efisys.bin, when
+# $IncludeNoPrompt is $false) and maps $script:BootPatchDriveName at it, so the function's own
+# "$($volume.DriveLetter):\efi\microsoft\boot\..." string concatenation resolves for real.
+function New-LabBootPatchStagedMount {
+    param([byte[]]$EfisysBytes, [byte[]]$NoPromptBytes, [bool]$IncludeNoPrompt = $true)
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-' + [guid]::NewGuid().ToString('N'))
+    $bootDir = Join-Path $dir 'efi\microsoft\boot'
+    [void][IO.Directory]::CreateDirectory($bootDir)
+    if ($null -ne $EfisysBytes) { [IO.File]::WriteAllBytes((Join-Path $bootDir 'efisys.bin'), $EfisysBytes) }
+    if ($IncludeNoPrompt -and $null -ne $NoPromptBytes) { [IO.File]::WriteAllBytes((Join-Path $bootDir 'efisys_noprompt.bin'), $NoPromptBytes) }
+    if (Get-PSDrive -Name $script:BootPatchDriveName -ErrorAction SilentlyContinue) {
+        Remove-PSDrive -Name $script:BootPatchDriveName -Force -ErrorAction Stop
+    }
+    [void](New-PSDrive -Name $script:BootPatchDriveName -PSProvider FileSystem -Root $dir -Scope Global -ErrorAction Stop)
+    return $dir
+}
+function Remove-LabBootPatchStagedMount {
+    param([string]$Dir)
+    if (Get-PSDrive -Name $script:BootPatchDriveName -ErrorAction SilentlyContinue) {
+        Remove-PSDrive -Name $script:BootPatchDriveName -Force -ErrorAction SilentlyContinue
+    }
+    if ([IO.Directory]::Exists($Dir)) { [IO.Directory]::Delete($Dir, $true) }
+}
+
+# Hand-builds a minimal, valid El Torito/ISO9660 byte layout: a Boot Record Volume Descriptor at
+# sector 17 ("CD001", "EL TORITO SPECIFICATION", a catalog-sector pointer at its documented offset
+# 71), a boot catalog at $CatalogSector (a Validation Entry naming platform id $PlatformId, then an
+# Initial/Default Entry whose Load RBA field -- local offset 8, so catalog offset 40 -- points at
+# $LoadRbaSector), and, when given, real content at that data sector standing in for efisys.bin's
+# own bytes.
+function New-LabFakeElToritoIso {
+    param([string]$Path, [int]$TotalSectors = 50, [int]$CatalogSector = 22, [int]$LoadRbaSector = 40, [byte[]]$SectorContent = $null, [byte]$PlatformId = 0xEF)
+    $sectorSize = 2048
+    $bytes = New-Object byte[] ($TotalSectors * $sectorSize)
+    $brvdOffset = 17 * $sectorSize
+    $bytes[$brvdOffset] = 0
+    [Array]::Copy([Text.Encoding]::ASCII.GetBytes('CD001'), 0, $bytes, $brvdOffset + 1, 5)
+    $elTorito = [Text.Encoding]::ASCII.GetBytes('EL TORITO SPECIFICATION')
+    [Array]::Copy($elTorito, 0, $bytes, $brvdOffset + 7, $elTorito.Length)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$CatalogSector), 0, $bytes, $brvdOffset + 71, 4)
+
+    $catOffset = $CatalogSector * $sectorSize
+    $bytes[$catOffset] = 0x01       # Validation Entry: header id
+    $bytes[$catOffset + 1] = $PlatformId
+    $bytes[$catOffset + 30] = 0x55  # Validation Entry: key bytes
+    $bytes[$catOffset + 31] = 0xAA
+    $bytes[$catOffset + 32] = 0x88  # Initial/Default Entry: boot indicator (bootable)
+    $bytes[$catOffset + 33] = 0x00  # Initial/Default Entry: boot media type (no emulation)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$LoadRbaSector), 0, $bytes, $catOffset + 40, 4)
+
+    if ($null -ne $SectorContent) {
+        [Array]::Copy($SectorContent, 0, $bytes, $LoadRbaSector * $sectorSize, $SectorContent.Length)
+    }
+    [IO.File]::WriteAllBytes($Path, $bytes)
+}
+
+function New-LabBootPatchDistinctBytes {
+    param([int]$Length, [int]$Seed)
+    $bytes = New-Object byte[] $Length
+    for ($i = 0; $i -lt $Length; $i++) { $bytes[$i] = [byte]((($i * $Seed) + $Seed) % 251) }
+    return $bytes
+}
+
+Test-Case 'New-LabPatchedBootableIso: happy path patches only the Load-RBA bytes, everything else unchanged' {
+    Reset-LabBootPatchFakes
+    $efisysBytes = New-LabBootPatchDistinctBytes 80 7
+    $noPromptBytes = New-LabBootPatchDistinctBytes 80 13
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $stagedDir = $null
+    try {
+        New-LabFakeElToritoIso -Path $isoPath -SectorContent $efisysBytes
+        $stagedDir = New-LabBootPatchStagedMount -EfisysBytes $efisysBytes -NoPromptBytes $noPromptBytes
+        $sourceBytes = [IO.File]::ReadAllBytes($isoPath)
+
+        $result = New-LabPatchedBootableIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $true
+        Assert-Equal $result.OutputPath $outputPath
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $true
+        $outputBytes = [IO.File]::ReadAllBytes($outputPath)
+        Assert-Equal $outputBytes.Length $sourceBytes.Length
+
+        $patchOffset = 40 * 2048
+        $patchedRegion = $outputBytes[$patchOffset..($patchOffset + 79)]
+        Assert-Equal ([Convert]::ToBase64String($patchedRegion)) ([Convert]::ToBase64String($noPromptBytes))
+
+        # Everything outside the patched region must be byte-identical to the original source ISO:
+        # rebuild the patched region back to its original content and hash-compare the whole file.
+        $reconstructed = [byte[]]$outputBytes.Clone()
+        [Array]::Copy($efisysBytes, 0, $reconstructed, $patchOffset, $efisysBytes.Length)
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        $beforeHash = [Convert]::ToBase64String($sha256.ComputeHash($sourceBytes))
+        $afterHash = [Convert]::ToBase64String($sha256.ComputeHash($reconstructed))
+        Assert-Equal $afterHash $beforeHash
+
+        Assert-Equal $script:BootPatchMountCalls 1
+        Assert-Equal $script:BootPatchDismountCalls 1
+        Assert-Equal $script:CopyCalls 1
+    } finally {
+        if ($stagedDir) { Remove-LabBootPatchStagedMount $stagedDir }
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableIso: a size mismatch between efisys.bin and efisys_noprompt.bin refuses, no copy made' {
+    Reset-LabBootPatchFakes
+    $efisysBytes = New-LabBootPatchDistinctBytes 80 7
+    $noPromptBytes = New-LabBootPatchDistinctBytes 79 13
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $stagedDir = $null
+    try {
+        New-LabFakeElToritoIso -Path $isoPath -SectorContent $efisysBytes
+        $stagedDir = New-LabBootPatchStagedMount -EfisysBytes $efisysBytes -NoPromptBytes $noPromptBytes
+
+        $result = New-LabPatchedBootableIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $false
+        if ($result.Reason -notmatch 'size|length|byte') { throw "Reason did not mention size/length: $($result.Reason)" }
+        Assert-Equal $result.OutputPath $null
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
+        Assert-Equal $script:CopyCalls 0
+        Assert-Equal $script:BootPatchDismountCalls 1
+    } finally {
+        if ($stagedDir) { Remove-LabBootPatchStagedMount $stagedDir }
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableIso: a boot catalog pointing at content that does not match efisys.bin refuses, no copy made' {
+    Reset-LabBootPatchFakes
+    $efisysBytes = New-LabBootPatchDistinctBytes 80 7
+    $noPromptBytes = New-LabBootPatchDistinctBytes 80 13
+    $isoSectorContent = New-LabBootPatchDistinctBytes 80 99
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $stagedDir = $null
+    try {
+        New-LabFakeElToritoIso -Path $isoPath -SectorContent $isoSectorContent
+        $stagedDir = New-LabBootPatchStagedMount -EfisysBytes $efisysBytes -NoPromptBytes $noPromptBytes
+
+        $result = New-LabPatchedBootableIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $false
+        if ($result.Reason -notmatch 'boot catalog') { throw "Reason did not say the boot catalog didn't point where expected: $($result.Reason)" }
+        Assert-Equal $result.OutputPath $null
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
+        Assert-Equal $script:CopyCalls 0
+        Assert-Equal $script:BootPatchDismountCalls 1
+    } finally {
+        if ($stagedDir) { Remove-LabBootPatchStagedMount $stagedDir }
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableIso: a missing efisys_noprompt.bin refuses immediately, no copy attempted' {
+    Reset-LabBootPatchFakes
+    $efisysBytes = New-LabBootPatchDistinctBytes 80 7
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $stagedDir = $null
+    try {
+        New-LabFakeElToritoIso -Path $isoPath -SectorContent $efisysBytes
+        $stagedDir = New-LabBootPatchStagedMount -EfisysBytes $efisysBytes -IncludeNoPrompt $false
+
+        $result = New-LabPatchedBootableIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $false
+        if ($result.Reason -notmatch 'efisys_noprompt\.bin') { throw "Reason did not name efisys_noprompt.bin: $($result.Reason)" }
+        Assert-Equal $result.OutputPath $null
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
+        Assert-Equal $script:CopyCalls 0
+        Assert-Equal $script:BootPatchMountCalls 1
+        Assert-Equal $script:BootPatchDismountCalls 1
+    } finally {
+        if ($stagedDir) { Remove-LabBootPatchStagedMount $stagedDir }
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableIso: a Mount-DiskImage failure propagates as itself, not masked by a dismount error' {
+    Reset-LabBootPatchFakes
+    $script:BootPatchMountThrows = 'simulated Mount-DiskImage failure'
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        Assert-Throws { New-LabPatchedBootableIso $isoPath $outputPath } 'simulated Mount-DiskImage failure'
+        Assert-Equal $script:BootPatchMountCalls 1
+        Assert-Equal $script:BootPatchDismountCalls 0
+    } finally {
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # --- Hyper-V shape drift guard (final-review fix) ---
