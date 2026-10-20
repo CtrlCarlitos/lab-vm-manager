@@ -1624,6 +1624,58 @@ Test-Case 'Gate: the real script rejects an out-of-range -SshPort at parameter b
     if (-not ($output -replace '\s', '').Contains('SshPort')) { throw "Unexpected output: $output" }
 }
 
+Test-Case 'Select-LabIsoPath lists candidates and returns the exact chosen path' {
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('labiso-select-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $dir1 = Join-Path $tempRoot 'dir1'
+    $dir2 = Join-Path $tempRoot 'dir2'
+    [void][IO.Directory]::CreateDirectory($dir1)
+    [void][IO.Directory]::CreateDirectory($dir2)
+    # Same filename in two different folders -- selection must resolve by index/FullName, not by name.
+    $path1 = Join-Path $dir1 'same.iso'
+    $path2 = Join-Path $dir2 'same.iso'
+    try {
+        [IO.File]::WriteAllBytes($path1, [byte[]]@(1, 2, 3))
+        [IO.File]::WriteAllBytes($path2, [byte[]]@(4, 5, 6, 7))
+        & {
+            $script:FakeIsoScan = [pscustomobject]@{
+                Files     = @(
+                    [pscustomobject]@{ FullName = $path1; Length = (Get-Item -LiteralPath $path1).Length; LastWriteTime = (Get-Item -LiteralPath $path1).LastWriteTime }
+                    [pscustomobject]@{ FullName = $path2; Length = (Get-Item -LiteralPath $path2).Length; LastWriteTime = (Get-Item -LiteralPath $path2).LastWriteTime }
+                )
+                Incomplete = $false
+                Errors     = @()
+            }
+            function Get-LabIsoCandidates { param([string]$IsoRoot) return $script:FakeIsoScan }
+            $script:IsoAnswers = [Collections.Generic.Queue[string]]::new([string[]]@('2'))
+            function Read-LabText { param([string]$Prompt) return $script:IsoAnswers.Dequeue() }
+            foreach ($sb in (Import-LabRealFunction 'Select-LabIsoPath')) { . $sb }
+            $result = Select-LabIsoPath $tempRoot
+            Assert-Equal $result $path2
+        }
+    } finally {
+        if ([IO.Directory]::Exists($tempRoot)) { [IO.Directory]::Delete($tempRoot, $true) }
+    }
+}
+Test-Case 'Select-LabIsoPath re-validates and rejects a path that no longer exists' {
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('labiso-missing-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    # $tempRoot is never created on disk -- the candidate's FullName does not exist.
+    $missingPath = Join-Path $tempRoot 'ghost.iso'
+    & {
+        $script:FakeIsoScan = [pscustomobject]@{
+            Files     = @([pscustomobject]@{ FullName = $missingPath; Length = [long]123; LastWriteTime = (Get-Date) })
+            Incomplete = $false
+            Errors     = @()
+        }
+        function Get-LabIsoCandidates { param([string]$IsoRoot) return $script:FakeIsoScan }
+        # Picks the (nonexistent) candidate first, then cancels once rejected, so the test ends cleanly.
+        $script:IsoAnswers = [Collections.Generic.Queue[string]]::new([string[]]@('1', 'B'))
+        function Read-LabText { param([string]$Prompt) return $script:IsoAnswers.Dequeue() }
+        foreach ($sb in (Import-LabRealFunction 'Select-LabIsoPath')) { . $sb }
+        $result = Select-LabIsoPath $tempRoot
+        Assert-Equal $result $null
+    }
+}
+
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
 if ($script:Failed -gt 0) { exit 1 }

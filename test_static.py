@@ -615,6 +615,11 @@ class SourceContract(unittest.TestCase):
     def test_iso_discovery_reports_incomplete_not_silent_partial(self):
         body = self.s.split('function Get-LabIsoCandidates {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('Incomplete', body)
+    def test_iso_selection_function_exists(self):
+        self.assertIn('function Select-LabIsoPath', self.s)
+    def test_iso_selection_revalidates_before_returning(self):
+        body = self.s.split('function Select-LabIsoPath {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('OpenRead', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
