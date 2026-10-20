@@ -51,7 +51,8 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
     'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath',
     'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind', 'Test-LabSshHostName', 'Test-LabSshUserName',
-    'Test-LabVMHasKeyProtector', 'Set-LabVMBootProfile')
+    'Test-LabVMHasKeyProtector', 'Set-LabVMBootProfile', 'Get-LabVMInstallMediaPath',
+    'Set-LabVMInstallMedia', 'Remove-LabVMInstallMedia', 'Set-LabVMBootOrder')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -132,9 +133,10 @@ Test-Case 'Paused VM is not Off' {
 # Fakes for the Hyper-V cmdlets Set-LabVMBootProfile and Test-LabVMHasKeyProtector call. No real
 # Hyper-V cmdlet is invoked by these tests. Get-VMKeyProtector mirrors the real cmdlet: a VM with
 # no key protector configured returns a zero-length RawKeyProtector, never $null.
-$script:FakeFirmware = [pscustomobject]@{ SecureBootTemplate = 'MicrosoftWindows' }
+$script:FakeFirmware = [pscustomobject]@{ SecureBootTemplate = 'MicrosoftWindows'; BootOrder = @() }
 $script:FakeHasKeyProtector = $false
 $script:SetVMFirmwareCalls = [Collections.Generic.List[string]]::new()
+$script:SetVMFirmwareBootOrderCalls = [Collections.Generic.List[object]]::new()
 $script:SetVMKeyProtectorCalls = 0
 $script:EnableVMTPMCalls = 0
 function Get-VMFirmware {
@@ -144,9 +146,15 @@ function Get-VMFirmware {
 }
 function Set-VMFirmware {
     [CmdletBinding()]
-    param($VM, [string]$SecureBootTemplate, [switch]$Confirm)
-    $script:SetVMFirmwareCalls.Add($SecureBootTemplate)
-    $script:FakeFirmware.SecureBootTemplate = $SecureBootTemplate
+    param($VM, [string]$SecureBootTemplate, [object[]]$BootOrder, [switch]$Confirm)
+    if ($PSBoundParameters.ContainsKey('SecureBootTemplate')) {
+        $script:SetVMFirmwareCalls.Add($SecureBootTemplate)
+        $script:FakeFirmware.SecureBootTemplate = $SecureBootTemplate
+    }
+    if ($PSBoundParameters.ContainsKey('BootOrder')) {
+        $script:SetVMFirmwareBootOrderCalls.Add($BootOrder)
+        $script:FakeFirmware.BootOrder = $BootOrder
+    }
 }
 function Get-VMKeyProtector {
     [CmdletBinding()]
@@ -222,6 +230,153 @@ Test-Case 'Set-LabVMBootProfile applies the Ubuntu Secure Boot template without 
     Assert-Equal $script:SetVMFirmwareCalls[-1] 'MicrosoftUEFICertificateAuthority'
     Assert-Equal $script:SetVMKeyProtectorCalls 0
     Assert-Equal $script:EnableVMTPMCalls 0
+}
+
+# --- DVD media attach/eject and generic boot-order control (Task 4) ---
+# Fakes for Add-VMDvdDrive/Get-VMDvdDrive/Set-VMDvdDrive. No real Hyper-V cmdlet is invoked. Each
+# fake DVD-drive object is a mutable pscustomobject, so Set-VMDvdDrive's in-place Path update is
+# visible to a caller still holding the object Get-VMDvdDrive returned, same as on a live VM.
+# Minimal stand-ins for the real device classes Get-VMFirmware's BootOrder returns on a live Gen2
+# VM (VMDvdDrive/VMHardDiskDrive/VMNetworkAdapter); Set-LabVMBootOrder tells entries apart by
+# $_.GetType().Name, which these classes supply without needing the Hyper-V module loaded.
+class VMDvdDrive {}
+class VMHardDiskDrive {}
+class VMNetworkAdapter {}
+$script:FakeDvdDrives = [Collections.Generic.List[object]]::new()
+$script:AddVMDvdDriveCalls = 0
+$script:SetVMDvdDriveCalls = [Collections.Generic.List[object]]::new()
+function Add-VMDvdDrive {
+    [CmdletBinding()]
+    param($VM, [switch]$Confirm)
+    $script:AddVMDvdDriveCalls++
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+}
+function Get-VMDvdDrive {
+    [CmdletBinding()]
+    param($VM, [switch]$Confirm)
+    return @($script:FakeDvdDrives)
+}
+function Set-VMDvdDrive {
+    [CmdletBinding()]
+    param($VMDvdDrive, [AllowNull()][AllowEmptyString()][string]$Path, [switch]$Confirm)
+    $script:SetVMDvdDriveCalls.Add($Path)
+    $VMDvdDrive.Path = $Path
+}
+
+Test-Case 'Get-LabVMInstallMediaPath is scoped by VM GUID' {
+    $id = [guid]'55555555-5555-5555-5555-555555555555'
+    $path = Get-LabVMInstallMediaPath $id
+    Assert-Equal ($path -like "*InstallMedia*$id.json") $true
+}
+Test-Case 'Set-LabVMInstallMedia reuses a single existing DVD drive' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $tempLocal = Join-Path ([IO.Path]::GetTempPath()) ('labinstallmedia-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labiso-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($isoPath, [byte[]]@(1, 2, 3))
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $tempLocal
+        $result = Set-LabVMInstallMedia $script:FakeId $isoPath
+        Assert-Equal $script:AddVMDvdDriveCalls 0
+        Assert-Equal $result.DvdDriveAdded $false
+        Assert-Equal $result.PreviousAttachment ''
+        Assert-Equal $script:FakeDvdDrives[0].Path $isoPath
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($tempLocal)) { [IO.Directory]::Delete($tempLocal, $true) }
+        [IO.File]::Delete($isoPath)
+    }
+}
+Test-Case 'Set-LabVMInstallMedia adds a drive when none exists' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $tempLocal = Join-Path ([IO.Path]::GetTempPath()) ('labinstallmedia-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labiso-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($isoPath, [byte[]]@(1, 2, 3))
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $tempLocal
+        $result = Set-LabVMInstallMedia $script:FakeId $isoPath
+        Assert-Equal $script:AddVMDvdDriveCalls 1
+        Assert-Equal $result.DvdDriveAdded $true
+        Assert-Equal $script:FakeDvdDrives.Count 1
+        Assert-Equal $script:FakeDvdDrives[0].Path $isoPath
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($tempLocal)) { [IO.Directory]::Delete($tempLocal, $true) }
+        [IO.File]::Delete($isoPath)
+    }
+}
+Test-Case 'Set-LabVMInstallMedia throws when multiple drives exist' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labiso-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($isoPath, [byte[]]@(1, 2, 3))
+    try {
+        Assert-Throws { Set-LabVMInstallMedia $script:FakeId $isoPath } 'more than one DVD drive exists'
+        Assert-Equal $script:AddVMDvdDriveCalls 0
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+    } finally {
+        [IO.File]::Delete($isoPath)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Set-LabVMInstallMedia rejects a since-deleted ISO path' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $tempLocal = Join-Path ([IO.Path]::GetTempPath()) ('labinstallmedia-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $missingIsoPath = Join-Path ([IO.Path]::GetTempPath()) ('labiso-missing-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $tempLocal
+        Assert-Throws { Set-LabVMInstallMedia $script:FakeId $missingIsoPath } 'no longer exists'
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($tempLocal)) { [IO.Directory]::Delete($tempLocal, $true) }
+    }
+}
+Test-Case 'Remove-LabVMInstallMedia ejects without removing the drive' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'E:\ISO\old.iso' })
+    $script:SetVMDvdDriveCalls.Clear()
+    Remove-LabVMInstallMedia $script:FakeId
+    Assert-Equal $script:FakeDvdDrives.Count 1
+    # The fake's [string]$Path parameter coerces the $null argument to '' during binding, same as
+    # [string]$drive.Path elsewhere in this file; the real Set-VMDvdDrive -Path $null idiom is what
+    # the production code actually calls (see Lab-VM.ps1), this only reflects the fake's own typing.
+    Assert-Equal $script:FakeDvdDrives[0].Path ''
+    Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+    Assert-Equal $script:SetVMDvdDriveCalls[0] ''
+}
+Test-Case 'Set-LabVMBootOrder reorders without dropping entries' {
+    $script:FakeFirmware.BootOrder = @([VMNetworkAdapter]::new(), [VMHardDiskDrive]::new(), [VMDvdDrive]::new())
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    Set-LabVMBootOrder $script:FakeId 'Dvd'
+    $applied = @($script:SetVMFirmwareBootOrderCalls[-1])
+    Assert-Equal $applied.Count 3
+    Assert-Equal ($applied[0] -is [VMDvdDrive]) $true
+    Assert-Equal ($applied[1] -is [VMNetworkAdapter]) $true
+    Assert-Equal ($applied[2] -is [VMHardDiskDrive]) $true
+}
+Test-Case 'Set-LabVMBootOrder preference Disk puts the hard drive first' {
+    $script:FakeFirmware.BootOrder = @([VMDvdDrive]::new(), [VMNetworkAdapter]::new(), [VMHardDiskDrive]::new())
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    Set-LabVMBootOrder $script:FakeId 'Disk'
+    $applied = @($script:SetVMFirmwareBootOrderCalls[-1])
+    Assert-Equal $applied.Count 3
+    Assert-Equal ($applied[0] -is [VMHardDiskDrive]) $true
+    Assert-Equal ($applied[1] -is [VMDvdDrive]) $true
+    Assert-Equal ($applied[2] -is [VMNetworkAdapter]) $true
 }
 
 Test-Case 'New VM name must start with LAB-' { Assert-Equal (Test-LabNewVMName 'OTHER-Test' @()) $false }

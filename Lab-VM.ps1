@@ -1458,6 +1458,82 @@ function Set-LabVMBootProfile {
     }
 }
 
+function Get-LabVMInstallMediaPath {
+    param([guid]$VMId)
+    return Join-Path $env:LOCALAPPDATA "LabVmManager\InstallMedia\$VMId.json"
+}
+
+function Set-LabVMInstallMedia {
+    param([guid]$VMId, [string]$IsoPath)
+    $vm = Assert-LabVMOff $VMId
+    # v1 limitation (disclosed, not a stub): the issue asks for drive selection among several DVD
+    # drives, but a freshly-created VM (this plan's primary case) only ever has zero or one, so
+    # choosing among more than one is deliberately deferred rather than built now.
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    if ($drives.Count -gt 1) {
+        throw "'$($vm.Name)': more than one DVD drive exists; this version doesn't choose among them. Attach the ISO to one of them manually in Hyper-V Manager."
+    }
+    $dvdDriveAdded = $false
+    if ($drives.Count -eq 0) {
+        Add-VMDvdDrive -VM $vm -Confirm:$false -ErrorAction Stop
+        $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+        $dvdDriveAdded = $true
+    }
+    $drive = $drives[0]
+    $previousAttachment = [string]$drive.Path
+
+    # Before changing anything (the ISO attachment below), record the drive's current attachment
+    # (which may be $null/empty for a newly added drive) so a later "show previous attachment" or
+    # restore can use it.
+    $path = Get-LabVMInstallMediaPath $VMId
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+    ([ordered]@{ PreviousAttachment = $previousAttachment } | ConvertTo-Json) | Set-Content -LiteralPath $path
+
+    # Re-validate immediately before attaching: the ISO may have been deleted, moved, or truncated
+    # since it was selected. Same checks as Select-LabIsoPath's own selection-time validation.
+    if (-not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) {
+        throw "ISO '$IsoPath' no longer exists."
+    }
+    try {
+        $stream = [IO.File]::OpenRead($IsoPath)
+        try { $length = $stream.Length } finally { $stream.Close() }
+    } catch {
+        throw "ISO '$IsoPath' could not be opened for reading ($($_.Exception.Message))."
+    }
+    if ($length -le 0) { throw "ISO '$IsoPath' is empty (0 bytes)." }
+
+    Set-VMDvdDrive -VMDvdDrive $drive -Path $IsoPath -Confirm:$false -ErrorAction Stop
+    return [pscustomobject]@{ PreviousAttachment = $previousAttachment; DvdDriveAdded = $dvdDriveAdded }
+}
+
+function Remove-LabVMInstallMedia {
+    param([guid]$VMId)
+    $vm = Assert-LabVMOff $VMId
+    # Same disclosed v1 limitation as Set-LabVMInstallMedia: does not choose among several drives.
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    if ($drives.Count -gt 1) {
+        throw "'$($vm.Name)': more than one DVD drive exists; this version doesn't choose among them. Eject the ISO manually in Hyper-V Manager."
+    }
+    if ($drives.Count -eq 0) { return }
+    # $null ejects the attached media while leaving the drive itself in place.
+    Set-VMDvdDrive -VMDvdDrive $drives[0] -Path $null -Confirm:$false -ErrorAction Stop
+}
+
+function Set-LabVMBootOrder {
+    param([guid]$VMId, [ValidateSet('Dvd', 'Disk')][string]$Preference)
+    # Deliberately generic: puts the chosen device class first without deleting any other existing
+    # boot-order entry, so the Windows/Linux unattended-install plans can reuse this for "swap back to
+    # disk-first after the installer's first reboot", not just this plan's "DVD first" need.
+    $vm = Assert-LabVMOff $VMId
+    $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
+    $currentOrder = @($firmware.BootOrder)
+    $targetTypeName = if ($Preference -eq 'Dvd') { 'VMDvdDrive' } else { 'VMHardDiskDrive' }
+    $preferred = @($currentOrder | Where-Object { $_.GetType().Name -eq $targetTypeName })
+    $rest = @($currentOrder | Where-Object { $_.GetType().Name -ne $targetTypeName })
+    $newOrder = @($preferred + $rest)
+    Set-VMFirmware -VM $vm -BootOrder $newOrder -Confirm:$false -ErrorAction Stop
+}
+
 function Get-LabVMRemovalPreview {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId
