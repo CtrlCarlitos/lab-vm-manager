@@ -645,6 +645,27 @@ class SourceContract(unittest.TestCase):
         ubuntu_branch = body[idx_ubuntu:idx_windows] if idx_ubuntu < idx_windows else body[idx_ubuntu:]
         self.assertNotIn('Enable-VMTPM', ubuntu_branch)
         self.assertNotIn('Set-VMKeyProtector', ubuntu_branch)
+    def test_install_media_function_exists(self):
+        self.assertIn('function Set-LabVMInstallMedia', self.s)
+    def test_install_media_records_previous_attachment(self):
+        body = self.s.split('function Set-LabVMInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('PreviousAttachment', body)
+    def test_install_media_revalidates_iso_before_attach(self):
+        body = self.s.split('function Set-LabVMInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Length', body)
+    def test_boot_order_preserves_other_entries(self):
+        self.assertIn('function Set-LabVMBootOrder', self.s)
+        body = self.s.split('function Set-LabVMBootOrder {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('BootOrder', body)
+    def test_eject_install_media_function_exists(self):
+        self.assertIn('function Remove-LabVMInstallMedia', self.s)
+    def test_install_media_rejects_multiple_dvd_drives(self):
+        body = self.s.split('function Set-LabVMInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("doesn't choose among them", body)
+    def test_install_media_path_helper_scoped_by_vm_guid(self):
+        body = self.s.split('function Get-LabVMInstallMediaPath {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('InstallMedia', body)
+        self.assertIn('$VMId', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
