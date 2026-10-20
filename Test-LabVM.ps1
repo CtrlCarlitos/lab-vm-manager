@@ -375,9 +375,11 @@ $script:AddVMDvdDriveCalls = 0
 $script:SetVMDvdDriveCalls = [Collections.Generic.List[object]]::new()
 function Add-VMDvdDrive {
     [CmdletBinding()]
-    param($VM, [switch]$Confirm)
+    param($VM, [switch]$Confirm, [switch]$Passthru)
     $script:AddVMDvdDriveCalls++
-    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $drive = [pscustomobject]@{ Path = $null }
+    $script:FakeDvdDrives.Add($drive)
+    if ($Passthru) { return $drive }
 }
 function Get-VMDvdDrive {
     [CmdletBinding()]
