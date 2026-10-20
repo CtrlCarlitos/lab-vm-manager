@@ -2235,6 +2235,36 @@ function New-LabWindowsAnswerFileXml {
     }
 }
 
+function Wait-LabPSDirectSession {
+    # Polls the already-shipped New-LabPSDirectSession (not a raw New-PSSession call) on each
+    # attempt: if the VM's state changes mid-wait (e.g. it stops unexpectedly), Assert-LabVMRunning
+    # inside that call surfaces a clear "not Running" error instead of a confusing raw connection
+    # failure. The caller owns the returned session and is responsible for Remove-PSSession.
+    param([guid]$VMId, [PSCredential]$Credential, [int]$TimeoutSeconds)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            return New-LabPSDirectSession $VMId $Credential
+        } catch {
+            Write-Host "Waiting for PowerShell Direct to come up ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $($_.Exception.Message)"
+            Start-Sleep -Seconds 10
+        }
+    }
+    throw "Timed out after $([int]$watch.Elapsed.TotalSeconds) seconds waiting for a PowerShell Direct session to open. The guest may still be booting or applying the unattend answer file; retry once it has settled."
+}
+
+function Write-LabProvisioningNote {
+    # Delivers $Content to a fixed file name on the connected account's own Desktop. The path is
+    # resolved INSIDE the session (via Invoke-Command) so [Environment]::GetFolderPath('Desktop')
+    # answers for the guest account, not for whatever account is running this script on the host.
+    param([System.Management.Automation.Runspaces.PSSession]$Session, [string]$Content)
+    Invoke-Command -Session $Session -ScriptBlock {
+        param($Text)
+        $path = Join-Path ([Environment]::GetFolderPath('Desktop')) 'lab-vm-manager-provisioning-note.txt'
+        Set-Content -LiteralPath $path -Value $Text -Encoding UTF8
+    } -ArgumentList $Content
+}
+
 function Format-LabBootEntry {
     param($Entry)
     $kind = Get-LabBootEntryKind $Entry
