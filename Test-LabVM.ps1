@@ -2761,6 +2761,6 @@ Test-HyperVDriftCase 'Drift guard: every Hyper-V cmdlet call in Lab-VM.ps1 uses 
     if ($checked -lt 20) { throw "Expected to check many Hyper-V calls in Lab-VM.ps1; checked $checked." }
 }
 
-Write-Host "`nHelper tests:$script:Passed passed; $script:Failed failed."
+Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
 if ($script:Failed -gt 0) { exit 1 }
