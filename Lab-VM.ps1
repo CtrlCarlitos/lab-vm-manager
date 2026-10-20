@@ -1884,35 +1884,64 @@ function ConvertFrom-LabSftpListing {
     param(
         [AllowNull()][AllowEmptyCollection()][string[]]$Output,
         [int]$ExitCode,
-        [string]$Path
+        [string]$Path,
+        [switch]$ParentListing
     )
     # Parses captured sftp batch output (KeyAgent mode only; password mode captures none) for the
     # long-listing line naming $Path. Returns the same shape as the engine's other probes: the leading
     # mode character ('-' file, 'd' directory, 'l' symlink, anything else a special file) and the size.
     # The name is matched exactly, either as the bare leaf name (a server's own long name, used when
     # listing a directory) or as the full path (the client's reformatted line) -- both forms occur.
+    # ListingNotFound is $true only when the listed path itself was reported missing.
+    #
+    # -ParentListing: $Output is an `ls -la` of $Path's parent directory, and "no line names $Path"
+    # becomes "absent" only when the listing is positively recognized -- its own '.' entry parsed, and
+    # no unparsed line ends in $Path's name. Otherwise it is an error, never "absent": an existing
+    # destination misread as absent would let the final rename replace it under Error or Skip.
     $lines = @($Output | Where-Object { $_ } | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -notmatch '^sftp>' })
     if ($ExitCode -ne 0) {
         if (@($lines | Where-Object { $_ -match 'not found|No such file' }).Count -gt 0) {
-            return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null }
+            return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null; ListingNotFound = $true }
         }
-        return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1
+        return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; ListingNotFound = $false
             Error = "the guest-side listing failed (sftp exit $ExitCode): $(@($lines | Select-Object -Last 3) -join ' ')" }
     }
     $leaf = $Path.Substring($Path.LastIndexOf('/') + 1)
+    $parent = $Path.Substring(0, [Math]::Max($Path.LastIndexOf('/'), 0))
+    if ($parent -eq '') { $parent = '/' }
     $pattern = '^(?<mode>\S)\S*\s+\d+\s+\S+\s+\S+\s+(?<size>\d+)\s+\S+\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4})\s(?<name>.+)$'
+    $selfParsed = $false
+    $parentNotDirectory = $false
+    $unparsedNamesTarget = $false
     foreach ($line in $lines) {
         $match = [regex]::Match($line, $pattern)
-        if (-not $match.Success) { continue }
+        if (-not $match.Success) {
+            # Something is listed under the target's name in a shape the pattern does not know (a device
+            # node's "major, minor" size field, an unexpected date format, ...).
+            $trimmed = $line.TrimEnd()
+            foreach ($suffix in @(" $leaf", "/$leaf")) {
+                if ($trimmed.EndsWith($suffix, [StringComparison]::Ordinal) -or $trimmed.Contains("$suffix -> ")) { $unparsedNamesTarget = $true }
+            }
+            continue
+        }
         $name = $match.Groups['name'].Value
         $mode = $match.Groups['mode'].Value
         # Some servers append " -> target" to a symlink's long name.
         if ($mode -eq 'l' -and $name.Contains(' -> ')) { $name = $name.Substring(0, $name.IndexOf(' -> ')) }
+        if ($name -ceq '.' -and $mode -eq 'd') { $selfParsed = $true }
+        # Listing a non-directory prints that item's own line, under its full path.
+        if ($ParentListing -and $name -ceq $parent -and $mode -ne 'd') { $parentNotDirectory = $true }
         if ($name -ceq $leaf -or $name -ceq $Path) {
-            return [pscustomobject]@{ Exists = $true; Mode = $mode; Size = [long]$match.Groups['size'].Value; Error = $null }
+            return [pscustomobject]@{ Exists = $true; Mode = $mode; Size = [long]$match.Groups['size'].Value; Error = $null; ListingNotFound = $false }
         }
     }
-    return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null }
+    $problem = $null
+    if ($ParentListing) {
+        if ($parentNotDirectory) { $problem = "the guest-side parent '$parent' exists but is not a directory" }
+        elseif ($unparsedNamesTarget) { $problem = "the guest-side listing of '$parent' has an entry named '$leaf' in a format that was not recognized; refusing to treat it as absent" }
+        elseif (-not $selfParsed) { $problem = "the guest-side listing format of '$parent' was not recognized (its '.' entry did not parse); refusing to treat '$leaf' as absent" }
+    }
+    return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $problem; ListingNotFound = $false }
 }
 
 function Copy-LabTransferItemSftp {
@@ -1933,7 +1962,9 @@ function Copy-LabTransferItemSftp {
     # Every connection is a separate ssh.exe/sftp.exe process (no connection reuse; see README), so in
     # InteractivePassword mode each one below asks for the password: a single-file upload needs up to
     # four (upfront check, upload, size/hash check, finalize), a single-file download three (upfront
-    # check, download, size/hash check), a directory two, plus one for cleanup after a failed upload.
+    # check, download, size/hash check), a directory two, plus one for cleanup after a failed upload and
+    # one more to remove guest-side parent directories the failed upload created. Creating missing
+    # parents costs none: the walk rides in the upfront check and the mkdir lines in the payload batch.
     # That is the cost of checking the copy strictly before it is moved into place.
     if ($AuthMode -notin @('KeyAgent', 'InteractivePassword')) { throw "Unknown SSH auth mode '$AuthMode'." }
     $state = @{ Completed = 0; Skipped = 0; Failed = 0; BytesTransferred = [long]0
@@ -2030,27 +2061,90 @@ function Copy-LabTransferItemSftp {
         } catch { $info.Error = $_.Exception.Message }
         return [pscustomobject]$info
     }
-    $probeRemote = {
+    $remoteParentOf = {
         param([string]$Path)
+        $i = $Path.LastIndexOf('/')
+        if ($i -le 0) { return '/' }
+        return $Path.Substring(0, $i)
+    }
+    # -WithAncestors (the upload destination): when the path does not exist, MissingParents also lists
+    # the contiguous run of missing directories directly above it, deepest first -- never one that
+    # exists -- and a nearest existing ancestor that is not a directory is an error.
+    $probeRemote = {
+        param([string]$Path, [bool]$WithAncestors = $false)
+        $missingParents = [Collections.Generic.List[string]]::new()
+        $ancestors = [Collections.Generic.List[string]]::new()
+        for ($a = & $remoteParentOf $Path; $a -ne '/'; $a = & $remoteParentOf $a) { $ancestors.Add($a) }
         if ($passwordMode) {
             # Password mode captures no output (the console is the operator's), so the guest's shell
-            # answers through its exit code, which $LASTEXITCODE reports either way.
+            # answers through its exit code, which $LASTEXITCODE reports either way. The ancestor walk
+            # rides in the same call, so it costs no extra password prompt: 10 = missing with its
+            # parent present, 30+N = missing with N missing parents, 15 = the nearest existing
+            # ancestor is not a directory.
             $p = & $shellQuote $Path
-            $result = & $runSsh "if [ -L $p ]; then exit 13; elif [ -d $p ]; then exit 12; elif [ -f $p ]; then exit 11; elif [ -e $p ]; then exit 14; else exit 10; fi"
-            $modes = @{ 11 = '-'; 12 = 'd'; 13 = 'l'; 14 = '?' }
-            if ($result.ExitCode -eq 10) { return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null } }
-            if ($modes.ContainsKey($result.ExitCode)) {
-                return [pscustomobject]@{ Exists = $true; Mode = $modes[$result.ExitCode]; Size = [long]-1; Error = $null }
+            $command = "if [ -L $p ]; then exit 13; elif [ -d $p ]; then exit 12; elif [ -f $p ]; then exit 11; elif [ -e $p ]; then exit 14; "
+            if (-not $WithAncestors) { $command += 'else exit 10; fi' }
+            else {
+                if ($ancestors.Count -gt 200) {
+                    return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; MissingParents = [string[]]@()
+                        Error = 'the guest-side path is too deeply nested (more than 200 parent directories).' }
+                }
+                $command += 'fi'
+                for ($i = 0; $i -lt $ancestors.Count; $i++) {
+                    $q = & $shellQuote $ancestors[$i]
+                    $code = if ($i -eq 0) { 10 } else { 30 + $i }
+                    $command += "; if [ -d $q ]; then exit $code; elif [ -e $q ] || [ -L $q ]; then exit 15; fi"
+                }
+                $command += "; exit $(if ($ancestors.Count -eq 0) { 10 } else { 30 + $ancestors.Count })"
             }
-            return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1
-                Error = "the guest-side check failed (ssh exit $($result.ExitCode)); password mode needs a POSIX-compatible login shell on the guest." }
+            $result = & $runSsh $command
+            $modes = @{ 11 = '-'; 12 = 'd'; 13 = 'l'; 14 = '?' }
+            $code = $result.ExitCode
+            if ($code -eq 10) { return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null; MissingParents = [string[]]@() } }
+            if ($modes.ContainsKey($code)) {
+                return [pscustomobject]@{ Exists = $true; Mode = $modes[$code]; Size = [long]-1; Error = $null; MissingParents = [string[]]@() }
+            }
+            if ($WithAncestors -and $code -eq 15) {
+                return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; MissingParents = [string[]]@()
+                    Error = 'a guest-side parent directory exists but is not a directory.' }
+            }
+            if ($WithAncestors -and $code -gt 30 -and $code -le 30 + $ancestors.Count) {
+                return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null
+                    MissingParents = [string[]]@($ancestors | Select-Object -First ($code - 30)) }
+            }
+            return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; MissingParents = [string[]]@()
+                Error = "the guest-side check failed (ssh exit $code); password mode needs a POSIX-compatible login shell on the guest." }
         }
         # The parent is listed, not the path itself: sftp's ls of a symlink to a directory silently
         # lists the target's contents, so only the parent's listing shows the entry's own mode.
-        $parent = $Path.Substring(0, $Path.LastIndexOf('/'))
-        if ($parent -eq '') { $parent = '/' }
-        $result = & $runBatch @('ls -la ' + (& $quote $parent))
-        return ConvertFrom-LabSftpListing $result.Output $result.ExitCode $Path
+        $listParentOf = {
+            param([string]$Item)
+            $listing = & $runBatch @('ls -la ' + (& $quote (& $remoteParentOf $Item)))
+            return ConvertFrom-LabSftpListing $listing.Output $listing.ExitCode $Item -ParentListing
+        }
+        $info = & $listParentOf $Path
+        if ($WithAncestors -and -not $info.Error -and -not $info.Exists -and $info.ListingNotFound) {
+            # The parent itself is missing: walk upward one listing (one connection) per missing level
+            # until a listing succeeds, so the run of missing directories is known before any write.
+            foreach ($ancestor in $ancestors) {
+                $up = & $listParentOf $ancestor
+                if ($up.Error) { return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $up.Error; MissingParents = [string[]]@() } }
+                if ($up.Exists) {
+                    # Its own listing said "not found", yet its parent lists it: a broken link or another
+                    # non-directory, which no file can be created under.
+                    return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; MissingParents = [string[]]@()
+                        Error = "the guest-side parent '$ancestor' exists but is not a directory." }
+                }
+                $missingParents.Add($ancestor)
+                if (-not $up.ListingNotFound) { break }
+            }
+            if ($missingParents.Count -eq 0 -or ($missingParents.Count -eq $ancestors.Count -and $up.ListingNotFound)) {
+                return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; MissingParents = [string[]]@()
+                    Error = 'the guest-side listing could not find any existing parent directory.' }
+            }
+        }
+        return [pscustomobject]@{ Exists = $info.Exists; Mode = $info.Mode; Size = $info.Size; Error = $info.Error
+            MissingParents = [string[]]$missingParents.ToArray() }
     }
     # Guest-side size/hash check, answered by exit code: 0 match, 20 size, 21 no sha256sum, 22 hash.
     # A negative $Size skips the size test; an empty $Hash skips the hash test.
@@ -2140,8 +2234,22 @@ function Copy-LabTransferItemSftp {
             return & $summary
         }
     }
-    $destination = if ($toVM) { & $probeRemote $remotePath } else { & $probeLocal $localPath }
+    $destination = if ($toVM) { & $probeRemote $remotePath $true } else { & $probeLocal $localPath }
     if ($destination.Error) { & $fail "${destinationLabel}: destination could not be inspected: $($destination.Error)"; return & $summary }
+    # Like the Windows engine, missing parent directories above the destination are created -- only the
+    # contiguous run directly above it, never one that exists -- and removed again if nothing completes.
+    # Deepest first.
+    $missingParents = @()
+    if ($toVM) { $missingParents = @($destination.MissingParents) }
+    elseif (-not $destination.Exists) {
+        try {
+            for ($dir = [IO.Path]::GetDirectoryName($localPath); $dir -and $dir -notmatch '^[A-Za-z]:[\\/]?$'; $dir = [IO.Path]::GetDirectoryName($dir)) {
+                if ([IO.Directory]::Exists($dir)) { break }
+                if ([IO.File]::Exists($dir)) { & $fail "${destinationLabel}: the host-side parent '$dir' exists but is not a directory."; return & $summary }
+                $missingParents += $dir
+            }
+        } catch { & $fail "${destinationLabel}: destination could not be inspected: $($_.Exception.Message)"; return & $summary }
+    }
     if ($destination.Mode -eq 'l') {
         & $fail "${destinationLabel}: destination is a symbolic link, junction or other reparse point; refusing to write through it."
         return & $summary
@@ -2171,9 +2279,44 @@ function Copy-LabTransferItemSftp {
     }
     if ($DryRun) {
         $verb = if ($action -eq 'Overwrite') { 'overwrite' } elseif ($Recurse) { 'copy directory' } else { 'copy' }
-        Write-Host "Dry run: would $verb $sourceLabel -> $destinationLabel"
+        $parentsNote = if ($missingParents.Count -eq 1) { ' (creating 1 missing parent directory)' }
+            elseif ($missingParents.Count -gt 1) { " (creating $($missingParents.Count) missing parent directories)" } else { '' }
+        Write-Host "Dry run: would $verb $sourceLabel -> $destinationLabel$parentsNote"
         $state.Completed++
         return & $summary
+    }
+    # Guest side: mkdir lines (top-down) lead the payload batch itself, so creating them costs no extra
+    # connection; a failing mkdir stops the batch before anything is copied. Cleanup is one best-effort
+    # rmdir batch (bottom-up, each line '-'-prefixed so one failure does not stop the rest): sftp's rmdir
+    # removes only empty directories, and only the ones found missing upfront are named.
+    $remoteMkdirLines = @()
+    if ($toVM) { for ($i = $missingParents.Count - 1; $i -ge 0; $i--) { $remoteMkdirLines += 'mkdir ' + (& $quote $missingParents[$i]) } }
+    $removeCreatedRemoteParents = {
+        if (-not $toVM -or $missingParents.Count -eq 0) { return }
+        try {
+            $result = & $runBatch @($missingParents | ForEach-Object { '-rmdir ' + (& $quote $_) })
+            if ($result.ExitCode -ne 0) { Write-Warning "Could not remove every parent directory created on the guest above '$remotePath' (sftp exit $($result.ExitCode))." }
+        } catch { Write-Warning "Could not remove the parent directories created on the guest above '$remotePath': $($_.Exception.Message)" }
+    }
+    # Host side: created one at a time, top-down, recording only those this call actually created.
+    $createdLocalParents = [Collections.Generic.List[string]]::new()
+    $createLocalParents = {
+        for ($i = $missingParents.Count - 1; $i -ge 0; $i--) {
+            if (-not [IO.Directory]::Exists($missingParents[$i])) {
+                [void][IO.Directory]::CreateDirectory($missingParents[$i])
+                $createdLocalParents.Add($missingParents[$i])
+            }
+        }
+    }
+    $removeCreatedLocalParents = {
+        for ($i = $createdLocalParents.Count - 1; $i -ge 0; $i--) {
+            $dir = $createdLocalParents[$i]
+            try {
+                # Only while empty: a non-recursive delete fails on anything left inside.
+                if ([IO.Directory]::Exists($dir) -and @([IO.Directory]::GetFileSystemEntries($dir)).Count -eq 0) { [IO.Directory]::Delete($dir, $false) }
+                else { break }
+            } catch { Write-Warning "Could not remove the directory '$dir' created for this transfer: $($_.Exception.Message)"; break }
+        }
     }
 
     # --- Payload. A recursive transfer counts as one item: the tree lands all at once or not at all. ---
@@ -2184,20 +2327,24 @@ function Copy-LabTransferItemSftp {
     if ($toVM -and $Recurse) {
         # One session: rename runs only if put -r succeeded (a failing batch command stops the batch),
         # and it is a single atomic POSIX rename of the whole tree.
-        $tree = & $runBatch @(('put -r ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp)),
-            ('rename ' + (& $quote $remoteTemp) + ' ' + (& $quote $remotePath)))
+        $tree = & $runBatch @($remoteMkdirLines + @(('put -r ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp)),
+            ('rename ' + (& $quote $remoteTemp) + ' ' + (& $quote $remotePath))))
         if ($tree.ExitCode -eq 0) {
             $state.Completed++
             # Measured from the host-side tree that was uploaded, not parsed from sftp's progress output.
             $state.BytesTransferred += $sourceTree.Bytes
         } else {
-            # sftp has no recursive delete, so a partial temporary tree is reported, not removed.
+            # sftp has no recursive delete, so a partial temporary tree is reported, not removed (and any
+            # parent directory holding it stays, since rmdir only removes an empty one).
             & $fail "${destinationLabel}: recursive upload failed (sftp exit $($tree.ExitCode): $(& $tail $tree)); the destination was not created. A partial temporary tree may remain at '$remoteTemp' on the guest and must be removed by hand."
+            & $removeCreatedRemoteParents
         }
         return & $summary
     }
     if (-not $toVM -and $Recurse) {
         try {
+            try { & $createLocalParents }
+            catch { & $fail "${destinationLabel}: the missing destination parent directory could not be created: $($_.Exception.Message)"; return & $summary }
             $tree = & $runBatch @('get -r ' + (& $quote $remotePath) + ' ' + (& $quote $localTemp.Replace('\', '/')))
             if ($tree.ExitCode -ne 0) {
                 & $fail "${destinationLabel}: recursive download failed (sftp exit $($tree.ExitCode): $(& $tail $tree)); nothing was written to the destination."
@@ -2218,6 +2365,7 @@ function Copy-LabTransferItemSftp {
             } catch { & $fail "${destinationLabel}: could not be finalized: $($_.Exception.Message)" }
         } finally {
             & $removeLocal $localTemp
+            if ($state.Completed -eq 0) { & $removeCreatedLocalParents }
         }
         return & $summary
     }
@@ -2231,12 +2379,13 @@ function Copy-LabTransferItemSftp {
             $expectedHash = & $localHash $localPath
             if (-not $expectedHash) { & $fail "${sourceLabel}: the source could not be hashed for -VerifyHash; nothing was transferred."; return & $summary }
         }
-        $batchA = @('put ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp))
+        $batchA = @($remoteMkdirLines) + @('put ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp))
         if (-not $passwordMode) { $batchA += 'ls -la ' + (& $quote $remoteTemp) }
         $upload = & $runBatch $batchA
         if ($upload.ExitCode -ne 0) {
             & $fail "${destinationLabel}: upload failed (sftp exit $($upload.ExitCode): $(& $tail $upload))."
             & $removeRemoteTemp
+            & $removeCreatedRemoteParents
             return & $summary
         }
         $problem = $null
@@ -2251,6 +2400,7 @@ function Copy-LabTransferItemSftp {
         if ($problem) {
             & $fail "${destinationLabel}: $problem"
             & $removeRemoteTemp
+            & $removeCreatedRemoteParents
             return & $summary
         }
         # The explicit rm keeps Overwrite portable: a server with the posix-rename@openssh.com extension
@@ -2270,12 +2420,15 @@ function Copy-LabTransferItemSftp {
         } else {
             & $fail "${destinationLabel}: could not be finalized (sftp exit $($finalize.ExitCode): $(& $tail $finalize))."
             & $removeRemoteTemp
+            & $removeCreatedRemoteParents
         }
         return & $summary
     }
     # Download: the copy lands beside the host-side destination and is checked before the host-side move.
     $retainTemp = $false
     try {
+        try { & $createLocalParents }
+        catch { & $fail "${destinationLabel}: the missing destination parent directory could not be created: $($_.Exception.Message)"; return & $summary }
         $download = & $runBatch @('get ' + (& $quote $remotePath) + ' ' + (& $quote $localTemp.Replace('\', '/')))
         if ($download.ExitCode -ne 0) {
             & $fail "${destinationLabel}: download failed (sftp exit $($download.ExitCode): $(& $tail $download))."
@@ -2317,6 +2470,8 @@ function Copy-LabTransferItemSftp {
         }
     } finally {
         if (-not $retainTemp) { & $removeLocal $localTemp }
+        # A failed copy does not leave behind the empty parent directories it created itself.
+        if ($state.Completed -eq 0) { & $removeCreatedLocalParents }
     }
     return & $summary
 }

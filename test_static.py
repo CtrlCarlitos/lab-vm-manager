@@ -396,6 +396,23 @@ class SourceContract(unittest.TestCase):
         self.assertNotIn('sftp.exe', body)
         self.assertIn('Invoke-LabSftpCommand ', body)
         self.assertIn('Invoke-LabSshCommand ', body)
+    def test_sftp_listing_parent_mode_fails_closed(self):
+        # Review M2: in parent-listing mode an unrecognized listing is an error, never "absent" --
+        # the parent's own '.' entry must parse -- and the engine's probe uses that mode.
+        listing = self.s.split('function ConvertFrom-LabSftpListing {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('[switch]$ParentListing', listing)
+        self.assertIn("$name -ceq '.'", listing)
+        engine = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('-ParentListing', engine)
+    def test_sftp_engine_creates_missing_parents_before_payload(self):
+        # Review M1: like the Windows engine, missing destination parents are created (guest: mkdir
+        # lines in the payload batch; host: CreateDirectory) and only those are removed on failure.
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        body = '\n'.join(l for l in body.splitlines() if not l.lstrip().startswith('#'))
+        self.assertIn("'mkdir '", body)
+        self.assertIn("'-rmdir '", body)
+        self.assertIn('[IO.Directory]::CreateDirectory(', body)
+        self.assertLess(body.index("'mkdir '"), body.index("'put "))
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

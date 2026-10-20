@@ -469,6 +469,8 @@ function Copy-FakeTree {
 }
 function Get-FakeLsLine {
     param([string]$Mode, [long]$Size, [string]$Name)
+    # IsoListing: a server whose long names use a date shape the engine's pattern does not know.
+    if ($script:SftpFault -eq 'IsoListing') { return ('{0}rw-r--r-- 1 labuser labuser {1} 2026-10-19 12:00 {2}' -f $Mode, $Size, $Name) }
     return ('{0}rw-r--r--    1 labuser  labuser  {1,8} Oct 19 12:00 {2}' -f $Mode, $Size, $Name)
 }
 function Invoke-LabSftpCommand {
@@ -488,7 +490,7 @@ function Invoke-LabSftpCommand {
     $exit = 0
     foreach ($line in $lines) {
         $out.Add("sftp> $line")
-        $m = [regex]::Match($line, '^(?<cmd>\w+)(?<r> -r)?(?: -la)? "(?<a>[^"]*)"(?: "(?<b>[^"]*)")?$')
+        $m = [regex]::Match($line, '^(?<ign>-)?(?<cmd>\w+)(?<r> -r)?(?: -la)? "(?<a>[^"]*)"(?: "(?<b>[^"]*)")?$')
         if (-not $m.Success) { throw "fake sftp: unparsed batch line [$line]" }
         $a = $m.Groups['a'].Value
         $b = $m.Groups['b'].Value
@@ -499,6 +501,9 @@ function Invoke-LabSftpCommand {
                 'ls' {
                     $p = ConvertTo-FakeGuestPath $a
                     if ([IO.Directory]::Exists($p)) {
+                        # A real ls -la of a directory always lists its own '.' and '..' entries.
+                        $out.Add((Get-FakeLsLine 'd' 4096 '.'))
+                        $out.Add((Get-FakeLsLine 'd' 4096 '..'))
                         foreach ($entry in ([IO.DirectoryInfo]::new($p)).GetFileSystemInfos()) {
                             $full = ($a.TrimEnd('/') + '/' + $entry.Name)
                             $mode = if ($script:FakeLinks.ContainsKey($full)) { 'l' } elseif ($entry -is [IO.DirectoryInfo]) { 'd' } else { '-' }
@@ -528,6 +533,18 @@ function Invoke-LabSftpCommand {
                     }
                 }
                 'rm' { $p = ConvertTo-FakeGuestPath $a; if (-not [IO.File]::Exists($p)) { throw "Couldn't delete file: No such file or directory" }; [IO.File]::Delete($p) }
+                'mkdir' {
+                    $p = ConvertTo-FakeGuestPath $a
+                    if ([IO.Directory]::Exists($p) -or [IO.File]::Exists($p)) { throw "Couldn't create directory: Failure" }
+                    if (-not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($p))) { throw "Couldn't create directory: No such file or directory" }
+                    [void][IO.Directory]::CreateDirectory($p)
+                }
+                'rmdir' {
+                    $p = ConvertTo-FakeGuestPath $a
+                    if (-not [IO.Directory]::Exists($p)) { throw "Couldn't remove directory: No such file or directory" }
+                    if (@([IO.Directory]::GetFileSystemEntries($p)).Count -gt 0) { throw "Couldn't remove directory: Failure" }
+                    [IO.Directory]::Delete($p, $false)
+                }
                 'rename' {
                     if ($script:SftpFault -eq 'FailRename') { throw "Couldn't rename file: Permission denied" }
                     $from = ConvertTo-FakeGuestPath $a
@@ -537,8 +554,8 @@ function Invoke-LabSftpCommand {
                 default { throw "fake sftp: unsupported command [$line]" }
             }
         } catch { $out.Add($_.Exception.Message); $ok = $false }
-        # A failing batch command stops the batch, as in real sftp -b.
-        if (-not $ok) { $exit = 1; break }
+        # A failing batch command stops the batch, as in real sftp -b, unless it is '-'-prefixed.
+        if (-not $ok -and -not $m.Groups['ign'].Success) { $exit = 1; break }
     }
     return [pscustomobject]@{ ExitCode = $exit; Output = [string[]]$out.ToArray() }
 }
@@ -551,6 +568,16 @@ function Invoke-LabSshCommand {
         $guestPath = $probe.Groups['p'].Value
         $p = ConvertTo-FakeGuestPath $guestPath
         $code = if ($script:FakeLinks.ContainsKey($guestPath)) { 13 } elseif ([IO.Directory]::Exists($p)) { 12 } elseif ([IO.File]::Exists($p)) { 11 } else { 10 }
+        if ($code -eq 10 -and $RemoteCommand -notmatch 'else exit 10; fi$') {
+            # The upload-destination form: the ancestor clauses run in order, then the trailing exit.
+            foreach ($clause in [regex]::Matches($RemoteCommand, "; if \[ -d '(?<a>[^']*)' \]; then exit (?<c>\d+); elif \[ -e '[^']*' \] \|\| \[ -L '[^']*' \]; then exit 15; fi")) {
+                $ancestor = ConvertTo-FakeGuestPath $clause.Groups['a'].Value
+                if ($script:FakeLinks.ContainsKey($clause.Groups['a'].Value)) { return [pscustomobject]@{ ExitCode = 15; Output = [string[]]@() } }
+                if ([IO.Directory]::Exists($ancestor)) { return [pscustomobject]@{ ExitCode = [int]$clause.Groups['c'].Value; Output = [string[]]@() } }
+                if ([IO.File]::Exists($ancestor)) { return [pscustomobject]@{ ExitCode = 15; Output = [string[]]@() } }
+            }
+            $code = [int][regex]::Match($RemoteCommand, '; exit (?<n>\d+)$').Groups['n'].Value
+        }
         return [pscustomobject]@{ ExitCode = $code; Output = [string[]]@() }
     }
     $size = [regex]::Match($RemoteCommand, "stat -c %s '(?<p>[^']*)' 2>/dev/null\) -eq (?<n>\d+) \]")
@@ -580,7 +607,7 @@ function Invoke-LabSftpXfer {
     finally { $script:SftpFault = $null; $script:DropAtCall = 0 }
 }
 function Get-SftpBatchText { return (@($script:SftpBatches | ForEach-Object { $_ -join "`n" }) -join "`n---`n") }
-function Get-SftpPayloadLineCount { return @($script:SftpBatches | ForEach-Object { $_ } | Where-Object { $_ -match '^(put|get|rename|rm) ' }).Count }
+function Get-SftpPayloadLineCount { return @($script:SftpBatches | ForEach-Object { $_ } | Where-Object { $_ -match '^-?(put|get|rename|rm|mkdir|rmdir) ' }).Count }
 function Get-FakeTempCount { return @(Get-ChildItem -LiteralPath $script:SftpBase -Recurse -Force | Where-Object { $_.Name -like '*.labxfer-*' }).Count }
 function Reset-FakeGuest {
     foreach ($dir in @($script:GuestRoot, $script:HostRoot)) {
@@ -619,6 +646,41 @@ Test-Case 'SFTP listing: not found is a missing item; any other failure is an er
     Assert-Equal $missing.Exists $false; Assert-Equal $missing.Error $null
     $denied = ConvertFrom-LabSftpListing @("Couldn't read directory: Permission denied") 1 '/root/x'
     if (-not $denied.Error) { throw 'A permission failure was not reported as an error.' }
+    Assert-Equal (ConvertFrom-LabSftpListing @("Can't ls: `"/nope`" not found") 1 '/nope/x' -ParentListing).ListingNotFound $true
+}
+Test-Case 'SFTP listing (parent): a recognized listing reports absent, or the entry it finds' {
+    $lines = @((Get-FakeLsLine 'd' 4096 '.'), (Get-FakeLsLine 'd' 4096 '..'), (Get-FakeLsLine '-' 9 'other.txt'))
+    $absent = ConvertFrom-LabSftpListing $lines 0 '/home/dev/a.txt' -ParentListing
+    Assert-Equal $absent.Exists $false; Assert-Equal $absent.Error $null; Assert-Equal $absent.ListingNotFound $false
+    $present = ConvertFrom-LabSftpListing ($lines + @((Get-FakeLsLine '-' 5 'a.txt'))) 0 '/home/dev/a.txt' -ParentListing
+    Assert-Equal $present.Exists $true; Assert-Equal $present.Mode '-'; Assert-Equal $present.Size ([long]5)
+}
+Test-Case 'SFTP listing (parent): a missing or corrupted "." entry is an error, never absent' {
+    $noSelf = ConvertFrom-LabSftpListing @((Get-FakeLsLine 'd' 4096 '..'), (Get-FakeLsLine '-' 9 'other.txt')) 0 '/home/dev/a.txt' -ParentListing
+    Assert-Equal $noSelf.Exists $false
+    if (-not $noSelf.Error) { throw 'A listing without a "." entry was reported as absent.' }
+    # An unexpected date shape (ISO) makes every line, "." included, unparseable.
+    $iso = @('drwxr-xr-x 2 dev dev 4096 2026-10-19 12:00 .', 'drwxr-xr-x 3 dev dev 4096 2026-10-19 12:00 ..')
+    if (-not (ConvertFrom-LabSftpListing $iso 0 '/home/dev/a.txt' -ParentListing).Error) { throw 'An unrecognized listing format was reported as absent.' }
+    if (-not (ConvertFrom-LabSftpListing @() 0 '/home/dev/a.txt' -ParentListing).Error) { throw 'An empty listing was reported as absent.' }
+}
+Test-Case 'SFTP listing (parent): an unparseable line ending in the target name is an error, never absent' {
+    $self = @((Get-FakeLsLine 'd' 4096 '.'), (Get-FakeLsLine 'd' 4096 '..'))
+    # A device node's "major, minor" size field does not match the size pattern.
+    $device = ConvertFrom-LabSftpListing ($self + @('crw-rw-rw-    1 root  root    1,   3 Oct 19 12:00 a.txt')) 0 '/home/dev/a.txt' -ParentListing
+    Assert-Equal $device.Exists $false
+    if (-not $device.Error) { throw 'An unparseable entry named like the target was reported as absent.' }
+    $isoLine = ConvertFrom-LabSftpListing ($self + @('-rw-r--r-- 1 dev dev 5 2026-10-19 12:00 a.txt')) 0 '/home/dev/a.txt' -ParentListing
+    if (-not $isoLine.Error) { throw 'An unparseable entry named like the target was reported as absent.' }
+    $link = ConvertFrom-LabSftpListing ($self + @('lrwxrwxrwx 1 dev dev 5 2026-10-19 12:00 a.txt -> /etc/x')) 0 '/home/dev/a.txt' -ParentListing
+    if (-not $link.Error) { throw 'An unparseable link named like the target was reported as absent.' }
+    # An unparseable line for a different name does not block an absent result.
+    $other = ConvertFrom-LabSftpListing ($self + @('crw-rw-rw-    1 root  root    1,   3 Oct 19 12:00 null')) 0 '/home/dev/a.txt' -ParentListing
+    Assert-Equal $other.Exists $false; Assert-Equal $other.Error $null
+}
+Test-Case 'SFTP listing (parent): a parent that is a regular file is an error' {
+    $r = ConvertFrom-LabSftpListing @((Get-FakeLsLine '-' 10 '/home/dev/g.txt')) 0 '/home/dev/g.txt/a.txt' -ParentListing
+    if (-not ($r.Error -match 'not a directory')) { throw "Unexpected result: $($r.Error)" }
 }
 try {
     Test-Case 'SFTP: an unknown auth mode throws before anything else' {
@@ -771,6 +833,113 @@ try {
             Assert-Equal (Get-Content -LiteralPath (Join-Path $target '.profile') -Raw) 'p'
             Assert-Equal (Get-FakeTempCount) 0
         }
+        Test-Case "SFTP ($mode): an upload creates a missing parent and grandparent, inside the payload batch" {
+            Reset-FakeGuest
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/n1/n2/a.txt' -AuthMode $mode
+            Assert-Equal $r.Completed 1; Assert-Equal $r.Failed 0
+            Assert-Equal (Get-Content -LiteralPath (ConvertTo-FakeGuestPath '/home/dev/n1/n2/a.txt') -Raw) 'alpha'
+            $put = @($script:SftpBatches | Where-Object { ($_ -join "`n") -match '(?m)^put ' })
+            Assert-Equal $put.Count 1
+            Assert-Equal $put[0][0] 'mkdir "/home/dev/n1"'
+            Assert-Equal $put[0][1] 'mkdir "/home/dev/n1/n2"'
+            Assert-Equal $put[0][2].StartsWith('put ') $true
+            if ($mode -eq 'InteractivePassword') {
+                # The ancestor walk rides in the probe's own ssh call: probe + size/hash check, nothing more.
+                Assert-Equal $script:SshCommands.Count 2
+                Assert-Equal $script:SftpBatches.Count 2
+            }
+            Reset-FakeGuest
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostTree '/home/dev/r1/r2/tree' -Recurse $true -AuthMode $mode
+            Assert-Equal $r.Completed 1; Assert-Equal $r.Failed 0
+            Assert-Equal (Get-Content -LiteralPath (ConvertTo-FakeGuestPath '/home/dev/r1/r2/tree/b.txt') -Raw) 'bravo!'
+            $last = @($script:SftpBatches[$script:SftpBatches.Count - 1])
+            Assert-Equal ($last -join '|') ('mkdir "/home/dev/r1"|mkdir "/home/dev/r1/r2"|' + ($last[2..3] -join '|'))
+            Assert-Equal $last[2].StartsWith('put -r ') $true
+            Assert-Equal (Get-FakeTempCount) 0
+        }
+        Test-Case "SFTP ($mode): a download creates a missing host-side parent and grandparent" {
+            Reset-FakeGuest
+            $target = Join-Path $script:HostRoot 'm1\m2\g.txt'
+            $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' $target -AuthMode $mode
+            Assert-Equal $r.Completed 1; Assert-Equal $r.Failed 0
+            Assert-Equal (Get-Content -LiteralPath $target -Raw) 'guest-file'
+            $tree = Join-Path $script:HostRoot 'd1\d2\gtree'
+            $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/gtree' $tree -Recurse $true -AuthMode $mode
+            Assert-Equal $r.Completed 1
+            Assert-Equal (Get-Content -LiteralPath (Join-Path $tree 'c.txt') -Raw) 'charlie'
+            Assert-Equal (Get-FakeTempCount) 0
+        }
+        Test-Case "SFTP ($mode): a dry run into missing parents agrees with the real run and creates nothing" {
+            foreach ($case in @(@('ToVM', $script:HostA, '/home/dev/n1/n2/a.txt', $false), @('ToVM', $script:HostTree, '/home/dev/n1/n2/tree', $true),
+                    @('FromVM', '/home/dev/g.txt', (Join-Path $script:HostRoot 'm1\m2\g.txt'), $false),
+                    @('FromVM', '/home/dev/gtree', (Join-Path $script:HostRoot 'm1\m2\gtree'), $true))) {
+                Reset-FakeGuest
+                $dry = Invoke-LabSftpXfer $case[0] $case[1] $case[2] -Recurse $case[3] -DryRun $true -AuthMode $mode
+                Assert-Equal $dry.Completed 1; Assert-Equal $dry.Failed 0; Assert-Equal (Get-SftpPayloadLineCount) 0
+                Assert-Equal ([IO.Directory]::Exists((ConvertTo-FakeGuestPath '/home/dev/n1'))) $false
+                Assert-Equal ([IO.Directory]::Exists((Join-Path $script:HostRoot 'm1'))) $false
+                $real = Invoke-LabSftpXfer $case[0] $case[1] $case[2] -Recurse $case[3] -AuthMode $mode
+                Assert-Equal $real.Completed $dry.Completed; Assert-Equal $real.Failed $dry.Failed
+            }
+        }
+        Test-Case "SFTP ($mode): a parent that is a file fails before any payload, in a dry run too" {
+            Reset-FakeGuest
+            foreach ($dry in @($true, $false)) {
+                $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/g.txt/x/a.txt' -DryRun $dry -AuthMode $mode
+                Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0; Assert-Equal (Get-SftpPayloadLineCount) 0
+                if (-not (($r.Errors -join ' ') -match 'not a directory')) { throw "Unexpected error: $($r.Errors)" }
+                $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' (Join-Path $script:HostRoot 'src\a.txt\x\g.txt') -DryRun $dry -AuthMode $mode
+                Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0; Assert-Equal (Get-SftpPayloadLineCount) 0
+                if (-not (($r.Errors -join ' ') -match 'not a directory')) { throw "Unexpected error: $($r.Errors)" }
+            }
+        }
+        Test-Case "SFTP ($mode): a failed upload removes the parents it created, never a pre-existing empty one" {
+            Reset-FakeGuest
+            [void][IO.Directory]::CreateDirectory((ConvertTo-FakeGuestPath '/home/dev/empty0'))
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/empty0/n1/n2/a.txt' -AuthMode $mode -Fault 'CorruptPut'
+            Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+            Assert-Equal ([IO.Directory]::Exists((ConvertTo-FakeGuestPath '/home/dev/empty0/n1'))) $false
+            Assert-Equal ([IO.Directory]::Exists((ConvertTo-FakeGuestPath '/home/dev/empty0'))) $true
+            Assert-Equal (Get-FakeTempCount) 0
+            $cleanup = @($script:SftpBatches[$script:SftpBatches.Count - 1])
+            Assert-Equal ($cleanup -join '|') '-rmdir "/home/dev/empty0/n1/n2"|-rmdir "/home/dev/empty0/n1"'
+        }
+        Test-Case "SFTP ($mode): a failed download removes the host parents it created, never a pre-existing empty one" {
+            Reset-FakeGuest
+            $existing = Join-Path $script:HostRoot 'e0'
+            [void][IO.Directory]::CreateDirectory($existing)
+            $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' (Join-Path $existing 'n1\n2\g.txt') -AuthMode $mode -Fault 'CorruptGet'
+            Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+            Assert-Equal ([IO.Directory]::Exists((Join-Path $existing 'n1'))) $false
+            Assert-Equal ([IO.Directory]::Exists($existing)) $true
+            Assert-Equal (Get-FakeTempCount) 0
+        }
+    }
+    Test-Case 'SFTP: a failed recursive upload leaves a non-empty created parent and every pre-existing one' {
+        Reset-FakeGuest
+        [void][IO.Directory]::CreateDirectory((ConvertTo-FakeGuestPath '/home/dev/empty0'))
+        $r = Invoke-LabSftpXfer 'ToVM' $script:HostTree '/home/dev/empty0/n1/tree' -Recurse $true -Fault 'FailRename'
+        Assert-Equal $r.Failed 1
+        # The partial temporary tree stays (reported for removal by hand), so its parent cannot be removed.
+        Assert-Equal ([IO.Directory]::Exists((ConvertTo-FakeGuestPath '/home/dev/empty0/n1'))) $true
+        Assert-Equal ((Get-SftpBatchText) -match '(?m)^-rmdir "/home/dev/empty0/n1"$') $true
+        Assert-Equal ((Get-SftpBatchText) -match 'rmdir "/home/dev/empty0"') $false
+    }
+    Test-Case 'SFTP: a connection lost mid-download into missing parents leaves no host-side directory behind' {
+        Reset-FakeGuest
+        Assert-Throws { Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' (Join-Path $script:HostRoot 'm1\m2\g.txt') -DropAtCall 2 } 'connection failed'
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $script:HostRoot 'm1'))) $false
+        Assert-Equal (Get-FakeTempCount) 0
+    }
+    Test-Case 'SFTP (KeyAgent): an unrecognized destination listing fails closed instead of overwriting' {
+        Reset-FakeGuest
+        [IO.File]::WriteAllText((ConvertTo-FakeGuestPath '/home/dev/a.txt'), 'original')
+        foreach ($policy in @('Error', 'Skip')) {
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt' -OnConflict $policy -Fault 'IsoListing'
+            Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0; Assert-Equal (Get-SftpPayloadLineCount) 0
+            if (-not (($r.Errors -join ' ') -match 'not recognized')) { throw "Unexpected error: $($r.Errors)" }
+        }
+        Assert-Equal (Get-Content -LiteralPath (ConvertTo-FakeGuestPath '/home/dev/a.txt') -Raw) 'original'
     }
     Test-Case 'SFTP: a hash check without sha256sum on the guest fails the item' {
         Reset-FakeGuest
