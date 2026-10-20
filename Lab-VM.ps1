@@ -82,7 +82,7 @@
 .PARAMETER SshHost
     Parameter mode: the SSH hostname or IP address to save, with -ConfigureSsh.
 .PARAMETER SshPort
-    Parameter mode: the SSH port to save, with -ConfigureSsh (default 22).
+    Parameter mode: the SSH port to save, with -ConfigureSsh (default 22; 1-65535).
 .PARAMETER SshUser
     Parameter mode: the SSH username to save, with -ConfigureSsh.
 .PARAMETER SshIdentityFile
@@ -126,6 +126,7 @@ param(
     [PSCredential]$Credential,
     [switch]$ConfigureSsh,
     [string]$SshHost,
+    [ValidateRange(1, 65535)]
     [int]$SshPort = 22,
     [string]$SshUser,
     [string]$SshIdentityFile
@@ -362,21 +363,49 @@ function Get-LabSshConnectionSettingsPath {
     return Join-Path $env:LOCALAPPDATA "LabVmManager\SshConnections\$VMId.json"
 }
 
+# The host and user values reach ssh.exe/sftp.exe inside one positional "user@host" argument. A value
+# starting with '-' could be read as a command-line option, and whitespace, control characters (or an
+# '@' in the host) would change how that argument is split, so such values are refused, not escaped.
+function Test-LabSshHostName {
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    return (-not [string]::IsNullOrEmpty($Value) -and -not $Value.StartsWith('-') -and $Value -notmatch '[\s\x00-\x1F\x7F@]')
+}
+
+function Test-LabSshUserName {
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+    return (-not [string]::IsNullOrEmpty($Value) -and -not $Value.StartsWith('-') -and $Value -notmatch '[\s\x00-\x1F\x7F]')
+}
+
 function Get-LabSshConnectionSettings {
     param([guid]$VMId)
     $path = Get-LabSshConnectionSettingsPath $VMId
     if (-not (Test-Path -LiteralPath $path)) { return $null }
+    # A settings file that exists but cannot be used fails loudly. Returning $null here would make the VM
+    # look unconfigured, and adapter selection would then silently fall back to PowerShell Direct (and its
+    # Windows credential prompt) for a VM the operator explicitly configured for SSH.
+    $problem = $null
+    $settings = $null
     try {
-        $saved = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        $saved = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $saved) { $problem = 'the file is empty' }
+        else {
+            $settings = [pscustomobject]@{
+                HostNameOrAddress = [string]$saved.HostNameOrAddress
+                Port = [int]$saved.Port
+                UserName = [string]$saved.UserName
+                IdentityFilePath = [string]$saved.IdentityFilePath
+            }
+            if (-not (Test-LabSshHostName $settings.HostNameOrAddress)) { $problem = 'the saved host name or address is missing or invalid' }
+            elseif (-not (Test-LabSshUserName $settings.UserName)) { $problem = 'the saved username is missing or invalid' }
+            elseif ($settings.Port -lt 1 -or $settings.Port -gt 65535) { $problem = 'the saved port is not between 1 and 65535' }
+        }
     } catch {
-        return $null
+        $problem = $_.Exception.Message
     }
-    return [pscustomobject]@{
-        HostNameOrAddress = [string]$saved.HostNameOrAddress
-        Port = [int]$saved.Port
-        UserName = [string]$saved.UserName
-        IdentityFilePath = [string]$saved.IdentityFilePath
+    if ($null -ne $problem) {
+        throw "The saved SSH connection settings for VM $VMId cannot be used ($problem). File: $path. Save new settings (option C or -ConfigureSsh) to replace it, or delete the file to return this VM to PowerShell Direct."
     }
+    return $settings
 }
 
 function Set-LabSshConnectionSettings {
@@ -388,6 +417,13 @@ function Set-LabSshConnectionSettings {
         # A path reference to a private key file, not the key/secret contents themselves.
         [AllowNull()][AllowEmptyString()][string]$IdentityFilePath
     )
+    if (-not (Test-LabSshHostName $HostNameOrAddress)) {
+        throw "Invalid SSH host name or address '$HostNameOrAddress': it must not be empty, start with '-', or contain whitespace, control characters or '@'."
+    }
+    if (-not (Test-LabSshUserName $UserName)) {
+        throw "Invalid SSH username '$UserName': it must not be empty, start with '-', or contain whitespace or control characters."
+    }
+    if ($Port -lt 1 -or $Port -gt 65535) { throw "Invalid SSH port ${Port}: it must be between 1 and 65535." }
     $path = Get-LabSshConnectionSettingsPath $VMId
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
     $settings = [ordered]@{
@@ -474,11 +510,17 @@ function Invoke-LabSftpCommand {
             $output = [string[]]@($raw | ForEach-Object { [string]$_ })
         }
         'InteractivePassword' {
-            $arguments = @('-o', 'StrictHostKeyChecking=yes', '-P', $Port, '-b', $BatchFilePath, $target)
-            # No -o BatchMode=yes and no stream redirection here: OpenSSH's own password and
-            # host-key-trust prompts must reach the operator's real console unmodified, so a
-            # future reader should not "fix" this branch to match the batch-mode one above.
-            & sftp.exe @arguments
+            # sftp's own -b silently hands its ssh child '-oBatchMode yes' (upstream sftp.c does this, and the
+            # bundled sftp.exe contains that string), which would switch password authentication off. sftp
+            # passes -o options on in command-line order and ssh keeps the first value it sees for an option,
+            # so BatchMode=no must come BEFORE -b. Order is load-bearing; test_static.py pins it.
+            $arguments = @('-o', 'BatchMode=no', '-o', 'StrictHostKeyChecking=yes', '-P', $Port, '-b', $BatchFilePath, $target)
+            # No stdin/stderr redirection here: OpenSSH's own password prompt must reach the operator's real
+            # console unmodified, so a future reader should not "fix" this branch to match the batch-mode one
+            # above. Out-Host only keeps sftp's stdout (its batch echo, e.g. "sftp> pwd") out of this
+            # function's return value -- inside a function, PowerShell would otherwise capture that stdout into
+            # the returned array, and callers reading .ExitCode would fail under StrictMode.
+            & sftp.exe @arguments | Out-Host
             $exitCode = $LASTEXITCODE
             $output = [string[]]@()
         }
@@ -521,8 +563,9 @@ function Invoke-LabSshCommand {
         }
         'InteractivePassword' {
             $arguments = @('-o', 'StrictHostKeyChecking=yes', '-p', $Port, $target, $RemoteCommand)
-            # No -o BatchMode=yes and no stderr redirection: OpenSSH's own password and host-key-trust
-            # prompts must reach the operator's console unmodified. Out-Host only keeps any remote stdout
+            # No -o BatchMode=yes and no stderr redirection: OpenSSH's own password prompt must reach the
+            # operator's console unmodified. (StrictHostKeyChecking=yes never prompts about host keys; first
+            # trust is the separate Add-LabSshKnownHost action.) Out-Host only keeps any remote stdout
             # (the commands used here print none) out of this function's return value -- inside a
             # function, PowerShell would otherwise capture that stdout into the returned array.
             & ssh.exe @arguments | Out-Host
@@ -552,7 +595,15 @@ function Test-LabSshConnection {
         if ($result.ExitCode -eq 0) {
             Write-Host "Connection succeeded ($authMode)."
         } else {
-            Write-Warning "Connection test failed (sftp exit code $($result.ExitCode))."
+            # KeyAgent mode captures sftp's own messages ("Host key verification failed.", "Permission denied
+            # (publickey).", "Connection refused"); show their tail instead of a bare exit code. In password mode
+            # OpenSSH already printed its reason straight to the console.
+            $reason = @($result.Output | Where-Object { $_ -and $_ -notmatch '^sftp>' } | Select-Object -Last 3) -join ' '
+            if ($reason) { Write-Warning "Connection test failed (sftp exit code $($result.ExitCode)): $reason" }
+            else { Write-Warning "Connection test failed (sftp exit code $($result.ExitCode)); OpenSSH's own message, if any, is shown above." }
+            if ($result.ExitCode -eq 255) {
+                Write-Warning 'Exit 255 is a connection-level failure: guest unreachable, authentication refused, or an unknown or changed host key. For a guest never connected to before, trust its key with option K; after its key changed, clear the old entry with option U.'
+            }
         }
     } catch {
         Write-Warning "Connection test failed: $($_.Exception.Message)"
@@ -575,10 +626,60 @@ function Update-LabSshKnownHost {
     }
 }
 
+function Add-LabSshKnownHost {
+    param([guid]$VMId)
+    # Explicit first-connection trust for a guest whose host key is not in known_hosts yet. Every other
+    # connection this script makes (each transfer, the connection test, every probe) keeps
+    # StrictHostKeyChecking=yes and refuses an unknown or changed key outright; this is the only call that
+    # uses StrictHostKeyChecking=ask, and only after the operator's typed confirmation below. The trust
+    # decision itself is the operator's own "yes" to OpenSSH's native fingerprint prompt: OpenSSH writes
+    # known_hosts, never this script, and this script never reads, echoes or answers that prompt.
+    # Interactive by design, so it is checked by source review (test_static.py), never run by a test.
+    $ErrorActionPreference = 'Continue'
+    $settings = Get-LabSshConnectionSettings $VMId
+    if ($null -eq $settings) {
+        Write-Host 'SSH connection is not configured for this VM. Use Configure SSH connection first.'
+        return
+    }
+    $null = Assert-LabVMRunning $VMId
+    $tooling = Get-LabSshToolingInfo
+    if (-not $tooling.Available) {
+        throw 'ssh.exe/sftp.exe (Windows OpenSSH Client) were not found. Install the OpenSSH Client optional feature on this host.'
+    }
+    $target = "$($settings.UserName)@$($settings.HostNameOrAddress)"
+    Write-Host "This connects once to $target (port $($settings.Port)) and lets OpenSSH itself ask whether to trust the guest's host key."
+    Write-Host 'Before you answer OpenSSH, compare the fingerprint it prints with the one the guest reports on its own console:'
+    Write-Host '    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub'
+    Write-Host "Answer 'yes' to OpenSSH only if the two match; OpenSSH then adds the key to your known_hosts file."
+    Write-Host 'A host whose saved key has CHANGED is still refused here: clear the old entry with option U first.'
+    if (-not (Confirm-LabText "TRUST HOST KEY $($settings.HostNameOrAddress)")) {
+        Write-Host 'Cancelled. No connection was made and known_hosts was not changed.'
+        return
+    }
+    $arguments = @('-o', 'StrictHostKeyChecking=ask', '-o', 'BatchMode=no', '-p', $settings.Port)
+    if (-not [string]::IsNullOrEmpty($settings.IdentityFilePath)) { $arguments += @('-i', $settings.IdentityFilePath) }
+    # 'exit' is the remote command: a harmless no-op once the login succeeds.
+    $arguments += @($target, 'exit')
+    # Console passthrough: stdin and stderr are not redirected, so OpenSSH's fingerprint prompt, the
+    # operator's answer and any password prompt pass directly between OpenSSH and the console. Out-Host only
+    # keeps remote stdout (none is expected from 'exit') off this function's return value, the same pattern
+    # as Invoke-LabSshCommand's password branch.
+    & ssh.exe @arguments | Out-Host
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0) {
+        Write-Host "Connected to $target; its host key is now trusted. Use T to run the SFTP connection test."
+    } else {
+        Write-Warning "ssh exited with code $exitCode. If you answered 'yes' to OpenSSH, the key may already be saved even though the login itself failed; run T to check. If you answered 'no', known_hosts is unchanged."
+    }
+}
+
 function Configure-LabSshConnectionInteractive {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId
-    $existing = Get-LabSshConnectionSettings $VMId
+    # An unreadable saved file is reported, not fatal here: saving new settings below is one way to fix it.
+    $existing = $null
+    try { $existing = Get-LabSshConnectionSettings $VMId }
+    catch { Write-Warning "$($_.Exception.Message) Saving below replaces that file." }
     if ($null -ne $existing) {
         $existingAuth = $(if ([string]::IsNullOrEmpty($existing.IdentityFilePath)) { 'password' } else { "identity file: $($existing.IdentityFilePath)" })
         Write-Host "Current saved settings: $($existing.UserName)@$($existing.HostNameOrAddress):$($existing.Port) ($existingAuth)"
@@ -600,8 +701,11 @@ function Configure-LabSshConnectionInteractive {
         $hostAnswer = Read-LabText 'Hostname or IP address for SSH (blank re-prompts; a listed number also works)'
         $candidateIndex = ConvertTo-LabMenuIndex $hostAnswer $candidates.Count
         if ($candidateIndex -ge 0) { $hostNameOrAddress = $candidates[$candidateIndex] }
-        elseif ($hostAnswer -ne '') { $hostNameOrAddress = $hostAnswer }
-        else { Write-Host 'Enter a hostname or address.' }
+        elseif ($hostAnswer -eq '') { Write-Host 'Enter a hostname or address.' }
+        elseif (-not (Test-LabSshHostName $hostAnswer)) {
+            Write-Host "A hostname or address must not start with '-' or contain spaces, control characters or '@'."
+        }
+        else { $hostNameOrAddress = $hostAnswer }
     }
 
     $port = 22
@@ -618,8 +722,12 @@ function Configure-LabSshConnectionInteractive {
 
     $userName = ''
     while ($userName -eq '') {
-        $userName = Read-LabText 'SSH username (blank re-prompts)'
-        if ($userName -eq '') { Write-Host 'Enter a username.' }
+        $userAnswer = Read-LabText 'SSH username (blank re-prompts)'
+        if ($userAnswer -eq '') { Write-Host 'Enter a username.' }
+        elseif (-not (Test-LabSshUserName $userAnswer)) {
+            Write-Host "A username must not start with '-' or contain spaces or control characters."
+        }
+        else { $userName = $userAnswer }
     }
 
     $identityFilePath = Read-LabText 'Identity-file path (blank = password authentication)'
@@ -2124,12 +2232,9 @@ function Copy-LabTransferItemSftp {
         $result = $null
         try {
             [IO.File]::WriteAllText($batchPath, (($Lines -join "`n") + "`n"))
-            # In password mode sftp's own stdout (its batch echo) arrives here alongside the result
-            # object; it is shown, not parsed.
-            foreach ($item in @(Invoke-LabSftpCommand $HostNameOrAddress $Port $UserName $IdentityFilePath $batchPath $AuthMode)) {
-                if ($null -ne $item -and $null -ne $item.PSObject.Properties['ExitCode']) { $result = $item }
-                elseif ($null -ne $item) { Write-Host $item }
-            }
+            # Invoke-LabSftpCommand returns exactly one result object in both modes (its password branch
+            # sends sftp's stdout to the console, not to its return value).
+            $result = Invoke-LabSftpCommand $HostNameOrAddress $Port $UserName $IdentityFilePath $batchPath $AuthMode
         } finally {
             if ([IO.File]::Exists($batchPath)) { [IO.File]::Delete($batchPath) }
         }
@@ -2685,6 +2790,8 @@ function Copy-LabTransferItemSftp {
 
 function Get-LabTransferAdapterKind {
     param([guid]$VMId)
+    # An unreadable settings file throws from Get-LabSshConnectionSettings and propagates from here: it is
+    # never mistaken for "not configured", which would silently pick PowerShell Direct.
     if ($null -ne (Get-LabSshConnectionSettings $VMId)) { return 'SFTP' }
     return 'PSDirect'
 }
@@ -2775,20 +2882,36 @@ function Copy-LabVMItemInteractive {
     $destinationPath = Read-LabText $destinationPrompt
     if ($destinationPath -eq '') { return 'CANCELLED' }
 
-    # Resolve the source's type by inspection (not a blind prompt) so recursion is only asked about
-    # when it is actually relevant; a FromVM source lives in the guest, so that inspection needs a session.
-    $probeSb = { param([string]$Path) [bool](Test-Path -LiteralPath $Path -PathType Container) }
+    $adapterKind = Get-LabTransferAdapterKind $VMId
     $sourceRemote = ($Direction -eq 'FromVM')
     $credential = $null
-    $session = $null
-    try {
-        if ($sourceRemote) {
-            $credential = Resolve-LabWindowsCredential $null $false
-            $session = New-LabPSDirectSession $VMId $credential
+    if ($sourceRemote -and $adapterKind -eq 'SFTP') {
+        # A guest-side source on the SFTP adapter: there is no PowerShell Direct session to inspect it with
+        # (opening one would ask for Windows credentials for a Linux guest), and an SSH probe would cost an
+        # extra password prompt in password mode, so ask instead. A wrong answer is harmless: the engine
+        # checks the real type itself and fails the item before any data moves. No credential is needed.
+        $sourceIsDirectory = $null
+        while ($null -eq $sourceIsDirectory) {
+            $directoryAnswer = (Read-LabText "Is the source on '$($vm.Name)' a directory? [y/N] (C cancels)").ToUpperInvariant()
+            if ($directoryAnswer -in @('C', 'CANCEL')) { return 'CANCELLED' }
+            if ($directoryAnswer -in @('', 'N', 'NO')) { $sourceIsDirectory = $false }
+            elseif ($directoryAnswer -in @('Y', 'YES')) { $sourceIsDirectory = $true }
+            else { Write-Host 'Enter Y, N, or C.' }
         }
-        $sourceIsDirectory = [bool](Invoke-LabTransferSide $session $sourceRemote $probeSb @($sourcePath))
-    } finally {
-        if ($session) { Remove-PSSession $session }
+    } else {
+        # Resolve the source's type by inspection (not a blind prompt) so recursion is only asked about
+        # when it is actually relevant; a FromVM source lives in the guest, so that inspection needs a session.
+        $probeSb = { param([string]$Path) [bool](Test-Path -LiteralPath $Path -PathType Container) }
+        $session = $null
+        try {
+            if ($sourceRemote) {
+                $credential = Resolve-LabWindowsCredential $null $false
+                $session = New-LabPSDirectSession $VMId $credential
+            }
+            $sourceIsDirectory = [bool](Invoke-LabTransferSide $session $sourceRemote $probeSb @($sourcePath))
+        } finally {
+            if ($session) { Remove-PSSession $session }
+        }
     }
 
     $recurse = $false
@@ -2827,8 +2950,14 @@ function Copy-LabVMItemInteractive {
         Write-Host 'Enter Y, N, or C.'
     }
 
+    $adapterLabel = 'PowerShell Direct'
+    if ($adapterKind -eq 'SFTP') {
+        $sshSettings = Get-LabSshConnectionSettings $VMId
+        $adapterLabel = "SFTP ($($sshSettings.UserName)@$($sshSettings.HostNameOrAddress):$($sshSettings.Port))"
+    }
     Write-Host "`n=== Copy preview ==="
     [pscustomobject]@{
+        Adapter = $adapterLabel
         Direction = $Direction
         VMName = $vm.Name
         VMId = $vm.Id
@@ -2916,6 +3045,8 @@ function Show-LabVMMenu {
  14  Copy file/directory from VM        [requires Running]
   T  Test guest connectivity (PowerShell Direct or SSH, adapter-aware)
   C  Configure SSH connection for this VM
+  K  Trust this VM's SSH host key (first connection; OpenSSH asks you)
+  U  Clear this VM's stale SSH host key (after the guest's key changed)
   R  Refresh
   B  Choose another VM
   Q  Quit
@@ -2939,6 +3070,8 @@ READ-ONLY: VM-changing operations are disabled.
  14  Copy file/directory from VM        [requires Running]
   T  Test guest connectivity (PowerShell Direct or SSH, adapter-aware) [requires Running]
   C  Configure SSH connection for this VM
+  K  Trust this VM's SSH host key (first connection; OpenSSH asks you) [requires Running]
+  U  Clear this VM's stale SSH host key (after the guest's key changed)
   X  EMERGENCY power-off                       [risk of data loss]
   R  Refresh
   B  Choose another VM
@@ -2967,6 +3100,14 @@ READ-ONLY: VM-changing operations are disabled.
                     else { Test-LabTransferConnection $VMId }
                 }
                 'C'  { Configure-LabSshConnectionInteractive $VMId }
+                # K and U change only the operator's own known_hosts on this host, never the VM, each behind
+                # a typed confirmation; like C they stay available under -ReadOnly.
+                'K'  { Add-LabSshKnownHost $VMId }
+                'U'  {
+                    $sshSettings = Get-LabSshConnectionSettings $VMId
+                    if ($null -eq $sshSettings) { Write-Host 'SSH connection is not configured for this VM. Use Configure SSH connection first.' }
+                    else { Update-LabSshKnownHost $sshSettings.HostNameOrAddress $sshSettings.Port }
+                }
                 'X'  { Invoke-LabAction $VMId 'emergency-power-off' { param($id) Stop-LabVMPower $id } }
                 'R'  { continue vmMenu }
                 'B'  { return 'BACK' }
@@ -3019,6 +3160,10 @@ function Start-LabSshConfigurationCli {
     if ($hasVMName -eq $hasVMId) { throw 'Supply exactly one of -VMName or -VMId.' }
     if ([string]::IsNullOrEmpty($SshHost)) { throw 'Supply -SshHost with -ConfigureSsh.' }
     if ([string]::IsNullOrEmpty($SshUser)) { throw 'Supply -SshUser with -ConfigureSsh.' }
+    # Checked here as well as in Set-LabSshConnectionSettings, so a bad value fails before any host check or log.
+    if (-not (Test-LabSshHostName $SshHost)) { throw "Invalid -SshHost '$SshHost': it must not start with '-' or contain whitespace, control characters or '@'." }
+    if (-not (Test-LabSshUserName $SshUser)) { throw "Invalid -SshUser '$SshUser': it must not start with '-' or contain whitespace or control characters." }
+    if ($SshPort -lt 1 -or $SshPort -gt 65535) { throw "Invalid -SshPort ${SshPort}: it must be between 1 and 65535." }
     $ErrorActionPreference = 'Stop'
     Assert-LabHost
     Initialize-LabLog $RequestedLogRoot

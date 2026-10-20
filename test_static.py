@@ -58,7 +58,7 @@ class SourceContract(unittest.TestCase):
         for token in ['RESTORE ', 'DELETE ', 'POWER OFF ', 'CONFIGURE ']:
             self.assertIn(token,self.s)
     def test_all_named_operations_exist(self):
-        for name in ['Get-LabVM','Select-LabVM','Start-LabVM','Stop-LabVMGracefully','New-LabCheckpoint','Restore-LabCheckpoint','Rename-LabCheckpoint','Remove-LabCheckpoint','Export-LabVM','Set-LabCheckpointPolicy','Stop-LabVMPower','Invoke-LabAction','Start-LabVMManager','New-LabVM','Edit-LabVMSettings','Remove-LabVM','Copy-LabVMItemInteractive','Invoke-LabFileTransfer','Configure-LabSshConnectionInteractive']:
+        for name in ['Get-LabVM','Select-LabVM','Start-LabVM','Stop-LabVMGracefully','New-LabCheckpoint','Restore-LabCheckpoint','Rename-LabCheckpoint','Remove-LabCheckpoint','Export-LabVM','Set-LabCheckpointPolicy','Stop-LabVMPower','Invoke-LabAction','Start-LabVMManager','New-LabVM','Edit-LabVMSettings','Remove-LabVM','Copy-LabVMItemInteractive','Invoke-LabFileTransfer','Configure-LabSshConnectionInteractive','Add-LabSshKnownHost','Update-LabSshKnownHost']:
             self.assertIn('function '+name+' {',self.s)
     def test_host_discovery_functions_exist(self):
         self.assertIn('function Get-LabHostDefaults', self.s)
@@ -468,6 +468,120 @@ class SourceContract(unittest.TestCase):
         # adapter applies to its own downloads (no session), never an sftp chmod.
         body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('Set-LabTransferPrivateAcl -Session $null', body)
+
+    # --- Final-review fix wave ---
+    def _body(self, name):
+        return self.s.split('function ' + name + ' {', 1)[1].split('\nfunction ', 1)[0]
+    def _code(self, text):
+        return '\n'.join(l for l in text.splitlines() if not l.lstrip().startswith('#'))
+    def _sftp_password_branch(self):
+        body = self._code(self._body('Invoke-LabSftpCommand'))
+        return body.split("'InteractivePassword' {", 1)[1].split('default {', 1)[0]
+    def test_sftp_password_branch_batchmode_no_precedes_b(self):
+        # sftp -b forces '-oBatchMode yes' on its ssh child; ssh keeps the FIRST value it sees, so
+        # BatchMode=no must be earlier in the same argument list than -b, not merely present.
+        branch = self._sftp_password_branch()
+        args_line = [l for l in branch.splitlines() if '$arguments = @(' in l]
+        self.assertEqual(len(args_line), 1)
+        args_line = args_line[0]
+        self.assertIn("'-o', 'BatchMode=no'", args_line)
+        self.assertLess(args_line.index("'BatchMode=no'"), args_line.index("'-b'"))
+        self.assertNotIn('BatchMode=yes', branch)
+        self.assertIn("'StrictHostKeyChecking=yes'", args_line)
+    def test_sftp_password_branch_keeps_stdout_off_return_value(self):
+        branch = self._sftp_password_branch()
+        self.assertIn('& sftp.exe @arguments | Out-Host', branch)
+        self.assertNotIn('2>&1', branch)
+        self.assertNotRegex(branch, r'sftp\.exe[^\r\n]*[<>]')
+    def test_sftp_engine_takes_single_result_from_helper(self):
+        body = self._code(self._body('Copy-LabTransferItemSftp'))
+        run_batch = body.split('$runBatch = {', 1)[1].split('$runSsh = {', 1)[0]
+        self.assertIn('$result = Invoke-LabSftpCommand ', run_batch)
+        self.assertIn("throw 'sftp returned no result.'", run_batch)
+    def test_trust_host_key_confirms_before_ask_mode_connection(self):
+        body = self._code(self._body('Add-LabSshKnownHost'))
+        idx_confirm = body.index('Confirm-LabText "TRUST HOST KEY ')
+        idx_ssh = body.index('& ssh.exe @arguments')
+        self.assertLess(idx_confirm, idx_ssh)
+        self.assertIn("'StrictHostKeyChecking=ask'", body)
+        self.assertIn("'BatchMode=no'", body)
+        self.assertLess(body.index('Get-LabSshToolingInfo'), idx_ssh)
+        self.assertLess(body.index('Assert-LabVMRunning'), idx_ssh)
+    def test_trust_host_key_never_touches_prompt_or_known_hosts_itself(self):
+        # OpenSSH's own fingerprint prompt goes straight to the console: no stdin/stderr redirection,
+        # no captured output, no scripted answer, and no direct write to known_hosts by this script.
+        body = self._code(self._body('Add-LabSshKnownHost'))
+        self.assertIn('& ssh.exe @arguments | Out-Host', body)
+        ssh_line = [l for l in body.splitlines() if '& ssh.exe' in l]
+        self.assertEqual(len(ssh_line), 1)
+        self.assertNotRegex(ssh_line[0], r'2>|<|\$\w+\s*=\s*&')
+        for forbidden in ['Read-Host', 'Start-Process', 'Set-Content', 'Add-Content', 'Out-File', 'WriteAllText',
+                          'AppendAllText', 'UserKnownHostsFile', '& ssh-keygen', 'ssh-keyscan', 'StrictHostKeyChecking=no',
+                          'StrictHostKeyChecking=accept-new']:
+            self.assertNotIn(forbidden, body)
+    def test_ask_mode_exists_only_in_the_trust_action(self):
+        code = self._code(self.s)
+        self.assertEqual(code.count('StrictHostKeyChecking=ask'), 1)
+        self.assertNotIn('StrictHostKeyChecking=no', code)
+        self.assertNotIn('accept-new', code)
+        for name in ['Invoke-LabSftpCommand', 'Invoke-LabSshCommand']:
+            body = self._code(self._body(name))
+            for branch in ["'KeyAgent' {", "'InteractivePassword' {"]:
+                part = body.split(branch, 1)[1].split('}', 1)[0]
+                self.assertIn("'StrictHostKeyChecking=yes'", part, name + ' ' + branch)
+    def test_menu_wires_known_host_actions(self):
+        body = self._body('Show-LabVMMenu')
+        self.assertIn("'K'  { Add-LabSshKnownHost $VMId }", body)
+        self.assertIn('Update-LabSshKnownHost $sshSettings.HostNameOrAddress $sshSettings.Port', body)
+        read_only_text, normal_text = re.findall(r"Write-Host @'\r?\n(.*?)\r?\n'@", body, re.S)[:2]
+        for text in (read_only_text, normal_text):
+            self.assertRegex(text, r'(?m)^  K  Trust ')
+            self.assertRegex(text, r'(?m)^  U  Clear ')
+        # Host-local known_hosts actions, like C: not routed through Invoke-LabAction's read-only gate.
+        self.assertNotRegex(body, r"Invoke-LabAction[^\r\n]*(Add-LabSshKnownHost|Update-LabSshKnownHost)")
+    def test_copy_from_vm_menu_is_adapter_aware(self):
+        body = self._code(self._body('Copy-LabVMItemInteractive'))
+        idx_kind = body.index('$adapterKind = Get-LabTransferAdapterKind $VMId')
+        self.assertLess(idx_kind, body.index('Resolve-LabWindowsCredential'))
+        self.assertLess(idx_kind, body.index('New-LabPSDirectSession'))
+        sftp_branch = body.split("if ($sourceRemote -and $adapterKind -eq 'SFTP') {", 1)[1].split('\n    } else {', 1)[0]
+        self.assertNotIn('Resolve-LabWindowsCredential', sftp_branch)
+        self.assertNotIn('New-LabPSDirectSession', sftp_branch)
+        self.assertIn('Read-LabText', sftp_branch)
+    def test_connection_test_surfaces_failure_reason(self):
+        body = self._code(self._body('Test-LabSshConnection'))
+        self.assertIn('$result.Output', body)
+        self.assertIn("-notmatch '^sftp>'", body)
+    def test_ssh_settings_read_fails_closed(self):
+        body = self._code(self._body('Get-LabSshConnectionSettings'))
+        self.assertEqual(body.count('return $null'), 1)
+        self.assertIn('if (-not (Test-Path -LiteralPath $path)) { return $null }', body)
+        catch_part = body.split('} catch {', 1)[1].split('}', 1)[0]
+        self.assertNotIn('return', catch_part)
+        self.assertIn('throw "The saved SSH connection settings', body)
+        self.assertIn('Test-LabSshHostName', body)
+        self.assertIn('Test-LabSshUserName', body)
+    def test_ssh_values_validated_wherever_accepted(self):
+        for name in ['Set-LabSshConnectionSettings', 'Start-LabSshConfigurationCli', 'Configure-LabSshConnectionInteractive']:
+            body = self.s.split('function ' + name + ' {', 1)[1].split('\n}\n', 1)[0]
+            self.assertIn('Test-LabSshHostName', body, name)
+            self.assertIn('Test-LabSshUserName', body, name)
+        host_check = self._body('Test-LabSshHostName')
+        self.assertIn("StartsWith('-')", host_check)
+        self.assertIn("StartsWith('-')", self._body('Test-LabSshUserName'))
+        params = self.s.split('param(', 1)[1].split(')\n\n', 1)[0]
+        self.assertRegex(params, r'\[ValidateRange\(1, 65535\)\]\s*\[int\]\$SshPort')
+    def test_docs_describe_real_first_trust_flow(self):
+        readme = SCRIPT.with_name('README.md').read_text(encoding='utf-8-sig')
+        manual = SCRIPT.with_name('MANUAL-TESTS.md').read_text(encoding='utf-8-sig')
+        for stale in ['host-key-trust prompt reaches', 'password and host-key-trust prompts',
+                      'password/host-key prompts', 'real host-key-trust prompt reappears']:
+            self.assertNotIn(stale, readme)
+            self.assertNotIn(stale, manual)
+        for doc in (readme, manual):
+            self.assertIn('TRUST HOST KEY', doc)
+            self.assertIn('StrictHostKeyChecking=ask', doc)
+        self.assertIn('SshConnections\\<VMId>.json', readme)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
