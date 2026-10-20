@@ -439,6 +439,35 @@ class SourceContract(unittest.TestCase):
     def test_configure_ssh_does_not_prompt(self):
         body = self.s.rsplit("if ($MyInvocation.InvocationName -ne '.')", 1)[1]
         self.assertIn('ConfigureSsh', body)
+    def test_sftp_engine_private_profile_param_exists(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'PrivateFiles'", body)
+    def test_sftp_chmod_after_rename_not_before(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        idx_rename = body.index("'rename ")
+        idx_chmod = body.index("chmod")
+        self.assertLess(idx_rename, idx_chmod)
+    def test_sftp_branch_forwards_permission_profile(self):
+        body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Copy-LabTransferItemSftp', body)
+        # the forwarding call site must reference $PermissionProfile
+        sftp_call_start = body.index('Copy-LabTransferItemSftp')
+        sftp_call_region = body[sftp_call_start:sftp_call_start + 400]
+        self.assertIn('$PermissionProfile', sftp_call_region)
+    def test_sftp_chmod_lines_follow_rename_in_the_same_batch(self):
+        # Every chmod line is appended to a batch after that batch's rename line (never in batch A).
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'chmod 600 '", body)
+        self.assertIn("'chmod 700 '", body)
+        batch_b = body.split('$batchB += \'rename ', 1)[1]
+        self.assertLess(batch_b.index("'chmod 600 '"), batch_b.index('$finalize = & $runBatch $batchB'))
+        batch_a = body.split('$batchA = ', 1)[1].split('$upload = & $runBatch $batchA', 1)[0]
+        self.assertNotIn('chmod', batch_a)
+    def test_sftp_download_private_profile_uses_host_side_acl(self):
+        # A download's destination is on this Windows host: the same host-side ACL the Windows
+        # adapter applies to its own downloads (no session), never an sftp chmod.
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Set-LabTransferPrivateAcl -Session $null', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

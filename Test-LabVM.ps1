@@ -475,6 +475,17 @@ $script:SshCommands = [Collections.Generic.List[string]]::new()
 $script:SftpFault = $null
 $script:SftpCallIndex = 0
 $script:DropAtCall = 0
+# Guest-side modes set by the fake sftp's chmod, keyed by guest path.
+$script:FakeModes = @{}
+# Host-side PrivateFiles: a recording stand-in, so no real icacls runs; AclFailPath makes one path fail.
+$script:AclCalls = [Collections.Generic.List[string]]::new()
+$script:AclFailPath = $null
+function Set-LabTransferPrivateAcl {
+    param($Session, [string]$Path, [bool]$IsDirectory)
+    if ($null -ne $Session) { throw 'An SFTP download must restrict host-side permissions without a session.' }
+    $script:AclCalls.Add("$Path|$IsDirectory")
+    if ($script:AclFailPath -and $Path -eq $script:AclFailPath) { throw "icacls could not restrict '$Path' (exit 5): Access is denied." }
+}
 function ConvertTo-FakeGuestPath { param([string]$Path) Join-Path $script:GuestRoot ($Path.TrimStart('/').Replace('/', '\')) }
 function Copy-FakeTree {
     param([string]$From, [string]$To)
@@ -507,7 +518,7 @@ function Invoke-LabSftpCommand {
     $exit = 0
     foreach ($line in $lines) {
         $out.Add("sftp> $line")
-        $m = [regex]::Match($line, '^(?<ign>-)?(?<cmd>\w+)(?<r> -r)?(?: -la)? "(?<a>[^"]*)"(?: "(?<b>[^"]*)")?$')
+        $m = [regex]::Match($line, '^(?<ign>-)?(?<cmd>\w+)(?<r> -r)?(?: -la)?(?: (?<mode>[0-7]{3}))? "(?<a>[^"]*)"(?: "(?<b>[^"]*)")?$')
         if (-not $m.Success) { throw "fake sftp: unparsed batch line [$line]" }
         $a = $m.Groups['a'].Value
         $b = $m.Groups['b'].Value
@@ -568,6 +579,14 @@ function Invoke-LabSftpCommand {
                     $to = ConvertTo-FakeGuestPath $b
                     if ([IO.Directory]::Exists($from)) { [IO.Directory]::Move($from, $to) } else { [IO.File]::Move($from, $to) }
                 }
+                'chmod' {
+                    $p = ConvertTo-FakeGuestPath $a
+                    if (-not ([IO.File]::Exists($p) -or [IO.Directory]::Exists($p))) { throw "remote setstat `"$a`": No such file or directory" }
+                    if ($script:SftpFault -eq 'FailChmod') { throw "remote setstat `"$a`": Permission denied" }
+                    # A setstat error line on a batch that still exits 0: the engine must not trust the exit code alone.
+                    if ($script:SftpFault -eq 'SetstatOutputOnly') { $out.Add("Couldn't setstat on `"$a`": Failure") }
+                    else { $script:FakeModes[$a] = $m.Groups['mode'].Value }
+                }
                 default { throw "fake sftp: unsupported command [$line]" }
             }
         } catch { $out.Add($_.Exception.Message); $ok = $false }
@@ -613,18 +632,21 @@ function Invoke-LabSshCommand {
 }
 function Invoke-LabSftpXfer {
     param([string]$Direction, [string]$Source, [string]$Destination, [bool]$Recurse = $false, [string]$OnConflict = 'Error',
-        [bool]$VerifyHash = $true, [bool]$DryRun = $false, [string]$AuthMode = 'KeyAgent', [string]$Fault = $null, [int]$DropAtCall = 0)
+        [bool]$VerifyHash = $true, [bool]$DryRun = $false, [string]$AuthMode = 'KeyAgent', [string]$Fault = $null, [int]$DropAtCall = 0,
+        [string]$PermissionProfile = 'Default')
     $script:SftpBatches.Clear()
     $script:SshCommands.Clear()
+    $script:AclCalls.Clear()
+    $script:FakeModes.Clear()
     $script:SftpFault = $Fault
     $script:SftpCallIndex = 0
     $script:DropAtCall = $DropAtCall
     $identity = if ($AuthMode -eq 'KeyAgent') { 'C:\keys\id_test' } else { '' }
-    try { return Copy-LabTransferItemSftp 'guest.invalid' 22 'labuser' $identity $AuthMode $Direction $Source $Destination $Recurse $OnConflict $VerifyHash $DryRun 6>$null 3>$null }
+    try { return Copy-LabTransferItemSftp 'guest.invalid' 22 'labuser' $identity $AuthMode $Direction $Source $Destination $Recurse $OnConflict $VerifyHash $DryRun $PermissionProfile 6>$null 3>$null }
     finally { $script:SftpFault = $null; $script:DropAtCall = 0 }
 }
 function Get-SftpBatchText { return (@($script:SftpBatches | ForEach-Object { $_ -join "`n" }) -join "`n---`n") }
-function Get-SftpPayloadLineCount { return @($script:SftpBatches | ForEach-Object { $_ } | Where-Object { $_ -match '^-?(put|get|rename|rm|mkdir|rmdir) ' }).Count }
+function Get-SftpPayloadLineCount { return @($script:SftpBatches | ForEach-Object { $_ } | Where-Object { $_ -match '^-?(put|get|rename|rm|mkdir|rmdir|chmod) ' }).Count }
 function Get-FakeTempCount { return @(Get-ChildItem -LiteralPath $script:SftpBase -Recurse -Force | Where-Object { $_.Name -like '*.labxfer-*' }).Count }
 function Reset-FakeGuest {
     foreach ($dir in @($script:GuestRoot, $script:HostRoot)) {
@@ -931,6 +953,134 @@ try {
             Assert-Equal ([IO.Directory]::Exists($existing)) $true
             Assert-Equal (Get-FakeTempCount) 0
         }
+        Test-Case "SFTP ($mode): PrivateFiles on a single-file upload sets mode 600 after the rename, in the finalize batch" {
+            Reset-FakeGuest
+            [IO.File]::WriteAllText((ConvertTo-FakeGuestPath '/home/dev/sibling.txt'), 's')
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/n1/a.txt' -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            Assert-Equal $r.Completed 1; Assert-Equal $r.Failed 0; Assert-Equal $r.BytesTransferred ([long]5)
+            $put = @($script:SftpBatches | Where-Object { ($_ -join "`n") -match '(?m)^put ' })
+            Assert-Equal $put.Count 1
+            if (($put[0] -join "`n") -match 'chmod') { throw 'chmod ran in the upload batch, before verification.' }
+            Assert-Equal $put[0][0] 'mkdir "/home/dev/n1"'
+            $final = @($script:SftpBatches[$script:SftpBatches.Count - 1])
+            Assert-Equal $final.Count 2
+            Assert-Equal $final[0].StartsWith('rename ') $true
+            Assert-Equal $final[1] 'chmod 600 "/home/dev/n1/a.txt"'
+            Assert-Equal $script:FakeModes.Count 1
+            Assert-Equal $script:FakeModes['/home/dev/n1/a.txt'] '600'
+            Assert-Equal $script:AclCalls.Count 0
+            Reset-FakeGuest
+            [IO.File]::WriteAllText((ConvertTo-FakeGuestPath '/home/dev/a.txt'), 'original')
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt' -OnConflict 'Overwrite' -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            Assert-Equal $r.Completed 1
+            $final = @($script:SftpBatches[$script:SftpBatches.Count - 1])
+            Assert-Equal ($final -join '|') ('rm "/home/dev/a.txt"|' + $final[1] + '|chmod 600 "/home/dev/a.txt"')
+            Assert-Equal $final[1].StartsWith('rename ') $true
+        }
+        Test-Case "SFTP ($mode): PrivateFiles on a fresh directory upload sets mode 700 on the root only, after the rename" {
+            Reset-FakeGuest
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostTree '/home/dev/r1/tree' -Recurse $true -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            Assert-Equal $r.Completed 1; Assert-Equal $r.Failed 0
+            $last = @($script:SftpBatches[$script:SftpBatches.Count - 1])
+            Assert-Equal $last.Count 4
+            Assert-Equal $last[0] 'mkdir "/home/dev/r1"'
+            Assert-Equal $last[1].StartsWith('put -r ') $true
+            Assert-Equal $last[2].StartsWith('rename ') $true
+            Assert-Equal $last[3] 'chmod 700 "/home/dev/r1/tree"'
+            Assert-Equal ($script:FakeModes.Keys -join ',') '/home/dev/r1/tree'
+        }
+        Test-Case "SFTP ($mode): a failed chmod after a landed upload is Failed, keeps the file in place, rolls nothing back" {
+            Reset-FakeGuest
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/n1/a.txt' -AuthMode $mode -PermissionProfile 'PrivateFiles' -Fault 'FailChmod'
+            Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0; Assert-Equal $r.BytesTransferred ([long]0)
+            if (-not (($r.Errors -join ' ') -match 'copied successfully but the private-file permission \(mode 600\)')) { throw "Unexpected error: $($r.Errors)" }
+            Assert-Equal (Get-Content -LiteralPath (ConvertTo-FakeGuestPath '/home/dev/n1/a.txt') -Raw) 'alpha'
+            Assert-Equal (Get-FakeTempCount) 0
+            Assert-Equal ((Get-SftpBatchText) -match '(?m)^-?(rm|rmdir) ') $false
+            Reset-FakeGuest
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostTree '/home/dev/n1/tree' -Recurse $true -AuthMode $mode -PermissionProfile 'PrivateFiles' -Fault 'FailChmod'
+            Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+            if (-not (($r.Errors -join ' ') -match 'copied successfully but the private-file permission \(mode 700 on the directory\)')) { throw "Unexpected error: $($r.Errors)" }
+            Assert-Equal (Get-Content -LiteralPath (ConvertTo-FakeGuestPath '/home/dev/n1/tree/b.txt') -Raw) 'bravo!'
+            Assert-Equal ((Get-SftpBatchText) -match '(?m)^-?rmdir ') $false
+        }
+        Test-Case "SFTP ($mode): PrivateFiles with a failed rename keeps the existing failure handling" {
+            Reset-FakeGuest
+            [IO.File]::WriteAllText((ConvertTo-FakeGuestPath '/home/dev/a.txt'), 'original')
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt' -OnConflict 'Overwrite' -AuthMode $mode -PermissionProfile 'PrivateFiles' -Fault 'FailRename'
+            Assert-Equal $r.Failed 1
+            if (-not (($r.Errors -join ' ') -match 'verified copy was kept')) { throw "Unexpected error: $($r.Errors)" }
+            Assert-Equal (Get-FakeTempCount) 1
+            Reset-FakeGuest
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt' -AuthMode $mode -PermissionProfile 'PrivateFiles' -Fault 'FailRename'
+            Assert-Equal $r.Failed 1
+            if (($r.Errors -join ' ') -match 'copied successfully') { throw "A failed rename was reported as landed: $($r.Errors)" }
+            Assert-Equal (Get-FakeTempCount) 0
+            Assert-Equal $script:FakeModes.Count 0
+        }
+        Test-Case "SFTP ($mode): PrivateFiles on a download restricts the host-side file, never with an sftp chmod" {
+            Reset-FakeGuest
+            $target = Join-Path $script:HostRoot 'g.txt'
+            $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' $target -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            Assert-Equal $r.Completed 1; Assert-Equal $r.Failed 0
+            Assert-Equal ($script:AclCalls -join ',') "$target|False"
+            Assert-Equal ((Get-SftpBatchText) -match 'chmod') $false
+            $script:AclFailPath = $target
+            try {
+                $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' $target -OnConflict 'Overwrite' -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            } finally { $script:AclFailPath = $null }
+            Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0; Assert-Equal $r.BytesTransferred ([long]0)
+            if (-not (($r.Errors -join ' ') -match 'copied successfully but the private-file permission could not be applied')) { throw "Unexpected error: $($r.Errors)" }
+            Assert-Equal (Get-Content -LiteralPath $target -Raw) 'guest-file'
+            Assert-Equal (Get-FakeTempCount) 0
+        }
+        Test-Case "SFTP ($mode): PrivateFiles on a directory download restricts every item, deepest first, root last" {
+            Reset-FakeGuest
+            $target = Join-Path $script:HostRoot 'dl'
+            $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/gtree' $target -Recurse $true -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            Assert-Equal $r.Completed 1; Assert-Equal $r.Failed 0
+            Assert-Equal $script:AclCalls.Count 4
+            Assert-Equal $script:AclCalls[3] "$target|True"
+            foreach ($expected in @("$(Join-Path $target 'empty')|True", "$(Join-Path $target '.profile')|False", "$(Join-Path $target 'c.txt')|False")) {
+                if (-not $script:AclCalls.Contains($expected)) { throw "Missing ACL call [$expected] in [$($script:AclCalls -join ', ')]." }
+            }
+            Assert-Equal ((Get-SftpBatchText) -match 'chmod') $false
+            Reset-FakeGuest
+            $script:AclFailPath = Join-Path $target 'c.txt'
+            try {
+                $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/gtree' $target -Recurse $true -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            } finally { $script:AclFailPath = $null }
+            Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+            if (-not (($r.Errors -join ' ') -match '1 of 4 items could not be restricted')) { throw "Unexpected error: $($r.Errors)" }
+            # Every other item was still restricted, and the tree stays in place.
+            Assert-Equal $script:AclCalls.Count 4
+            Assert-Equal (Get-Content -LiteralPath (Join-Path $target 'c.txt') -Raw) 'charlie'
+        }
+        Test-Case "SFTP ($mode): PrivateFiles in a dry run changes no permission" {
+            Reset-FakeGuest
+            $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt' -DryRun $true -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            Assert-Equal $r.Completed 1; Assert-Equal (Get-SftpPayloadLineCount) 0
+            $r = Invoke-LabSftpXfer 'FromVM' '/home/dev/g.txt' (Join-Path $script:HostRoot 'g.txt') -DryRun $true -AuthMode $mode -PermissionProfile 'PrivateFiles'
+            Assert-Equal $r.Completed 1; Assert-Equal $script:AclCalls.Count 0
+        }
+    }
+    Test-Case 'SFTP (KeyAgent): a setstat error line demotes the item even when sftp exits 0' {
+        Reset-FakeGuest
+        $r = Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt' -PermissionProfile 'PrivateFiles' -Fault 'SetstatOutputOnly'
+        Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+        if (-not (($r.Errors -join ' ') -match "Couldn't setstat")) { throw "Unexpected error: $($r.Errors)" }
+        Assert-Equal (Get-Content -LiteralPath (ConvertTo-FakeGuestPath '/home/dev/a.txt') -Raw) 'alpha'
+        $r = Invoke-LabSftpXfer 'ToVM' $script:HostTree '/home/dev/tree' -Recurse $true -PermissionProfile 'PrivateFiles' -Fault 'SetstatOutputOnly'
+        Assert-Equal $r.Failed 1; Assert-Equal $r.Completed 0
+    }
+    Test-Case 'SFTP: a default-profile transfer has no chmod line and no host-side ACL call' {
+        Reset-FakeGuest
+        Assert-Equal (Invoke-LabSftpXfer 'ToVM' $script:HostA '/home/dev/a.txt').Completed 1
+        Assert-Equal ((Get-SftpBatchText) -match 'chmod') $false
+        Assert-Equal (Invoke-LabSftpXfer 'ToVM' $script:HostTree '/home/dev/tree' -Recurse $true).Completed 1
+        Assert-Equal ((Get-SftpBatchText) -match 'chmod') $false
+        $null = Invoke-LabSftpXfer 'FromVM' '/home/dev/gtree' (Join-Path $script:HostRoot 'dl') -Recurse $true
+        Assert-Equal $script:AclCalls.Count 0
     }
     Test-Case 'SFTP: a failed recursive upload leaves a non-empty created parent and every pre-existing one' {
         Reset-FakeGuest
@@ -1079,6 +1229,20 @@ Test-Case 'Audit: a clean transfer is recorded as COMPLETED with paths, options 
     foreach ($part in @('Direction=ToVM', 'Source=C:\src\id_test', 'Destination=C:\Users\dev\.ssh\id_test', 'OnConflict=Skip',
             'PermissionProfile=PrivateFiles', 'VerifyHash=True', 'Completed=1; Skipped=0; Failed=0')) { Assert-Contains $record.Detail $part }
     Assert-Equal $script:SessionsClosed 1
+}
+Test-Case 'Orchestrator: the SFTP branch forwards -PermissionProfile to the SFTP engine' {
+    # Replaces the real SFTP engine from here on (its own tests ran above).
+    $script:SftpEngineArgs = $null
+    function Copy-LabTransferItemSftp { $script:SftpEngineArgs = $args; return [pscustomobject]$script:EngineOutcome }
+    $script:FakeSshSettings = [pscustomobject]@{ HostNameOrAddress = 'guest.invalid'; Port = 22; UserName = 'dev'; IdentityFilePath = 'C:\keys\id_test' }
+    try {
+        $r = Invoke-LabXferOrchestrator @{ Completed = 1; Skipped = 0; Failed = 0; BytesTransferred = [long]5; Errors = [string[]]@() }
+    } finally { $script:FakeSshSettings = $null }
+    Assert-Equal $r.Completed 1
+    Assert-Equal $script:SessionsOpened 0
+    Assert-Equal $script:SftpEngineArgs.Count 13
+    Assert-Equal $script:SftpEngineArgs[12] 'PrivateFiles'
+    Assert-Contains (Get-LabOnlyAuditRecord).Detail 'PermissionProfile=PrivateFiles'
 }
 Test-Case 'Audit: some failed, some completed is PARTIAL' {
     $null = Invoke-LabXferOrchestrator @{ Completed = 2; Skipped = 0; Failed = 1; BytesTransferred = [long]5; Errors = [string[]]@('x') }
