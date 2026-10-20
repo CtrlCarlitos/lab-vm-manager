@@ -64,11 +64,36 @@ This does not persist a machine/user policy change and cannot override an organi
 
 ## Menus
 
-The first menu lists matching VMs, current state, CPU count, assigned memory and full VM ID. Assigned memory can be zero while a VM is Off. Pick a number, `N` to create a new VM (hidden in `-ReadOnly` mode), `R` to refresh or `Q` to quit. An empty list still offers `N` (unless read-only); it never creates or renames one automatically on its own.
+The first menu lists matching VMs, current state, CPU count, assigned memory and full VM ID. Assigned memory can be zero while a VM is Off. Pick a number, `N` to create a new VM, `W` to create a new VM and install Windows 11 on it unattended (both hidden in `-ReadOnly` mode), `R` to refresh or `Q` to quit. An empty list still offers `N` and `W` (unless read-only); it never creates or renames one automatically on its own.
 
 ### Create VM (`N`)
 
 Collects, in order: a unique `LAB-` name (at most 100 characters, with no path, wildcard or control characters, since it becomes a folder and file name); a VM storage root (defaults to the host's configured VM path; an ISO/installer media folder such as `E:\ISO` is explicitly called out as invalid storage); vCPU count (bounded by host logical processors); startup RAM and a static/dynamic memory choice with minimum/maximum when dynamic; a VHDX storage root and maximum capacity; and a virtual switch, or an explicit "Disconnected" choice. Both storage roots must be existing absolute local drive paths (e.g. `D:\Hyper-V`); relative paths, UNC paths and mapped network drives are rejected, as for exports. Each new VM gets its own dedicated storage subfolder and VHDX subfolder, so creation refuses to proceed if that destination already exists. The VM is always created as **Generation 2**, with the same Standard/no-automatic-checkpoints policy used elsewhere in this tool. A full preview is shown before the `CREATE <name>` confirmation; creation itself is also protected by a dedicated per-name creation lock, and is blocked entirely in `-ReadOnly` mode.
+
+### Provision Windows 11 VM (`W`)
+
+Creates a new `LAB-` VM and installs **Windows 11 (client editions only)** on it with no console interaction, ending with the VM installed, running, and proven to boot on its own. The same flow runs from the command line with `-ProvisionWindowsVM` (see "Parameter mode: Windows unattended install" below), which is also how you change any default.
+
+1. **Pick the ISO** under `-IsoRoot` (same browser as `M`), or pass `-WindowsIsoPath`. The ISO is mounted read-only and its editions are listed. **If it has no Windows 11 client edition** (installation type `Client`, build 22000 or later), it is refused right there, listing every edition actually found; no VM is created. Windows 10 and Windows Server ISOs are out of scope.
+2. **Pick the edition** from a numbered list of the ISO's Windows 11 client editions only; a blank answer takes `Windows 11 Pro` when the ISO has it. With `-OsEdition` (full name such as `'Windows 11 Pro'`, or short name such as `Pro`) no picker appears, unless the name is not on the ISO: then the picker appears interactively, and `-NonInteractive` fails naming the available editions.
+3. **VM name.** Prompted for (same rules as `N`), unless `-NewVMName` is given.
+4. **One combined preview** of the VM hardware and the Windows settings, with **no per-field wizard**: 2 vCPUs (capped to the host), dynamic memory 2 / 4 / 8 GB (minimum / startup / maximum), a 150 GB dynamic VHDX, the network adapter **Disconnected** (PowerShell Direct needs no network), the host's default VM and VHDX folders, Generation 2, the edition, a computer name derived from the VM name, locale `en-US`, the host's time zone, and the Windows11 boot profile. Then a single `[Y/n/cancel]` confirmation; nothing exists until you answer `Y`. To change a value, cancel and rerun with `-ProvisionWindowsVM` and the matching parameter.
+5. **Create and provision**, in this order, holding the same per-name creation lock as `N` while the VM is created and then the new VM's own per-VM lock for everything after:
+   - create the VM;
+   - ask for the guest account (`Get-Credential`; the user name becomes a new local administrator account, any `COMPUTER\` prefix is dropped, and the password must not be empty). The password is never logged;
+   - create the per-VM provisioning workspace, `%LOCALAPPDATA%\LabVmManager\Provisioning\<VM ID>` (never under `-IsoRoot`);
+   - write a copy of the ISO with the **no-prompt EFI boot loader** into the workspace, so the "Press any key to boot from CD or DVD" prompt (see `M` below) never appears. If the ISO's boot layout is not one this understands, nothing is patched, the original ISO is used instead, and you are warned that the prompt may appear on the first start;
+   - build the `Autounattend.xml` answer file (disk layout, edition, computer name, locale, time zone, the account, and a single automatic sign-in) and a small seed ISO holding it;
+   - attach the Windows ISO and the seed ISO as two DVD drives, DVD first in the boot order, and apply the Windows11 boot profile (Secure Boot with the `MicrosoftWindows` template, a new local key protector and vTPM);
+   - **first boot cycle:** start the VM and wait (up to `-ProvisioningTimeoutSeconds`, default 1800 s) for a PowerShell Direct sign-in with the account, which proves Windows is installed. It then writes `lab-vm-manager-provisioning-note.txt` on that account's desktop;
+   - **cleanup:** request a normal guest shutdown (not forced), remove the seed drive, eject the Windows ISO (the drive itself stays), put the disk first in the boot order, and **delete the provisioning workspace**;
+   - **second boot cycle:** start the VM again and wait for a second PowerShell Direct sign-in, which proves it boots cleanly on its own with no install media.
+
+   The VM is left running. Audit records: `provision-windows-vm` `STARTED` right after the VM is created and one `COMPLETED` or `FAILED_OR_UNCONFIRMED` at the end, each naming the ISO, edition, computer name and elapsed time. Creating the key protector also writes its own `add-key-protector` record, as `M` does.
+
+**If a step fails** after the VM exists, the error lists every step already applied, and the VM is left exactly as it is: no automatic power-off and no deletion. **The provisioning workspace is kept, not deleted**, and the error gives its path. Once the seed ISO is built, that workspace **contains the account password in plain text** (in the answer file inside `seed.iso`). Inspect the VM, then delete that folder yourself. An interrupted run (Ctrl+C) prints the same summary.
+
+The first wait covers all of Windows Setup, including its own reboots, which happen with DVD still first in the boot order (see `MANUAL-TESTS.md`, "Windows unattended install", for the live checks of that behavior).
 
 The selected-VM menu provides:
 
@@ -132,7 +157,7 @@ One entry point for a VM's installer media, with three sub-actions:
 - **E — Eject the current DVD media** (VM must be Off). Shows what is attached and asks `[Y/n/cancel]`. The DVD drive stays, and the boot order is not changed (an empty DVD entry is skipped at boot).
 - **I — Inspect** the DVD drives and their media, the recorded previous attachment, Secure Boot state/template, key protector and vTPM state, and the firmware boot order. A security read that fails (key protector or vTPM) shows as `unknown` instead of ending the view. Read-only; this is the only sub-action available under `-ReadOnly`, where `M` goes straight to it and never prompts for a profile or ISO.
 
-What this does **not** do yet: it does not install an OS. It prepares the VM (firmware profile, media, boot order) so that starting it boots the chosen installer, which you then run yourself in the VM console; unattended Windows/Linux installation (using the seed-ISO builder) is the next plan. Known v1 limitations: selecting among **several existing DVD drives** is not supported — attach and eject refuse with a clear message when a VM has more than one, and you attach/eject manually in Hyper-V Manager instead. The DVD-first reorder recognizes boot entries by their device type. If no DVD entry is recognized, the step fails loudly instead of silently leaving the order unchanged.
+What this does **not** do: it does not install an OS. It prepares the VM (firmware profile, media, boot order) so that starting it boots the chosen installer, which you then run yourself in the VM console. For an unattended Windows 11 install on a new VM, use `W` from the VM list instead (see "Provision Windows 11 VM (`W`)"); unattended Linux installation is not implemented. Known v1 limitations: selecting among **several existing DVD drives** is not supported — attach and eject refuse with a clear message when a VM has more than one, and you attach/eject manually in Hyper-V Manager instead. The DVD-first reorder recognizes boot entries by their device type. If no DVD entry is recognized, the step fails loudly instead of silently leaving the order unchanged.
 
 Hyper-V shapes this relies on are **confirmed**, not guessed. Each was read by .NET reflection from the installed Hyper-V module's own type metadata, which needs no elevation and touches no VM. `Test-LabVM.ps1` re-checks them against the installed module on every run.
 - `Get-VMFirmware`'s `BootOrder` is a `VMBootSource[]`. Each entry's `.Device` is a `DvdDrive` or `HardDiskDrive`, with no `VM` prefix on the type name.
@@ -144,7 +169,7 @@ What still needs a live, elevated run is end-to-end behavior (see `MANUAL-TESTS.
 - Open the console (`vmconnect localhost <name>`, or Connect in Hyper-V Manager) before or right as you start the VM, click into it, and press a key at the prompt.
 - If it falls through, turn the VM off and start it again.
 
-Ubuntu media showed no such prompt. Removing the prompt (a no-prompt boot loader) belongs to the unattended-install plan.
+Ubuntu media showed no such prompt. This prompt still applies to Windows media attached with `M`. `W` (and `-ProvisionWindowsVM`) does not show it: it boots a copy of the ISO patched with the ISO's own no-prompt boot loader. The exception is an ISO whose boot layout cannot be patched; `W` then warns before the first start, and the steps above apply.
 
 ## Parameter mode: file transfer
 
@@ -188,7 +213,7 @@ powershell.exe -NoProfile -File .\Lab-VM.ps1 -ConfigureSsh -VMName LAB-linux -Ss
 
 Parameters:
 
-- `-ConfigureSsh` -- the switch that selects this mode. Mutually exclusive with `-CopyToVM`/`-CopyFromVM`; supplying `-ConfigureSsh` together with either exits `1` before anything else runs ("Supply only one of -ConfigureSsh, -CopyToVM, or -CopyFromVM; one action per invocation.").
+- `-ConfigureSsh` -- the switch that selects this mode. Mutually exclusive with `-CopyToVM`/`-CopyFromVM`/`-ProvisionWindowsVM`; supplying `-ConfigureSsh` together with any of them exits `1` before anything else runs ("Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, or -ProvisionWindowsVM; one action per invocation.").
 - `-VMName` / `-VMId` -- identify the target VM; pick exactly one, same resolution rules as file transfer.
 - `-SshHost` -- required hostname or IP address to save. Must not start with `-` or contain whitespace, control characters or `@`.
 - `-SshPort` -- optional; defaults to `22`; must be 1-65535 (rejected at parameter binding otherwise).
@@ -196,6 +221,35 @@ Parameters:
 - `-SshIdentityFile` -- optional identity-file path to save. Omit it to save password authentication.
 
 `-SshHost` and `-SshUser` are both required; a run missing either, or giving an invalid value, exits `1` with a message naming the parameter, and nothing is written. Trusting the guest's host key is not part of this non-interactive mode, because it needs the operator's answer to OpenSSH's fingerprint prompt: use menu option `K` once (see "First connection: trusting the guest's host key (`K`)"). On success, the process writes the settings file and exits `0`; a subsequent `-CopyToVM`/`-CopyFromVM` (or menu option `T`/`13`/`14`) against that same VM then automatically uses the SSH/SFTP adapter, with no further action needed. The same host assertion and `session` `STARTED`/`ENDED`/`configure-ssh-cli` audit records that other parameter-mode runs write are written here too.
+
+## Parameter mode: Windows unattended install
+
+Pass `-ProvisionWindowsVM` to run the `W` flow (see "Provision Windows 11 VM (`W`)" above) from the command line and exit, instead of launching the menu. Each parameter below overrides one value in the combined preview. Without `-NonInteractive`, anything not supplied is asked for the same way `W` asks: ISO picker, edition picker, VM name, credential prompt, and the single confirmation.
+
+```powershell
+$cred = Get-Credential
+& .\Lab-VM.ps1 -ProvisionWindowsVM -NewVMName LAB-win11 -WindowsIsoPath E:\ISO\Win11_24H2_English_x64.iso -OsEdition Pro -NonInteractive -Credential $cred
+```
+
+Parameters (all optional unless noted):
+
+- `-ProvisionWindowsVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM` and `-CopyFromVM` (exit `1` before anything runs).
+- `-NewVMName` -- name of the VM to **create** (must start with `LAB-` and be unique). This is deliberately not `-VMName`, which always names an existing VM. `-VMName`, `-VMId` and the other transfer-only parameters are rejected with `-ProvisionWindowsVM`.
+- `-WindowsIsoPath` -- the Windows 11 ISO. Default: pick one under `-IsoRoot`.
+- `-OsEdition` -- edition name, full or short (`'Windows 11 Pro'` or `Pro`). Default: the picker, preselecting Pro. With `-NonInteractive`: Pro, or the ISO's only Windows 11 client edition; otherwise it fails listing the choices.
+- `-ComputerName` -- 1-15 letters, digits or hyphens. Default: the VM name with other characters removed, cut to 15 characters.
+- `-Locale` -- for example `en-US` (the default). It must be a language the ISO contains.
+- `-TimeZone` -- a Windows time zone ID such as `'Pacific Standard Time'` (`tzutil /l` lists them). Default: this host's time zone.
+- `-VCpuCount` -- default `2`, capped to this host's logical processor count; an explicit value above that count is refused, not reduced.
+- `-MemoryMinimumGB` / `-MemoryStartupGB` / `-MemoryMaximumGB` -- dynamic memory, defaults `2` / `4` / `8`; minimum <= startup <= maximum.
+- `-VhdxSizeGB` -- dynamic VHDX maximum size, default `150` (64-65536).
+- `-SwitchName` -- an existing virtual switch. Default: none (Disconnected).
+- `-VmStorageRoot` / `-VhdxStorageRoot` -- existing local folders, same rules as `N`. Default: the Hyper-V host's configured VM and virtual-disk folders.
+- `-ProvisioningTimeoutSeconds` -- default `1800` (300-7200). This is how long each of the two PowerShell Direct sign-in waits may take. It is separate from `-TimeoutSeconds`, which only bounds short VM state changes such as the shutdown between the two boots.
+- `-Credential` -- the new guest account, built with `Get-Credential` in the calling session (as for file transfer; never a plaintext password on the command line). Without it, you are prompted after the VM is created.
+- `-NonInteractive` -- never prompt. Then `-NewVMName`, `-WindowsIsoPath` and `-Credential` are required, and a run missing any of them exits `1` before any VM exists. Without `-OsEdition`, the edition defaults to Pro, or to the ISO's only edition.
+
+The provisioning-only parameters (`-NewVMName` through `-ProvisioningTimeoutSeconds`) require `-ProvisionWindowsVM`; supplying any of them without it exits `1` rather than being ignored or opening the menu. Exit code: `0` only when the whole flow completed (both sign-ins proven). A refusal, a failure, or an interactive cancel exits `1`. The same host assertion and `session` `STARTED`/`ENDED` audit records as the other parameter modes are written, plus the `provision-windows-vm` records described above. Under `-ReadOnly`, it creates nothing and exits `1`.
 
 ## First baseline
 
@@ -260,7 +314,7 @@ Option `12` calls Hyper-V's `Remove-VM`, which unregisters the VM and its config
 
 ## Intentionally not included
 
-No guest OS installation (option `M` only attaches installer media and prepares the boot profile/order; it never runs an installer), VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing, remote hosts, automatic login, guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
+No guest OS installation other than `W`'s unattended Windows 11 install on a newly created VM (option `M` only attaches installer media and prepares the boot profile/order; it never runs an installer), Linux unattended installation, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing (no product key is set), remote hosts, automatic login beyond `W`'s single first sign-in, other guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
 
 ## Linux file transfer: SFTP backend design decision
 
