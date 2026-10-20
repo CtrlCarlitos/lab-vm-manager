@@ -2020,6 +2020,75 @@ function Set-LabVMBootOrder {
     Set-VMFirmware -VM $vm -BootOrder $newOrder -Confirm:$false -ErrorAction Stop
 }
 
+function Set-LabVMUnattendedInstallMedia {
+    param([guid]$VMId, [string]$WindowsIsoPath, [string]$SeedIsoPath)
+    # Unlike Set-LabVMInstallMedia (manual-install flow, reuses/adds a single drive on a VM that may
+    # already have one), this is only ever called against a VM this plan just created itself: zero
+    # existing DVD drives, so there is no "choose among several drives" ambiguity to handle.
+    $vm = Assert-LabVMOff $VMId
+    if ([int]$vm.Generation -ne 2) {
+        throw "'$($vm.Name)' is Generation $($vm.Generation). Unattended Windows install requires Generation 2."
+    }
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    if ($drives.Count -gt 0) {
+        throw "'$($vm.Name)' already has $($drives.Count) DVD drive(s) attached; this function is for a freshly created VM with none yet."
+    }
+
+    # Re-validate the Windows ISO immediately before attaching it -- not once up front for both -- so
+    # a problem with the Windows ISO is caught before anything is touched at all.
+    if (-not (Test-Path -LiteralPath $WindowsIsoPath -PathType Leaf)) {
+        throw "ISO '$WindowsIsoPath' no longer exists."
+    }
+    try {
+        $stream = [IO.File]::OpenRead($WindowsIsoPath)
+        try { $length = $stream.Length } finally { $stream.Close() }
+    } catch {
+        throw "ISO '$WindowsIsoPath' could not be opened for reading ($($_.Exception.Message))."
+    }
+    if ($length -le 0) { throw "ISO '$WindowsIsoPath' is empty (0 bytes)." }
+    Add-VMDvdDrive -VM $vm -Confirm:$false -ErrorAction Stop
+    $windowsDrive = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)[-1]
+    Set-VMDvdDrive -VMDvdDrive $windowsDrive -Path $WindowsIsoPath -Confirm:$false -ErrorAction Stop
+
+    # Re-validate the seed ISO immediately before attaching it, too -- so a problem with the seed ISO
+    # is caught before the Windows drive above is touched, except that the Windows drive already was:
+    # a seed-ISO failure here is reported with that drive left attached, not rolled back.
+    if (-not (Test-Path -LiteralPath $SeedIsoPath -PathType Leaf)) {
+        throw "ISO '$SeedIsoPath' no longer exists."
+    }
+    try {
+        $stream = [IO.File]::OpenRead($SeedIsoPath)
+        try { $length = $stream.Length } finally { $stream.Close() }
+    } catch {
+        throw "ISO '$SeedIsoPath' could not be opened for reading ($($_.Exception.Message))."
+    }
+    if ($length -le 0) { throw "ISO '$SeedIsoPath' is empty (0 bytes)." }
+    Add-VMDvdDrive -VM $vm -Confirm:$false -ErrorAction Stop
+    $seedDrive = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)[-1]
+    Set-VMDvdDrive -VMDvdDrive $seedDrive -Path $SeedIsoPath -Confirm:$false -ErrorAction Stop
+
+    # Both new drives are DVD-kind; which one ends up first doesn't matter -- UEFI firmware skips a
+    # non-bootable disc and falls through, so the seed drive being tried first costs nothing.
+    Set-LabVMBootOrder $VMId 'Dvd'
+}
+
+function Complete-LabWindowsProvisioning {
+    param([guid]$VMId, [string]$WindowsIsoPath, [string]$SeedIsoPath)
+    $vm = Assert-LabVMOff $VMId
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    $seedDrive = @($drives | Where-Object { [string]$_.Path -eq $SeedIsoPath })
+    $windowsDrive = @($drives | Where-Object { [string]$_.Path -eq $WindowsIsoPath })
+    if ($seedDrive.Count -ne 1 -or $windowsDrive.Count -ne 1) {
+        throw "'$($vm.Name)': could not find exactly one DVD drive attached to each of the seed ISO and the Windows ISO (found $($seedDrive.Count) matching the seed path, $($windowsDrive.Count) matching the Windows ISO path). Check the drives manually in Hyper-V Manager."
+    }
+    # The seed drive (its job was only to deliver the unattend answer file/first-boot script) is
+    # removed entirely. The installer drive is only ejected, keeping the drive itself in place --
+    # matching Remove-LabVMInstallMedia's own "the drive itself stays" behavior.
+    Remove-VMDvdDrive -VMDvdDrive $seedDrive[0] -Confirm:$false -ErrorAction Stop
+    Set-VMDvdDrive -VMDvdDrive $windowsDrive[0] -Path $null -Confirm:$false -ErrorAction Stop
+    Set-LabVMBootOrder $VMId 'Disk'
+}
+
 function Format-LabBootEntry {
     param($Entry)
     $kind = Get-LabBootEntryKind $Entry

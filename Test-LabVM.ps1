@@ -60,7 +60,7 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Set-LabVMInstallMedia', 'Remove-LabVMInstallMedia', 'Set-LabVMBootOrder', 'Get-LabProperty',
     'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
     'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope',
-    'New-LabPatchedBootableIso')
+    'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -390,6 +390,16 @@ function Set-VMDvdDrive {
     $script:SetVMDvdDriveCalls.Add($Path)
     $VMDvdDrive.Path = $Path
 }
+# Fake for Remove-VMDvdDrive (Task 3): removes the drive object from the fake VM's drive list
+# entirely, matching the real cmdlet's "the drive itself is gone" behavior (unlike Set-VMDvdDrive
+# -Path $null, which only ejects the media and keeps the drive).
+$script:RemoveVMDvdDriveCalls = [Collections.Generic.List[object]]::new()
+function Remove-VMDvdDrive {
+    [CmdletBinding()]
+    param($VMDvdDrive, [switch]$Confirm)
+    $script:RemoveVMDvdDriveCalls.Add($VMDvdDrive)
+    [void]$script:FakeDvdDrives.Remove($VMDvdDrive)
+}
 
 Test-Case 'Get-LabVMInstallMediaPath is scoped by VM GUID' {
     $id = [guid]'55555555-5555-5555-5555-555555555555'
@@ -540,6 +550,130 @@ Test-Case 'Set-LabVMBootOrder backward compatibility: bare VM-prefixed devices s
     Assert-Equal ($applied[0] -is [VMDvdDrive]) $true
     Assert-Equal ($applied[1] -is [VMNetworkAdapter]) $true
     Assert-Equal ($applied[2] -is [VMHardDiskDrive]) $true
+}
+
+# --- Two-drive unattended-install media attach and post-install cleanup (Task 3) ---
+Test-Case 'Set-LabVMUnattendedInstallMedia attaches both drives in order and sets DVD boot order' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Dvd'))
+    $windowsIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-win-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($windowsIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Set-LabVMUnattendedInstallMedia $script:FakeId $windowsIso $seedIso
+        Assert-Equal $script:AddVMDvdDriveCalls 2
+        Assert-Equal $script:FakeDvdDrives.Count 2
+        Assert-Equal $script:FakeDvdDrives[0].Path $windowsIso
+        Assert-Equal $script:FakeDvdDrives[1].Path $seedIso
+        Assert-Equal ($script:SetVMDvdDriveCalls -join '|') "$windowsIso|$seedIso"
+        Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
+        $applied = @($script:SetVMFirmwareBootOrderCalls[0])
+        Assert-Equal (Get-LabBootEntryKind $applied[0]) 'Dvd'
+    } finally {
+        [IO.File]::Delete($windowsIso)
+        [IO.File]::Delete($seedIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Set-LabVMUnattendedInstallMedia refuses a VM that already has a DVD drive, before any mutation' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $windowsIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-win-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($windowsIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Assert-Throws { Set-LabVMUnattendedInstallMedia $script:FakeId $windowsIso $seedIso } 'DVD drive'
+        Assert-Equal $script:AddVMDvdDriveCalls 0
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+    } finally {
+        [IO.File]::Delete($windowsIso)
+        [IO.File]::Delete($seedIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Set-LabVMUnattendedInstallMedia refuses a Generation 1 VM, before any mutation' {
+    $script:FakeVM.Generation = 1
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $windowsIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-win-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($windowsIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Assert-Throws { Set-LabVMUnattendedInstallMedia $script:FakeId $windowsIso $seedIso } 'Generation'
+        Assert-Equal $script:AddVMDvdDriveCalls 0
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+    } finally {
+        $script:FakeVM.Generation = 2
+        [IO.File]::Delete($windowsIso)
+        [IO.File]::Delete($seedIso)
+    }
+}
+Test-Case 'Set-LabVMUnattendedInstallMedia leaves the Windows drive attached, unrolled back, when the seed ISO fails re-validation' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $windowsIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-win-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($windowsIso, [byte[]]@(1, 2, 3))
+    $missingSeedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-missing-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        Assert-Throws { Set-LabVMUnattendedInstallMedia $script:FakeId $windowsIso $missingSeedIso } 'no longer exists'
+        # Proves the ordering: the Windows drive (drive 1) was already added and attached before the
+        # seed ISO's re-validation ran and threw -- so no cleanup/rollback happens here.
+        Assert-Equal $script:AddVMDvdDriveCalls 1
+        Assert-Equal $script:FakeDvdDrives.Count 1
+        Assert-Equal $script:FakeDvdDrives[0].Path $windowsIso
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+        Assert-Equal $script:SetVMDvdDriveCalls[0] $windowsIso
+    } finally {
+        [IO.File]::Delete($windowsIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Complete-LabWindowsProvisioning removes the seed drive and ejects (not removes) the installer drive' {
+    $windowsIso = 'D:\iso\win.iso'
+    $seedIso = 'D:\iso\seed.iso'
+    $script:FakeDvdDrives.Clear()
+    $windowsDrive = [pscustomobject]@{ Path = $windowsIso }
+    $seedDrive = [pscustomobject]@{ Path = $seedIso }
+    $script:FakeDvdDrives.Add($windowsDrive)
+    $script:FakeDvdDrives.Add($seedDrive)
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:RemoveVMDvdDriveCalls.Clear()
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Dvd'), (New-FakeBootEntry 'Disk'))
+    Complete-LabWindowsProvisioning $script:FakeId $windowsIso $seedIso
+    Assert-Equal $script:RemoveVMDvdDriveCalls.Count 1
+    Assert-Equal ([object]::ReferenceEquals($script:RemoveVMDvdDriveCalls[0], $seedDrive)) $true
+    Assert-Equal $script:FakeDvdDrives.Count 1
+    Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+    Assert-Equal $script:SetVMDvdDriveCalls[0] ''
+    Assert-Equal $windowsDrive.Path ''
+    Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
+    $applied = @($script:SetVMFirmwareBootOrderCalls[0])
+    Assert-Equal (Get-LabBootEntryKind $applied[0]) 'Disk'
+}
+Test-Case 'Complete-LabWindowsProvisioning throws clearly when neither known ISO path matches an attached drive' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'D:\iso\other1.iso' })
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'D:\iso\other2.iso' })
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:RemoveVMDvdDriveCalls.Clear()
+    try {
+        Assert-Throws { Complete-LabWindowsProvisioning $script:FakeId 'D:\iso\win.iso' 'D:\iso\seed.iso' } 'could not find'
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+        Assert-Equal $script:RemoveVMDvdDriveCalls.Count 0
+    } finally {
+        $script:FakeDvdDrives.Clear()
+    }
 }
 
 Test-Case 'New VM name must start with LAB-' { Assert-Equal (Test-LabNewVMName 'OTHER-Test' @()) $false }
