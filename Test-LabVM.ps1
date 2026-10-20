@@ -61,7 +61,7 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
     'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope',
     'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning',
-    'New-LabWindowsAnswerFileXml')
+    'New-LabWindowsAnswerFileXml', 'Wait-LabPSDirectSession')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -848,6 +848,76 @@ Test-Case 'Configured SSH settings select the SFTP adapter' {
 Test-Case 'No SSH settings select the PSDirect adapter' {
     $script:FakeSshSettings = $null
     Assert-Equal (Get-LabTransferAdapterKind $script:FakeId) 'PSDirect'
+}
+
+# --- Windows unattended install, Task 5: PowerShell Direct completion wait and note delivery ---
+# Write-LabProvisioningNote is loaded with its PSSession parameter type loosened, same as the
+# transfer engine functions below, so a fake session object can stand in for a real
+# PowerShell Direct connection. Wait-LabPSDirectSession takes no PSSession parameter, so it is
+# loaded normally via the main allowlist above.
+foreach ($name in @('Write-LabProvisioningNote')) {
+    $matches = @($definitions | Where-Object { $_.Name -ceq $name })
+    if ($matches.Count -ne 1) { throw "Expected one definition of $name." }
+    . ([scriptblock]::Create($matches[0].Extent.Text.Replace('[System.Management.Automation.Runspaces.PSSession]$Session', '$Session')))
+}
+
+# New-LabPSDirectSession (the already-shipped, already-tested building block the real function
+# reuses) is replaced here so no real Hyper-V / PowerShell Direct connection is attempted.
+# $script:PSDirectFailuresBeforeSuccess failures are thrown before an "Opened" session is handed
+# back; $script:PSDirectAlwaysFails models a guest that never becomes reachable within the test's
+# timeout. Start-Sleep is a no-op so these tests run in real wall-clock milliseconds, not minutes --
+# the one exception is the timeout test, which relies on the function's own real
+# [Diagnostics.Stopwatch] to end the loop, so it genuinely takes about as long as its own
+# $TimeoutSeconds.
+$script:PSDirectAttempts = 0
+$script:PSDirectFailuresBeforeSuccess = 0
+$script:PSDirectAlwaysFails = $false
+function New-LabPSDirectSession {
+    param($VMId, $Credential)
+    $script:PSDirectAttempts++
+    if ($script:PSDirectAlwaysFails -or $script:PSDirectAttempts -le $script:PSDirectFailuresBeforeSuccess) {
+        throw 'simulated: guest not ready to accept PowerShell Direct connections yet'
+    }
+    return [pscustomobject]@{ State = 'Opened' }
+}
+$script:SleepCalls = 0
+function Start-Sleep { param([int]$Seconds) $script:SleepCalls++ }
+
+Test-Case 'Wait-LabPSDirectSession retries past early failures, sleeping between attempts, and returns the opened session' {
+    $script:PSDirectAttempts = 0; $script:PSDirectFailuresBeforeSuccess = 2; $script:PSDirectAlwaysFails = $false
+    $script:SleepCalls = 0
+    $session = Wait-LabPSDirectSession $script:FakeId $null 60
+    Assert-Equal $session.State 'Opened'
+    Assert-Equal ($script:PSDirectAttempts -ge 3) $true
+    Assert-Equal ($script:SleepCalls -ge 2) $true
+}
+Test-Case 'Wait-LabPSDirectSession times out with a clear message once its own stopwatch runs out' {
+    $script:PSDirectAttempts = 0; $script:PSDirectFailuresBeforeSuccess = 0; $script:PSDirectAlwaysFails = $true
+    $script:SleepCalls = 0
+    $realWatch = [Diagnostics.Stopwatch]::StartNew()
+    # 6>$null discards this fast-spinning fake's hundreds of per-attempt Write-Host progress lines;
+    # production use (seconds between real attempts) never produces output anywhere near this volume.
+    Assert-Throws { Wait-LabPSDirectSession $script:FakeId $null 1 6>$null } 'Timed out'
+    $realElapsedSeconds = $realWatch.Elapsed.TotalSeconds
+    # The function's own 1-second budget, not this fast-spinning fake's retry count, bounds how
+    # long the real stopwatch runs; a generous ceiling keeps this robust on a loaded CI box.
+    Assert-Equal ($realElapsedSeconds -lt 15) $true
+    Assert-Equal ($script:PSDirectAttempts -gt 1) $true
+}
+
+$script:NoteInvokeArgs = $null
+function Invoke-Command {
+    [CmdletBinding()]
+    param($Session, [scriptblock]$ScriptBlock, [object[]]$ArgumentList)
+    $script:NoteInvokeArgs = [pscustomobject]@{ Session = $Session; ScriptBlock = $ScriptBlock; ArgumentList = $ArgumentList }
+}
+Test-Case 'Write-LabProvisioningNote invokes a script block that reads the guest Desktop, carrying the exact content through' {
+    $script:NoteInvokeArgs = $null
+    $fakeSession = [pscustomobject]@{ State = 'Opened' }
+    Write-LabProvisioningNote $fakeSession 'hello from the host'
+    Assert-Equal $script:NoteInvokeArgs.Session.State 'Opened'
+    Assert-Equal ($script:NoteInvokeArgs.ScriptBlock.ToString().Contains("GetFolderPath('Desktop')")) $true
+    Assert-Equal $script:NoteInvokeArgs.ArgumentList[0] 'hello from the host'
 }
 
 # --- Transfer engine (Copy-LabTransferItem) against a local temp tree ---

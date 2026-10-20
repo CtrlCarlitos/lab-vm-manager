@@ -827,5 +827,17 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('[Runtime.InteropServices.Marshal]', body)
 
+    # --- Windows unattended install, Task 5: PowerShell Direct completion wait and note delivery ---
+    def test_psdirect_wait_functions_exist(self):
+        for name in ['Wait-LabPSDirectSession', 'Write-LabProvisioningNote']:
+            self.assertIn('function ' + name + ' {', self.s)
+    def test_psdirect_wait_has_bounded_timeout(self):
+        body = self.s.split('function Wait-LabPSDirectSession {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Stopwatch', body)
+        self.assertIn('throw', body)
+    def test_provisioning_note_reads_guest_desktop(self):
+        body = self.s.split('function Write-LabProvisioningNote {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("GetFolderPath('Desktop')", body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
