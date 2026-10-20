@@ -814,5 +814,18 @@ class SourceContract(unittest.TestCase):
         self.assertIn("-Path $null", body)
         self.assertIn('Remove-VMDvdDrive', body)
 
+    # --- Windows unattended install, Task 4: Autounattend.xml content builder ---
+    def test_answer_file_builder_exists(self):
+        self.assertIn('function New-LabWindowsAnswerFileXml', self.s)
+    def test_answer_file_no_product_key(self):
+        body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn('ProductKey', body)
+    def test_answer_file_single_logon(self):
+        body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('LogonCount', body)
+    def test_answer_file_password_scoped(self):
+        body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('[Runtime.InteropServices.Marshal]', body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
