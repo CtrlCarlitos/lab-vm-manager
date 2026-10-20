@@ -9,6 +9,11 @@
     One test launches Lab-VM.ps1 in a child powershell.exe with transfer-only
     parameters and no direction switch, which exits at the invocation gate
     before host checks, logging or the UI.
+    The Hyper-V shape drift guard launches one more child powershell.exe that
+    imports the Hyper-V module only to read its type metadata by reflection
+    (no cmdlet is called, no VM is touched, no elevation is needed) and
+    compares it with the fakes in this file and the calls in Lab-VM.ps1. It is
+    skipped when the Hyper-V module is not installed.
     Run without administrator privileges. This is not a Hyper-V integration test.
 #>
 [CmdletBinding()]
@@ -133,25 +138,37 @@ Test-Case 'Paused VM is not Off' {
 }
 # --- Boot profile (Task 3): Secure Boot template + vTPM/key-protector preparation ---
 # Fakes for the Hyper-V cmdlets Set-LabVMBootProfile and Test-LabVMHasKeyProtector call. No real
-# Hyper-V cmdlet is invoked by these tests. Get-VMKeyProtector mirrors the real cmdlet: a VM with
-# no key protector configured returns a zero-length RawKeyProtector, never $null.
-$script:FakeFirmware = [pscustomobject]@{ SecureBootTemplate = 'MicrosoftWindows'; BootOrder = @() }
+# Hyper-V cmdlet is invoked by these tests.
+# Get-VMKeyProtector mirrors the REAL cmdlet's shape, confirmed by reflection against the installed
+# Hyper-V module (and re-checked by the drift guard at the end of this file): it writes ONE bare
+# System.Byte[] to the pipeline, un-enumerated (Cmdlet.WriteObject(object)), with no wrapper object.
+# Write-Output -NoEnumerate reproduces that; a plain 'return $bytes' would enumerate it byte by byte.
+# The absent form defaults to the reported 4-byte header 0,0,0,4; tests override it via
+# $script:FakeKeyProtectorBytes ($null = use the default for FakeHasKeyProtector).
+$script:FakeFirmware = [pscustomobject]@{ SecureBoot = 'On'; SecureBootTemplate = 'MicrosoftWindows'; BootOrder = @() }
 $script:FakeHasKeyProtector = $false
+$script:FakeKeyProtectorBytes = $null
+$script:FakeKeyProtectorThrows = $false
 $script:SetVMFirmwareCalls = [Collections.Generic.List[string]]::new()
+$script:SetVMFirmwareSecureBootCalls = [Collections.Generic.List[string]]::new()
 $script:SetVMFirmwareBootOrderCalls = [Collections.Generic.List[object]]::new()
 $script:SetVMKeyProtectorCalls = 0
 $script:EnableVMTPMCalls = 0
 function Get-VMFirmware {
     [CmdletBinding()]
-    param($VM, [switch]$Confirm)
+    param($VM)
     return $script:FakeFirmware
 }
 function Set-VMFirmware {
     [CmdletBinding()]
-    param($VM, [string]$SecureBootTemplate, [object[]]$BootOrder, [switch]$Confirm)
+    param($VM, [string]$SecureBootTemplate, [string]$EnableSecureBoot, [object[]]$BootOrder, [switch]$Confirm)
     if ($PSBoundParameters.ContainsKey('SecureBootTemplate')) {
         $script:SetVMFirmwareCalls.Add($SecureBootTemplate)
         $script:FakeFirmware.SecureBootTemplate = $SecureBootTemplate
+    }
+    if ($PSBoundParameters.ContainsKey('EnableSecureBoot')) {
+        $script:SetVMFirmwareSecureBootCalls.Add($EnableSecureBoot)
+        $script:FakeFirmware.SecureBoot = $EnableSecureBoot
     }
     if ($PSBoundParameters.ContainsKey('BootOrder')) {
         $script:SetVMFirmwareBootOrderCalls.Add($BootOrder)
@@ -161,8 +178,12 @@ function Set-VMFirmware {
 function Get-VMKeyProtector {
     [CmdletBinding()]
     param($VM, [switch]$Confirm)
-    $bytes = if ($script:FakeHasKeyProtector) { [byte[]]@(1, 2, 3) } else { [byte[]]@() }
-    return [pscustomobject]@{ RawKeyProtector = $bytes }
+    if ($script:FakeKeyProtectorThrows) { throw 'The operation failed: Get-VMKeyProtector (fake read failure).' }
+    # Plain assignments, not '$bytes = if (...)': an if-expression would re-collect the array as object[].
+    if ($null -ne $script:FakeKeyProtectorBytes) { [byte[]]$bytes = $script:FakeKeyProtectorBytes }
+    elseif ($script:FakeHasKeyProtector) { [byte[]]$bytes = 1..1024 | ForEach-Object { $_ % 256 } }
+    else { [byte[]]$bytes = 0, 0, 0, 4 }
+    Write-Output -NoEnumerate $bytes
 }
 function Set-VMKeyProtector {
     [CmdletBinding()]
@@ -185,6 +206,52 @@ Test-Case 'Test-LabVMHasKeyProtector reads existing state without calling any mu
         Assert-Equal $script:SetVMKeyProtectorCalls 0
         Assert-Equal $script:EnableVMTPMCalls 0
     } finally { $script:FakeHasKeyProtector = $false }
+}
+Test-Case 'Test-LabVMHasKeyProtector: the real un-enumerated byte[] shape really reaches the code' {
+    # Guards the fake itself: the real cmdlet emits one byte[] object, not a stream of bytes.
+    $script:FakeHasKeyProtector = $true
+    try {
+        $raw = Get-VMKeyProtector -VM $script:FakeVM
+        Assert-Equal ($raw -is [byte[]]) $true
+        Assert-Equal $raw.Length 1024
+        Assert-Equal ($null -eq $raw.PSObject.Properties['RawKeyProtector']) $true
+    } finally { $script:FakeHasKeyProtector = $false }
+}
+Test-Case 'Test-LabVMHasKeyProtector: absent forms (4-byte header, empty, $null) all read as $false, read-only' {
+    $script:SetVMKeyProtectorCalls = 0
+    $script:EnableVMTPMCalls = 0
+    try {
+        $script:FakeHasKeyProtector = $false
+        $script:FakeKeyProtectorBytes = $null
+        Assert-Equal (Test-LabVMHasKeyProtector $script:FakeId) $false
+        $script:FakeKeyProtectorBytes = [byte[]]@()
+        Assert-Equal (Test-LabVMHasKeyProtector $script:FakeId) $false
+        $script:FakeKeyProtectorBytes = [byte[]]@(0, 0, 0, 4)
+        Assert-Equal (Test-LabVMHasKeyProtector $script:FakeId) $false
+        $script:FakeKeyProtectorBytes = $null
+        & {
+            function Get-VMKeyProtector { [CmdletBinding()] param($VM) }
+            Assert-Equal (Test-LabVMHasKeyProtector $script:FakeId) $false
+        }
+        Assert-Equal $script:SetVMKeyProtectorCalls 0
+        Assert-Equal $script:EnableVMTPMCalls 0
+    } finally { $script:FakeKeyProtectorBytes = $null; $script:FakeHasKeyProtector = $false }
+}
+Test-Case 'Test-LabVMHasKeyProtector: a real-sized blob reads as $true, also when a caller enumerated it' {
+    try {
+        $script:FakeKeyProtectorBytes = [byte[]](1..1024 | ForEach-Object { $_ % 256 })
+        Assert-Equal (Test-LabVMHasKeyProtector $script:FakeId) $true
+        # Defensive normalization: the same bytes streamed one by one still count as present.
+        & {
+            function Get-VMKeyProtector { [CmdletBinding()] param($VM) return [byte[]](1..64) }
+            Assert-Equal (Test-LabVMHasKeyProtector $script:FakeId) $true
+        }
+    } finally { $script:FakeKeyProtectorBytes = $null }
+}
+Test-Case 'Test-LabVMHasKeyProtector: a read failure propagates (fails closed, never reads as absent)' {
+    $script:FakeKeyProtectorThrows = $true
+    try { Assert-Throws { Test-LabVMHasKeyProtector $script:FakeId } 'fake read failure' }
+    finally { $script:FakeKeyProtectorThrows = $false }
 }
 Test-Case 'Set-LabVMBootProfile rejects a Generation 1 VM before changing anything' {
     $script:FakeVM.Generation = 1
@@ -233,17 +300,75 @@ Test-Case 'Set-LabVMBootProfile applies the Ubuntu Secure Boot template without 
     Assert-Equal $script:SetVMKeyProtectorCalls 0
     Assert-Equal $script:EnableVMTPMCalls 0
 }
+Test-Case 'Set-LabVMBootProfile turns Secure Boot on when it is Off, for both profiles' {
+    foreach ($osProfileName in @('Windows11', 'UbuntuDesktop')) {
+        $script:FakeFirmware.SecureBoot = 'Off'
+        $script:FakeHasKeyProtector = $true
+        $script:SetVMFirmwareSecureBootCalls.Clear()
+        $script:SetVMKeyProtectorCalls = 0
+        try {
+            $result = Set-LabVMBootProfile $script:FakeId $osProfileName
+            Assert-Equal $script:SetVMFirmwareSecureBootCalls.Count 1
+            Assert-Equal $script:SetVMFirmwareSecureBootCalls[0] 'On'
+            Assert-Equal $script:FakeFirmware.SecureBoot 'On'
+            Assert-Equal $result.SecureBootEnabled $true
+            Assert-Equal $script:SetVMKeyProtectorCalls 0
+        } finally { $script:FakeFirmware.SecureBoot = 'On'; $script:FakeHasKeyProtector = $false }
+    }
+}
+Test-Case 'Set-LabVMBootProfile leaves Secure Boot alone when it is already On, for both profiles' {
+    foreach ($osProfileName in @('Windows11', 'UbuntuDesktop')) {
+        $script:FakeFirmware.SecureBoot = 'On'
+        $script:SetVMFirmwareSecureBootCalls.Clear()
+        try {
+            $result = Set-LabVMBootProfile $script:FakeId $osProfileName
+            Assert-Equal $script:SetVMFirmwareSecureBootCalls.Count 0
+            Assert-Equal $result.SecureBootEnabled $false
+        } finally { $script:FakeHasKeyProtector = $false }
+    }
+}
+Test-Case 'Set-LabVMBootProfile does not turn Secure Boot on for a Generation 1 VM' {
+    $script:FakeVM.Generation = 1
+    $script:FakeFirmware.SecureBoot = 'Off'
+    $script:SetVMFirmwareSecureBootCalls.Clear()
+    try {
+        Assert-Throws { Set-LabVMBootProfile $script:FakeId 'UbuntuDesktop' } 'Generation'
+        Assert-Equal $script:SetVMFirmwareSecureBootCalls.Count 0
+    } finally { $script:FakeVM.Generation = 2; $script:FakeFirmware.SecureBoot = 'On' }
+}
 
 # --- DVD media attach/eject and generic boot-order control (Task 4) ---
 # Fakes for Add-VMDvdDrive/Get-VMDvdDrive/Set-VMDvdDrive. No real Hyper-V cmdlet is invoked. Each
 # fake DVD-drive object is a mutable pscustomobject, so Set-VMDvdDrive's in-place Path update is
 # visible to a caller still holding the object Get-VMDvdDrive returned, same as on a live VM.
-# Minimal stand-ins for the real device classes Get-VMFirmware's BootOrder returns on a live Gen2
-# VM (VMDvdDrive/VMHardDiskDrive/VMNetworkAdapter); Set-LabVMBootOrder tells entries apart by
-# $_.GetType().Name, which these classes supply without needing the Hyper-V module loaded.
+# Stand-ins for the REAL Get-VMFirmware BootOrder shape, confirmed by reflection against the installed
+# Hyper-V module (and re-checked by the drift guard at the end of this file): BootOrder is a
+# Microsoft.HyperV.PowerShell.VMBootSource[] whose Device property holds the device, and the DVD/disk
+# device classes are named DvdDrive and HardDiskDrive -- with NO 'VM' prefix. These classes supply
+# the same short type names without the Hyper-V module loaded, so the primary fixtures below are
+# VMBootSource{ Device = DvdDrive/HardDiskDrive/VMNetworkAdapter }, exactly the shape the suffix match
+# in Get-LabBootEntryKind exists for. VMDvdDrive/VMHardDiskDrive are kept ONLY for the
+# backward-compatibility cases (a bare or VM-prefixed device), not as the primary shape.
+class DvdDrive {}
+class HardDiskDrive {}
+class VMNetworkAdapter {}
 class VMDvdDrive {}
 class VMHardDiskDrive {}
-class VMNetworkAdapter {}
+class VMBootSource {
+    [string]$BootType
+    [string]$Description
+    [string]$FirmwarePath
+    [object]$Device
+    VMBootSource([string]$BootType, [object]$Device) { $this.BootType = $BootType; $this.Device = $Device }
+}
+function New-FakeBootEntry {
+    param([ValidateSet('Dvd', 'Disk', 'Nic')][string]$Kind)
+    switch ($Kind) {
+        'Dvd' { return [VMBootSource]::new('Drive', [DvdDrive]::new()) }
+        'Disk' { return [VMBootSource]::new('Drive', [HardDiskDrive]::new()) }
+        'Nic' { return [VMBootSource]::new('Network', [VMNetworkAdapter]::new()) }
+    }
+}
 $script:FakeDvdDrives = [Collections.Generic.List[object]]::new()
 $script:AddVMDvdDriveCalls = 0
 $script:SetVMDvdDriveCalls = [Collections.Generic.List[object]]::new()
@@ -255,7 +380,7 @@ function Add-VMDvdDrive {
 }
 function Get-VMDvdDrive {
     [CmdletBinding()]
-    param($VM, [switch]$Confirm)
+    param($VM)
     return @($script:FakeDvdDrives)
 }
 function Set-VMDvdDrive {
@@ -360,7 +485,52 @@ Test-Case 'Remove-LabVMInstallMedia ejects without removing the drive' {
     Assert-Equal $script:SetVMDvdDriveCalls.Count 1
     Assert-Equal $script:SetVMDvdDriveCalls[0] ''
 }
-Test-Case 'Set-LabVMBootOrder reorders without dropping entries' {
+Test-Case 'Set-LabVMInstallMedia re-validates the ISO before adding a drive or writing the record' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $tempLocal = Join-Path ([IO.Path]::GetTempPath()) ('labinstallmedia-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $emptyIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-empty-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($emptyIso, [byte[]]@())
+    $missingIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-missing-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $tempLocal
+        Assert-Throws { Set-LabVMInstallMedia $script:FakeId $missingIso } 'no longer exists'
+        Assert-Throws { Set-LabVMInstallMedia $script:FakeId $emptyIso } 'is empty'
+        Assert-Equal $script:AddVMDvdDriveCalls 0
+        Assert-Equal $script:FakeDvdDrives.Count 0
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+        Assert-Equal ([IO.File]::Exists((Get-LabVMInstallMediaPath $script:FakeId))) $false
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($tempLocal)) { [IO.Directory]::Delete($tempLocal, $true) }
+        [IO.File]::Delete($emptyIso)
+    }
+}
+Test-Case 'Set-LabVMBootOrder reorders real-shape VMBootSource{DvdDrive} entries without dropping any' {
+    $nic = New-FakeBootEntry 'Nic'; $hdd = New-FakeBootEntry 'Disk'; $dvd = New-FakeBootEntry 'Dvd'
+    $script:FakeFirmware.BootOrder = @($nic, $hdd, $dvd)
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    Set-LabVMBootOrder $script:FakeId 'Dvd'
+    $applied = @($script:SetVMFirmwareBootOrderCalls[-1])
+    Assert-Equal $applied.Count 3
+    Assert-Equal ([object]::ReferenceEquals($applied[0], $dvd)) $true
+    Assert-Equal ([object]::ReferenceEquals($applied[1], $nic)) $true
+    Assert-Equal ([object]::ReferenceEquals($applied[2], $hdd)) $true
+}
+Test-Case 'Set-LabVMBootOrder preference Disk puts the real-shape HardDiskDrive entry first' {
+    $dvd = New-FakeBootEntry 'Dvd'; $nic = New-FakeBootEntry 'Nic'; $hdd = New-FakeBootEntry 'Disk'
+    $script:FakeFirmware.BootOrder = @($dvd, $nic, $hdd)
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    Set-LabVMBootOrder $script:FakeId 'Disk'
+    $applied = @($script:SetVMFirmwareBootOrderCalls[-1])
+    Assert-Equal $applied.Count 3
+    Assert-Equal ([object]::ReferenceEquals($applied[0], $hdd)) $true
+    Assert-Equal ([object]::ReferenceEquals($applied[1], $dvd)) $true
+    Assert-Equal ([object]::ReferenceEquals($applied[2], $nic)) $true
+}
+Test-Case 'Set-LabVMBootOrder backward compatibility: bare VM-prefixed devices still reorder' {
     $script:FakeFirmware.BootOrder = @([VMNetworkAdapter]::new(), [VMHardDiskDrive]::new(), [VMDvdDrive]::new())
     $script:SetVMFirmwareBootOrderCalls.Clear()
     Set-LabVMBootOrder $script:FakeId 'Dvd'
@@ -369,16 +539,6 @@ Test-Case 'Set-LabVMBootOrder reorders without dropping entries' {
     Assert-Equal ($applied[0] -is [VMDvdDrive]) $true
     Assert-Equal ($applied[1] -is [VMNetworkAdapter]) $true
     Assert-Equal ($applied[2] -is [VMHardDiskDrive]) $true
-}
-Test-Case 'Set-LabVMBootOrder preference Disk puts the hard drive first' {
-    $script:FakeFirmware.BootOrder = @([VMDvdDrive]::new(), [VMNetworkAdapter]::new(), [VMHardDiskDrive]::new())
-    $script:SetVMFirmwareBootOrderCalls.Clear()
-    Set-LabVMBootOrder $script:FakeId 'Disk'
-    $applied = @($script:SetVMFirmwareBootOrderCalls[-1])
-    Assert-Equal $applied.Count 3
-    Assert-Equal ($applied[0] -is [VMHardDiskDrive]) $true
-    Assert-Equal ($applied[1] -is [VMDvdDrive]) $true
-    Assert-Equal ($applied[2] -is [VMNetworkAdapter]) $true
 }
 
 Test-Case 'New VM name must start with LAB-' { Assert-Equal (Test-LabNewVMName 'OTHER-Test' @()) $false }
@@ -1985,23 +2145,27 @@ function Get-VHD {
 }
 function Get-VMSecurity { [CmdletBinding()] param($VM) return [pscustomobject]@{ TpmEnabled = $script:FakeTpmEnabled } }
 function Get-LabMutationCount {
-    return $script:SetVMFirmwareCalls.Count + $script:SetVMFirmwareBootOrderCalls.Count + $script:SetVMKeyProtectorCalls +
-        $script:EnableVMTPMCalls + $script:AddVMDvdDriveCalls + $script:SetVMDvdDriveCalls.Count
+    return $script:SetVMFirmwareCalls.Count + $script:SetVMFirmwareSecureBootCalls.Count + $script:SetVMFirmwareBootOrderCalls.Count +
+        $script:SetVMKeyProtectorCalls + $script:EnableVMTPMCalls + $script:AddVMDvdDriveCalls + $script:SetVMDvdDriveCalls.Count
 }
 function Reset-LabMediaFakes {
     $script:FakeVM.State = 'Off'; $script:FakeVM.Generation = 2; $script:FakeVM.Name = 'LAB-Test'
     $script:FakeHasKeyProtector = $false
+    $script:FakeKeyProtectorBytes = $null
+    $script:FakeKeyProtectorThrows = $false
     $script:FakeTpmEnabled = $false
+    $script:FakeFirmware.SecureBoot = 'On'
     $script:FakeFirmware.SecureBootTemplate = 'MicrosoftUEFICertificateAuthority'
-    $script:FakeFirmware.BootOrder = @([VMHardDiskDrive]::new(), [VMDvdDrive]::new())
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Dvd'))
     $script:FakeDvdDrives.Clear()
     $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
     $script:FakeSnapshots = @()
     $script:FakeHardDisks = @()
     $script:FakeVhdParents = @{}
-    $script:SetVMFirmwareCalls.Clear(); $script:SetVMFirmwareBootOrderCalls.Clear()
+    $script:SetVMFirmwareCalls.Clear(); $script:SetVMFirmwareSecureBootCalls.Clear(); $script:SetVMFirmwareBootOrderCalls.Clear()
     $script:SetVMKeyProtectorCalls = 0; $script:EnableVMTPMCalls = 0
     $script:AddVMDvdDriveCalls = 0; $script:SetVMDvdDriveCalls.Clear()
+    $script:AuditRecords.Clear()
     $script:LabReadOnly = $false
 }
 function New-LabMediaTempDir {
@@ -2011,17 +2175,24 @@ function New-LabMediaTempDir {
 }
 $script:LabIsoRoot = 'C:\labmedia-test-iso-root'
 
-Test-Case 'Boot entry kind: a VMBootSource-style wrapper is classified by its Device' {
+Test-Case 'Boot entry kind: the real VMBootSource{Device=DvdDrive/HardDiskDrive} shape is classified by its Device' {
+    Assert-Equal (Get-LabBootEntryKind (New-FakeBootEntry 'Dvd')) 'Dvd'
+    Assert-Equal (Get-LabBootEntryKind (New-FakeBootEntry 'Disk')) 'Disk'
+    Assert-Equal (Get-LabBootEntryKind (New-FakeBootEntry 'Nic')) 'Other'
+    # The wrapper's own type name must never be what decides it.
+    Assert-Equal (Get-LabBootEntryKind ([VMBootSource]::new('File', $null))) 'Other'
+}
+Test-Case 'Boot entry kind: backward compatibility with bare and VM-prefixed devices' {
     Assert-Equal (Get-LabBootEntryKind ([pscustomobject]@{ BootType = 'Drive'; Device = [VMDvdDrive]::new() })) 'Dvd'
     Assert-Equal (Get-LabBootEntryKind ([pscustomobject]@{ BootType = 'Drive'; Device = [VMHardDiskDrive]::new() })) 'Disk'
-    Assert-Equal (Get-LabBootEntryKind ([pscustomobject]@{ BootType = 'Network'; Device = [VMNetworkAdapter]::new() })) 'Other'
     Assert-Equal (Get-LabBootEntryKind ([VMDvdDrive]::new())) 'Dvd'
+    Assert-Equal (Get-LabBootEntryKind ([DvdDrive]::new())) 'Dvd'
 }
 Test-Case 'Set-LabVMBootOrder reorders wrapper entries and passes the original wrappers back' {
     Reset-LabMediaFakes
     $nic = [pscustomobject]@{ BootType = 'Network'; Device = [VMNetworkAdapter]::new() }
-    $hdd = [pscustomobject]@{ BootType = 'Drive'; Device = [VMHardDiskDrive]::new() }
-    $dvd = [pscustomobject]@{ BootType = 'Drive'; Device = [VMDvdDrive]::new() }
+    $hdd = [pscustomobject]@{ BootType = 'Drive'; Device = [HardDiskDrive]::new() }
+    $dvd = [pscustomobject]@{ BootType = 'Drive'; Device = [DvdDrive]::new() }
     $script:FakeFirmware.BootOrder = @($nic, $hdd, $dvd)
     Set-LabVMBootOrder $script:FakeId 'Dvd'
     $applied = @($script:SetVMFirmwareBootOrderCalls[-1])
@@ -2032,9 +2203,74 @@ Test-Case 'Set-LabVMBootOrder reorders wrapper entries and passes the original w
 }
 Test-Case 'Set-LabVMBootOrder fails loudly, without writing, when no matching entry is recognized' {
     Reset-LabMediaFakes
-    $script:FakeFirmware.BootOrder = @([VMHardDiskDrive]::new(), [VMNetworkAdapter]::new())
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Nic'))
     Assert-Throws { Set-LabVMBootOrder $script:FakeId 'Dvd' } 'no Dvd entry was recognized'
     Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 0
+}
+Test-Case 'Media preview: Secure Boot Off is shown as Off -> On, never as "already matches"' {
+    Reset-LabMediaFakes
+    $script:FakeFirmware.SecureBoot = 'Off'
+    $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'UbuntuDesktop' 'C:\x.iso'
+    Assert-Equal $preview.SecureBootState 'Off'
+    Assert-Equal $preview.BootProfileChanges.Count 1
+    Assert-Equal $preview.BootProfileChanges[0] 'Secure Boot: Off -> On.'
+    Assert-Equal (Get-LabMutationCount) 0
+    $script:FakeFirmware.SecureBoot = 'On'
+    $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'UbuntuDesktop' 'C:\x.iso'
+    Assert-Equal $preview.BootProfileChanges.Count 0
+}
+Test-Case 'Media preview: one DVD drive with no recognizable boot entry is detected up front, read-only' {
+    Reset-LabMediaFakes
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Nic'))
+    $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'UbuntuDesktop' 'C:\x.iso'
+    Assert-Equal $preview.DvdDriveCount 1
+    Assert-Equal $preview.DvdBootEntryRecognized $false
+    Reset-LabMediaFakes
+    $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'UbuntuDesktop' 'C:\x.iso'
+    Assert-Equal $preview.DvdBootEntryRecognized $true
+    # No drive yet: the entry cannot exist, so it is not pre-judged; the plan says when it is checked.
+    $script:FakeDvdDrives.Clear()
+    $preview = Get-LabVMInstallationMediaPreview $script:FakeId 'UbuntuDesktop' 'C:\x.iso'
+    Assert-Equal $preview.DvdBootEntryRecognized $null
+    Assert-Equal ($preview.DvdPlan -match 'verified at the last step') $true
+    Assert-Equal (Get-LabMutationCount) 0
+}
+Test-Case 'Media attach: one DVD drive without a recognizable boot entry is refused before any change' {
+    Reset-LabMediaFakes
+    $script:FakeFirmware.SecureBoot = 'Off'
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Nic'))
+    & {
+        $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('A', '1'))
+        function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+        function Select-LabIsoPath { param([string]$IsoRoot) return 'C:\labmedia-test\win.iso' }
+        function Read-LabYesNoCancel { throw 'TRIPWIRE: confirmation requested although the DVD entry is unrecognizable.' }
+        foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+        $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+        Assert-Equal $out.Count 1
+        Assert-Equal $out[0] 'CANCELLED'
+    }
+    Assert-Equal (Get-LabMutationCount) 0
+    Assert-Equal $script:FakeHasKeyProtector $false
+    Assert-Equal $script:FakeFirmware.SecureBoot 'Off'
+    Assert-Equal $script:AuditRecords.Count 0
+}
+Test-Case 'Media inspect: a Get-VMKeyProtector read failure is reported, not fatal, and the boot order still prints' {
+    Reset-LabMediaFakes
+    $script:FakeKeyProtectorThrows = $true
+    $savedLocal = $env:LOCALAPPDATA
+    $dir = New-LabMediaTempDir
+    try {
+        $env:LOCALAPPDATA = $dir
+        $text = @(Show-LabVMInstallMediaConfiguration $script:FakeId 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+        Assert-Equal ($text -match 'Key protector configured: unknown') $true
+        Assert-Equal ($text -match 'Firmware boot order') $true
+        Assert-Equal ($text -match 'Dvd \[DvdDrive\]') $true
+        Assert-Equal (Get-LabMutationCount) 0
+    } finally {
+        $script:FakeKeyProtectorThrows = $false
+        $env:LOCALAPPDATA = $savedLocal
+        [IO.Directory]::Delete($dir, $true)
+    }
 }
 Test-Case 'Media preview: existing key protector and a checkpoint are reported without any mutation' {
     Reset-LabMediaFakes
@@ -2164,7 +2400,7 @@ Test-Case 'Media attach: after confirmation applies boot profile, then media, th
         function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
         function Select-LabIsoPath { param([string]$IsoRoot) return 'C:\labmedia-test\win.iso' }
         function Read-LabYesNoCancel { param([string]$Prompt) return 'Y' }
-        function Set-LabVMBootProfile { param([guid]$VMId, [string]$OsProfile) $script:ApplyLog.Add("profile:$OsProfile"); [pscustomobject]@{ SecureBootTemplateChanged = $true; KeyProtectorAdded = $true; TpmEnabled = $true } }
+        function Set-LabVMBootProfile { param([guid]$VMId, [string]$OsProfile) $script:ApplyLog.Add("profile:$OsProfile"); [pscustomobject]@{ SecureBootTemplateChanged = $true; SecureBootEnabled = $false; KeyProtectorAdded = $true; TpmEnabled = $true } }
         function Set-LabVMInstallMedia { param([guid]$VMId, [string]$IsoPath) $script:ApplyLog.Add("media:$IsoPath"); [pscustomobject]@{ PreviousAttachment = ''; DvdDriveAdded = $false } }
         function Set-LabVMBootOrder { param([guid]$VMId, [string]$Preference) $script:ApplyLog.Add("order:$Preference") }
         foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
@@ -2196,7 +2432,19 @@ Test-Case 'Media attach end-to-end through the real apply functions: Windows11 V
         Assert-Equal $script:FakeHasKeyProtector $true
         Assert-Equal $script:EnableVMTPMCalls 1
         Assert-Equal $script:FakeDvdDrives[0].Path $iso
-        Assert-Equal ((@($script:FakeFirmware.BootOrder))[0] -is [VMDvdDrive]) $true
+        $first = (@($script:FakeFirmware.BootOrder))[0]
+        Assert-Equal ($first -is [VMBootSource]) $true
+        Assert-Equal ($first.Device -is [DvdDrive]) $true
+        # The security-relevant key-protector creation gets its own audit record, then the full outcome.
+        Assert-Equal (@($script:AuditRecords | ForEach-Object { $_.Action }) -join '|') 'add-key-protector|attach-install-media'
+        Assert-Equal $script:AuditRecords[0].Status 'COMPLETED'
+        Assert-Equal $script:AuditRecords[0].VMId ([string]$script:FakeId)
+        Assert-Contains $script:AuditRecords[0].Detail 'NewLocalKeyProtector=True'
+        Assert-Contains $script:AuditRecords[0].Detail 'VTpmEnabled=True'
+        Assert-Contains $script:AuditRecords[1].Detail 'OsProfile=Windows11'
+        Assert-Contains $script:AuditRecords[1].Detail "Iso=$iso"
+        Assert-Contains $script:AuditRecords[1].Detail 'KeyProtectorAdded=True'
+        Assert-Contains $script:AuditRecords[1].Detail 'SecureBootEnabled=False'
     } finally {
         $env:LOCALAPPDATA = $savedLocal
         [IO.Directory]::Delete($dir, $true)
@@ -2218,10 +2466,301 @@ Test-Case 'Media eject: confirmed eject clears the media; nothing attached is NO
         Assert-Equal $second[0] 'NO_CHANGE'
         Assert-Equal $script:SetVMDvdDriveCalls.Count 1
     }
+    Assert-Equal $script:AuditRecords.Count 1
+    Assert-Equal $script:AuditRecords[0].Action 'eject-install-media'
+    Assert-Contains $script:AuditRecords[0].Detail 'Ejected=E:\ISO\a.iso'
+}
+Test-Case 'Media attach: Ubuntu on a VM with Secure Boot Off turns it on and audits without a key-protector record' {
+    Reset-LabMediaFakes
+    $script:FakeFirmware.SecureBoot = 'Off'
+    $dir = New-LabMediaTempDir
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $dir
+        $iso = Join-Path $dir 'ubuntu.iso'
+        [IO.File]::WriteAllBytes($iso, [byte[]]@(1, 2, 3))
+        & {
+            $script:Answers = [Collections.Generic.Queue[string]]::new([string[]]@('A', '2'))
+            $script:TestIso = $iso
+            function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+            function Select-LabIsoPath { param([string]$IsoRoot) return $script:TestIso }
+            function Read-LabYesNoCancel { param([string]$Prompt) return 'Y' }
+            foreach ($sb in (Import-LabRealFunction 'Set-LabVMInstallationMediaInteractive')) { . $sb }
+            $out = @(Set-LabVMInstallationMediaInteractive $script:FakeId 6>$null 3>$null)
+            Assert-Equal $out[0] 'COMPLETED'
+        }
+        Assert-Equal $script:FakeFirmware.SecureBoot 'On'
+        Assert-Equal $script:SetVMKeyProtectorCalls 0
+        Assert-Equal $script:EnableVMTPMCalls 0
+        Assert-Equal (@($script:AuditRecords | ForEach-Object { $_.Action }) -join '|') 'attach-install-media'
+        Assert-Contains $script:AuditRecords[0].Detail 'SecureBootEnabled=True'
+        Assert-Contains $script:AuditRecords[0].Detail 'KeyProtectorAdded=False'
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        [IO.Directory]::Delete($dir, $true)
+    }
 }
 Reset-LabMediaFakes
 $script:FakeDvdDrives.Clear()
 
-Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
+# --- New-LabSeedIso $Files contract (final-review fix) ---
+# The real function drives the IMAPI2FS COM object; here New-Object and Write-LabIStreamToFile are
+# replaced in a child scope, so no COM object is created and nothing is written but the function's own
+# staging directory under %TEMP%. The fake image records exactly what was staged, byte for byte.
+function Invoke-LabSeedIsoWithFakeImage {
+    param([hashtable]$Files)
+    $script:SeedComCreated = 0
+    $script:SeedStaged = @{}
+    $script:SeedStagingDir = $null
+    & {
+        function New-Object {
+            [CmdletBinding()]
+            param([string]$ComObject)
+            $script:SeedComCreated++
+            $root = [pscustomobject]@{}
+            $root | Add-Member -MemberType ScriptMethod -Name AddTree -Value {
+                param([string]$Path, [bool]$IncludeBaseDirectory)
+                $script:SeedStagingDir = $Path
+                $prefix = [IO.Path]::GetFullPath($Path).TrimEnd('\') + '\'
+                foreach ($file in [IO.Directory]::GetFiles($Path, '*', 'AllDirectories')) {
+                    $script:SeedStaged[$file.Substring($prefix.Length)] = [IO.File]::ReadAllBytes($file)
+                }
+            }
+            $image = [pscustomobject]@{ VolumeName = $null; Root = $root }
+            $image | Add-Member -MemberType ScriptMethod -Name CreateResultImage -Value { [pscustomobject]@{ ImageStream = 'fake-stream' } }
+            return $image
+        }
+        function Write-LabIStreamToFile { param($Stream, [string]$Path) }
+        foreach ($sb in (Import-LabRealFunction 'New-LabSeedIso')) { . $sb }
+        New-LabSeedIso -Files $Files -OutputPath (Join-Path ([IO.Path]::GetTempPath()) 'labseed-fake-output.iso')
+    }
+}
+Test-Case 'New-LabSeedIso: a plain string is always literal content, even when it names an existing file' {
+    $dir = New-LabMediaTempDir
+    try {
+        $existing = Join-Path $dir 'real-answer.xml'
+        [IO.File]::WriteAllText($existing, '<real/>')
+        Invoke-LabSeedIsoWithFakeImage @{ 'Autounattend.xml' = $existing; 'sub/dir/note.txt' = 'hello' }
+        Assert-Equal $script:SeedComCreated 1
+        Assert-Equal ([Text.Encoding]::UTF8.GetString($script:SeedStaged['Autounattend.xml'])) $existing
+        Assert-Equal ([Text.Encoding]::UTF8.GetString($script:SeedStaged['sub\dir\note.txt'])) 'hello'
+        Assert-Equal ([IO.Directory]::Exists($script:SeedStagingDir)) $false
+    } finally { [IO.Directory]::Delete($dir, $true) }
+}
+Test-Case 'New-LabSeedIso: @{ SourcePath } copies the file byte for byte' {
+    $dir = New-LabMediaTempDir
+    try {
+        $source = Join-Path $dir 'user-data'
+        $bytes = [byte[]]@(35, 99, 108, 111, 117, 100, 13, 10, 0, 255)
+        [IO.File]::WriteAllBytes($source, $bytes)
+        Invoke-LabSeedIsoWithFakeImage @{ 'user-data' = @{ SourcePath = $source } }
+        Assert-Equal ($script:SeedStaged['user-data'] -join ',') ($bytes -join ',')
+    } finally { [IO.Directory]::Delete($dir, $true) }
+}
+Test-Case 'New-LabSeedIso: a missing SourcePath fails clearly before any COM object or staging exists' {
+    $missing = Join-Path ([IO.Path]::GetTempPath()) ('labseed-missing-' + [guid]::NewGuid().ToString('N') + '.xml')
+    Assert-Throws { Invoke-LabSeedIsoWithFakeImage @{ 'Autounattend.xml' = @{ SourcePath = $missing } } } 'does not exist'
+    Assert-Equal $script:SeedComCreated 0
+    Assert-Equal $script:SeedStagingDir $null
+}
+Test-Case 'New-LabSeedIso: rooted, drive, colon, empty, dot and .. keys are refused before any COM object exists' {
+    foreach ($key in @('..\x.txt', 'a/../b.txt', '\x.txt', '/x.txt', 'C:\x.txt', 'C:x.txt', 'a:b.txt', 'a\\b.txt', 'a\.\b.txt', 'dir\', ' ')) {
+        Assert-Throws { Invoke-LabSeedIsoWithFakeImage @{ $key = 'content' } } 'Invalid in-image path'
+        Assert-Equal $script:SeedComCreated 0
+    }
+}
+Test-Case 'New-LabSeedIso: unsupported values and duplicate in-image paths are refused' {
+    $values = @($null, 42, [byte[]]@(1, 2), [IO.FileInfo]::new('C:\x.txt'), @{ Other = 'x' }, @{ SourcePath = 'C:\x'; Extra = 1 })
+    foreach ($value in $values) {
+        Assert-Throws { Invoke-LabSeedIsoWithFakeImage @{ 'a.txt' = $value } } 'Unsupported value'
+        Assert-Equal $script:SeedComCreated 0
+    }
+    $files = @{ 'a/b.txt' = 'one' }
+    $files['a\B.TXT'] = 'two'
+    Assert-Throws { Invoke-LabSeedIsoWithFakeImage $files } 'same file'
+    Assert-Equal $script:SeedComCreated 0
+}
+
+# --- Hyper-V shape drift guard (final-review fix) ---
+# Every fake above stands in for a real Hyper-V cmdlet, and once a fake invented an output shape
+# (Get-VMKeyProtector returning a RawKeyProtector wrapper) that no real host produces, so every test
+# passed against output that cannot exist. This guard compares the fakes and the production code's
+# Hyper-V calls with the INSTALLED Hyper-V module's own type metadata, read by .NET reflection in a
+# child powershell.exe. Reflection needs no elevation and touches no VM: the child only imports the
+# module and inspects types and IL; it never calls a Hyper-V cmdlet. This process never imports
+# Hyper-V. Skipped (not counted as a pass) when the Hyper-V module is not installed.
+$script:HyperVReflectionScript = @'
+$ErrorActionPreference = 'Stop'
+if (-not (Get-Module -ListAvailable -Name Hyper-V)) { '{"Skip":true}'; return }
+Import-Module Hyper-V
+$cmdlets = @{}
+foreach ($c in (Get-Command -Module Hyper-V -CommandType Cmdlet)) {
+    $names = [Collections.Generic.List[string]]::new()
+    foreach ($p in $c.Parameters.Values) { $names.Add($p.Name); foreach ($a in $p.Aliases) { $names.Add($a) } }
+    $cmdlets[$c.Name] = $names.ToArray()
+}
+$assemblies = @([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetName().Name -like 'Microsoft.HyperV.PowerShell*' -or $_.GetName().Name -like 'Microsoft.Vhd.PowerShell*' })
+$allTypes = foreach ($a in $assemblies) { try { $a.GetTypes() } catch { $_.Exception.Types | Where-Object { $_ } } }
+$types = @{}
+foreach ($t in $allTypes) {
+    if (-not $t.IsPublic) { continue }
+    $props = @{}
+    foreach ($p in $t.GetProperties()) { $props[$p.Name] = $p.PropertyType.FullName }
+    $types[$t.FullName] = @{ Properties = $props; EnumNames = $(if ($t.IsEnum) { [Enum]::GetNames($t) } else { @() }) }
+}
+$bf = [Reflection.BindingFlags]'Public,NonPublic,Instance,Static,DeclaredOnly'
+$cmdType = (Get-Command Get-VMKeyProtector).ImplementingType
+$calls = [Collections.Generic.List[string]]::new()
+foreach ($m in $cmdType.GetMethods($bf)) {
+    $body = $m.GetMethodBody(); if (-not $body) { continue }
+    $il = $body.GetILAsByteArray()
+    for ($i = 0; $i -lt $il.Length - 4; $i++) {
+        if ($il[$i] -in 0x28, 0x6F) {
+            try {
+                $mm = $m.Module.ResolveMethod([BitConverter]::ToInt32($il, $i + 1), $cmdType.BaseType.GetGenericArguments(), $null)
+                $ret = if ($mm -is [Reflection.MethodInfo]) { $mm.ReturnType.FullName } else { '' }
+                $calls.Add("$($m.Name)|$($mm.DeclaringType.Name)::$($mm.Name)|$ret")
+            } catch { }
+        }
+    }
+}
+$writeOverloads = [Collections.Generic.List[string]]::new()
+$x = $cmdType
+while ($x -and $x -ne [Management.Automation.PSCmdlet]) {
+    foreach ($m in ($x.GetMethods($bf) | Where-Object { $_.Name -like '*WriteObject' })) {
+        $body = $m.GetMethodBody(); if (-not $body) { continue }
+        $il = $body.GetILAsByteArray()
+        for ($i = 0; $i -lt $il.Length - 4; $i++) {
+            if ($il[$i] -in 0x28, 0x6F) {
+                try {
+                    $mm = $m.Module.ResolveMethod([BitConverter]::ToInt32($il, $i + 1))
+                    if ($mm.DeclaringType -eq [Management.Automation.Cmdlet] -and $mm.Name -eq 'WriteObject') {
+                        $writeOverloads.Add((@($mm.GetParameters() | ForEach-Object { $_.ParameterType.Name }) -join ','))
+                    }
+                } catch { }
+            }
+        }
+    }
+    $x = $x.BaseType
+}
+$rawProps = @(foreach ($t in $allTypes) { foreach ($p in $t.GetProperties($bf)) { if ($p.Name -in 'RawKeyProtector', 'RawData') { "$($t.FullName).$($p.Name)" } } })
+@{ Skip = $false; ModuleVersion = [string](Get-Module Hyper-V).Version; Cmdlets = $cmdlets; Types = $types
+   KeyProtectorCalls = $calls.ToArray(); CmdletWriteObjectOverloads = $writeOverloads.ToArray()
+   RawKeyProtectorProperties = $rawProps } | ConvertTo-Json -Depth 5 -Compress
+'@
+$script:HyperVFacts = $null
+$script:HyperVFactsError = $null
+try {
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script:HyperVReflectionScript))
+    $json = (& $exe -NoProfile -NonInteractive -EncodedCommand $encoded) -join ''
+    if ($LASTEXITCODE -ne 0) { throw "reflection child exited $LASTEXITCODE" }
+    $script:HyperVFacts = $json | ConvertFrom-Json
+} catch { $script:HyperVFactsError = $_.Exception.Message }
+function Get-HyperVType {
+    param([string]$FullName)
+    $entry = $script:HyperVFacts.Types.PSObject.Properties[$FullName]
+    if ($null -eq $entry) { throw "The installed Hyper-V module has no public type '$FullName'." }
+    return $entry.Value
+}
+function Get-HyperVTypeProperties { param([string]$FullName) return @((Get-HyperVType $FullName).Properties.PSObject.Properties | ForEach-Object { $_.Name }) }
+function Test-HyperVDriftCase {
+    param([string]$Name, [scriptblock]$Body)
+    if ($null -ne $script:HyperVFactsError) { Test-Case $Name { throw "Hyper-V reflection child failed: $script:HyperVFactsError" }; return }
+    if ($script:HyperVFacts.Skip) { Write-Host "SKIP: $Name -- the Hyper-V PowerShell module is not installed on this machine."; return }
+    Test-Case $Name $Body
+}
+$hp = 'Microsoft.HyperV.PowerShell'
+
+Test-HyperVDriftCase 'Drift guard: real Get-VMKeyProtector writes one bare, un-enumerated byte[] (no wrapper)' {
+    $calls = @($script:HyperVFacts.KeyProtectorCalls)
+    Assert-Equal ($calls -contains 'ProcessOneOperand|VMSecurity::GetKeyProtector|System.Byte[]') $true
+    Assert-Equal (@($calls | Where-Object { $_ -like 'ProcessOneOperand|IOperationWatcher::WriteObject|*' }).Count -gt 0) $true
+    # Cmdlet.WriteObject(object) writes the array as ONE object; WriteObject(object, bool) would enumerate.
+    Assert-Equal (@($script:HyperVFacts.CmdletWriteObjectOverloads) -join ';') 'Object'
+    Assert-Equal @($script:HyperVFacts.RawKeyProtectorProperties).Count 0
+    # ...and the fake matches: one byte[] object, no invented property.
+    $fake = Get-VMKeyProtector -VM $script:FakeVM
+    Assert-Equal ($fake -is [byte[]]) $true
+}
+Test-HyperVDriftCase 'Drift guard: real BootOrder is VMBootSource[] wrapping unprefixed DvdDrive/HardDiskDrive devices' {
+    $firmware = (Get-HyperVType "$hp.VMFirmware").Properties
+    Assert-Equal $firmware.BootOrder "$hp.VMBootSource[]"
+    Assert-Equal $firmware.SecureBoot "$hp.OnOffState"
+    Assert-Equal ((Get-HyperVType "$hp.OnOffState").EnumNames -join ',') 'On,Off'
+    Assert-Equal ((Get-HyperVTypeProperties "$hp.VMBootSource") -contains 'Device') $true
+    # The fixture classes must carry the real short type names and only real properties.
+    foreach ($fixture in @([DvdDrive], [HardDiskDrive], [VMNetworkAdapter], [VMBootSource])) {
+        $real = Get-HyperVTypeProperties "$hp.$($fixture.Name)"
+        foreach ($property in $fixture.GetProperties()) {
+            if ($real -notcontains $property.Name) { throw "Fixture [$($fixture.Name)] invents property '$($property.Name)'." }
+        }
+    }
+    # The VM-prefixed fixture names are backward-compatibility cases only: no such real types exist.
+    foreach ($name in @('VMDvdDrive', 'VMHardDiskDrive')) {
+        if ($null -ne $script:HyperVFacts.Types.PSObject.Properties["$hp.$name"]) { throw "Unexpected real type $hp.${name}; re-check the boot-order fixtures." }
+    }
+}
+Test-HyperVDriftCase 'Drift guard: every property a fake returns, or the code reads, exists on the real output type' {
+    $savedDrives = @($script:FakeDvdDrives)
+    $savedAddCalls = $script:AddVMDvdDriveCalls
+    try {
+        $script:FakeDvdDrives.Clear()
+        Add-VMDvdDrive -VM $script:FakeVM
+        $fakeDrive = @(Get-VMDvdDrive -VM $script:FakeVM)[0]
+    } finally {
+        $script:FakeDvdDrives.Clear(); foreach ($d in $savedDrives) { $script:FakeDvdDrives.Add($d) }
+        $script:AddVMDvdDriveCalls = $savedAddCalls
+    }
+    $cases = @(
+        @{ Type = "$hp.VirtualMachine"; Names = @($script:FakeVM.PSObject.Properties.Name) },
+        @{ Type = "$hp.VMFirmware"; Names = @((Get-VMFirmware -VM $script:FakeVM).PSObject.Properties.Name) },
+        @{ Type = "$hp.VMSecurity"; Names = @((Get-VMSecurity -VM $script:FakeVM).PSObject.Properties.Name) },
+        @{ Type = "$hp.DvdDrive"; Names = @($fakeDrive.PSObject.Properties.Name) + @('ControllerType', 'ControllerNumber', 'ControllerLocation') },
+        @{ Type = "$hp.HardDiskDrive"; Names = @('Path', 'DiskNumber') },
+        @{ Type = "$hp.VMSnapshot"; Names = @('Name') },
+        @{ Type = 'Microsoft.Vhd.PowerShell.VirtualHardDisk'; Names = @((Get-VHD -Path 'C:\x.vhdx').PSObject.Properties.Name) },
+        @{ Type = "$hp.VMBootSource"; Names = @('BootType', 'Description', 'Device') }
+    )
+    foreach ($case in $cases) {
+        $real = Get-HyperVTypeProperties $case.Type
+        foreach ($name in $case.Names) {
+            if ($real -notcontains $name) { throw "'$name' is not a property of the real $($case.Type)." }
+        }
+    }
+}
+Test-HyperVDriftCase 'Drift guard: every Hyper-V cmdlet this file fakes declares only parameters the real cmdlet has' {
+    $faked = @($script:HyperVFacts.Cmdlets.PSObject.Properties | Where-Object { Get-Command $_.Name -CommandType Function -ErrorAction SilentlyContinue })
+    if ($faked.Count -lt 10) { throw "Expected the Hyper-V fakes of this file to be visible; found $($faked.Count)." }
+    # Only the always-present common parameters are skipped. -Confirm/-WhatIf exist on a real cmdlet only
+    # when it supports ShouldProcess, so a fake declaring them is checked like any other parameter.
+    $common = [Management.Automation.Cmdlet]::CommonParameters
+    foreach ($cmdlet in $faked) {
+        $real = @($cmdlet.Value)
+        foreach ($parameter in (Get-Command $cmdlet.Name -CommandType Function).Parameters.Keys) {
+            if ($common -contains $parameter) { continue }
+            if ($real -notcontains $parameter) { throw "The fake $($cmdlet.Name) declares -$parameter, which the real cmdlet does not have." }
+        }
+    }
+}
+Test-HyperVDriftCase 'Drift guard: every Hyper-V cmdlet call in Lab-VM.ps1 uses parameter names the real cmdlet has' {
+    $cmdlets = $script:HyperVFacts.Cmdlets
+    $checked = 0
+    foreach ($command in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true)) {
+        $name = $command.GetCommandName()
+        if (-not $name) { continue }
+        $entry = $cmdlets.PSObject.Properties[$name]
+        if ($null -eq $entry) { continue }
+        $checked++
+        foreach ($element in $command.CommandElements) {
+            if ($element -is [Management.Automation.Language.CommandParameterAst] -and @($entry.Value) -notcontains $element.ParameterName) {
+                throw "Lab-VM.ps1 line $($element.Extent.StartLineNumber): $name has no -$($element.ParameterName)."
+            }
+        }
+    }
+    if ($checked -lt 20) { throw "Expected to check many Hyper-V calls in Lab-VM.ps1; checked $checked." }
+}
+
+Write-Host "`nHelper tests:$script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
 if ($script:Failed -gt 0) { exit 1 }
