@@ -46,8 +46,11 @@ Optional host paths and state-polling timeout:
 powershell.exe -NoProfile -File .\Lab-VM.ps1 `
     -ExportRoot 'E:\HyperV-Exports' `
     -LogRoot 'C:\LabHostLogs' `
+    -IsoRoot 'E:\ISO' `
     -TimeoutSeconds 300
 ```
+
+`-IsoRoot` (default `E:\ISO`) is the local ISO library that menu option `M` scans, recursively and read-only, when you pick installer media. It is never written to: generated provisioning files live under `%LOCALAPPDATA%\LabVmManager\Provisioning\<VM ID>` instead.
 
 Create the export root yourself first, or choose an existing local folder when prompted. Each export creates a new timestamp-and-ID subfolder. Network-share export and import/cloning are outside this version.
 
@@ -89,10 +92,11 @@ The selected-VM menu provides:
 | C | Configure the SSH connection settings saved for this VM |
 | K | Trust this VM's SSH host key on first connection: typed confirmation, then OpenSSH's own fingerprint prompt; VM must be Running |
 | U | Clear this VM's stale SSH host key from `known_hosts` after the guest's key changed; typed confirmation |
+| M | Installation media: attach an installer ISO and prepare the boot profile, eject media, or inspect the DVD/boot configuration; attach/eject require Off |
 | X | Emergency power-off, with strong confirmation and data-loss warning |
 | R / B / Q | Refresh / choose another VM / quit |
 
-`-ReadOnly` allows only inspection, listing, the connectivity test (option `T`), the SSH options (`C`, `K`, `U`) and the file-copy options (`13`/`14`); it performs no VM mutation. `C`, `K` and `U` change only files on this host that belong to the operator (the VM's saved SSH settings, and the operator's own `~/.ssh/known_hosts`), never the VM, and `K`/`U` each require a typed confirmation. The copy options still remain listed because a real copy is blocked deeper inside the transfer itself (reported as a failed item, not a generic read-only warning), not by the menu dispatch gate. It still writes a host audit log.
+`-ReadOnly` allows only inspection, listing, the connectivity test (option `T`), the SSH options (`C`, `K`, `U`), the file-copy options (`13`/`14`) and the inspect-only part of option `M`; it performs no VM mutation. `C`, `K` and `U` change only files on this host that belong to the operator (the VM's saved SSH settings, and the operator's own `~/.ssh/known_hosts`), never the VM, and `K`/`U` each require a typed confirmation. The copy options still remain listed because a real copy is blocked deeper inside the transfer itself (reported as a failed item, not a generic read-only warning), not by the menu dispatch gate. It still writes a host audit log.
 
 ### Test connection (`T`)
 
@@ -115,6 +119,20 @@ Collects a source path, a destination path (blank cancels either), recursion (as
 Answering `Y` to the private-files prompt restricts each item actually delivered by this transfer (and, for a recursive copy, the destination root directory, but only if this transfer newly created it) to the receiving Windows account only, using `icacls` on whichever side is the destination -- the current signed-in user for a `FromVM` copy landing on this host, or the account the PowerShell Direct session authenticated as for a `ToVM` copy landing in the guest (never an owner inferred from the path). It never walks into a pre-existing destination directory to touch files this transfer did not itself write. If the permission step fails for an item that otherwise copied successfully, that item is reported as `Failed`, not `Completed` -- a byte-identical copy with a permission you couldn't lock down is not a successful private-file transfer. On a VM with a saved SSH connection (the Linux/SFTP adapter), an upload gets `chmod 600` (a single file) or `chmod 700` (only the root of a directory copy) on the guest instead, and a download gets the same host-side `icacls` restriction described here; see "Private files on the Linux/SFTP adapter" below, including its directory-contents limitation.
 
 **Timing limitation (this version):** the restrictive permission is applied immediately *after* each file (or newly created directory) has been written and moved into place, not before. There is therefore a brief window in which the data exists at the destination (and, during the copy, in its `*.labxfer-*.tmp` temporary sibling) with the default/inherited permissions of its parent directory before being restricted. That is acceptable for disposable lab VMs, but if the destination directory's inherited permissions would expose the content to other accounts even briefly, restrict that directory yourself first. Restricting permissions *before* any private bytes are written (including the temporary item), and reading the final permissions back to verify them, is planned follow-up work.
+
+### Installation media (`M`)
+
+One entry point for a VM's installer media, with three sub-actions:
+
+- **A — Attach an installer ISO and prepare the VM to boot it** (VM must be Off, Generation 2). Asks for the OS profile (`Windows11` or `UbuntuDesktop`), then lets you browse and pick an ISO under `-IsoRoot` (files with the same name in different folders are listed by full path, so they stay distinguishable). A **read-only preview** follows — nothing has changed at this point — showing the target VM, the ISO, which DVD drive will be used (or that one will be added), the exact Secure Boot template / key protector / vTPM changes the boot profile will make (`Windows11`: `MicrosoftWindows` template, plus a new local key protector and vTPM only if no key protector exists yet — an existing one is never rotated; `UbuntuDesktop`: `MicrosoftUEFICertificateAuthority` template, vTPM untouched), and the boot-order change. The boot-order change puts the DVD drive first in the firmware boot order; this is a **persistent firmware preference, not a one-time boot**: it applies to every later boot until it is changed back. Two safety checks, both read-only, appear in the preview:
+  - if the VM **already has a key protector** (encryption-related state), a warning that security/firmware changes on an already-encrypted guest can require recovery material (e.g. a BitLocker recovery key);
+  - if the VM **already has a checkpoint**, or an attached virtual disk (following a differencing disk's parent chain) **already uses 256 MiB or more on disk** — measured from the real files, never guessed from a name — or a disk cannot be measured, a warning that booting installer media can overwrite an existing OS/data, with a suggestion to checkpoint (`5`) or export (`9`) first. This case also requires a second, typed `INSTALL OVER <name>` confirmation; anything else cancels.
+
+  After the `[Y/n/cancel]` confirmation (plus the typed one when required), the changes are applied in this order: boot profile, then ISO attach (recording the drive's previous attachment under `%LOCALAPPDATA%\LabVmManager\InstallMedia\<VM ID>.json`), then DVD-first boot order. If a step fails, the error names the steps already applied.
+- **E — Eject the current DVD media** (VM must be Off). Shows what is attached and asks `[Y/n/cancel]`. The DVD drive stays, and the boot order is not changed (an empty DVD entry is skipped at boot).
+- **I — Inspect** the DVD drives and their media, the recorded previous attachment, Secure Boot state/template, key protector and vTPM state, and the firmware boot order. Read-only; this is the only sub-action available under `-ReadOnly`, where `M` goes straight to it and never prompts for a profile or ISO.
+
+What this does **not** do yet: it does not install an OS. It prepares the VM (firmware profile, media, boot order) so that starting it boots the chosen installer, which you then run yourself in the VM console; unattended Windows/Linux installation (using the seed-ISO builder) is the next plan. Known v1 limitations: selecting among **several existing DVD drives** is not supported — attach and eject refuse with a clear message when a VM has more than one, and you attach/eject manually in Hyper-V Manager instead. The DVD-first reorder recognizes boot entries by their device type; that matching has not yet been verified against a live host's `Get-VMFirmware` output (see `MANUAL-TESTS.md`), and if no DVD entry is recognized the step fails loudly instead of silently leaving the order unchanged.
 
 ## Parameter mode: file transfer
 
@@ -230,7 +248,7 @@ Option `12` calls Hyper-V's `Remove-VM`, which unregisters the VM and its config
 
 ## Intentionally not included
 
-No guest OS installation, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing, remote hosts, automatic login, guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
+No guest OS installation (option `M` only attaches installer media and prepares the boot profile/order; it never runs an installer), VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing, remote hosts, automatic login, guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
 
 ## Linux file transfer: SFTP backend design decision
 
