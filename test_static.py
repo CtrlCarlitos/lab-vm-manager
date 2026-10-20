@@ -273,6 +273,17 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('finally', body)
         self.assertIn('Remove-PSSession', body)
+    def test_orchestrator_branches_on_adapter_kind(self):
+        body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Get-LabTransferAdapterKind', body)
+        self.assertIn("'SFTP'", body)
+        self.assertIn('Copy-LabTransferItemSftp', body)
+    def test_orchestrator_still_calls_psdirect_path(self):
+        body = self.s.split('function Invoke-LabFileTransfer {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('New-LabPSDirectSession', body)
+        # Trailing space distinguishes the real call from the substring "Copy-LabTransferItemSftp",
+        # which also contains the literal text "Copy-LabTransferItem" and would otherwise false-pass this check.
+        self.assertIn('Copy-LabTransferItem ', body)
     def test_copy_menu_options_pass_allow_readonly(self):
         body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("'copy-to-vm-menu' -AllowReadOnly", body)
