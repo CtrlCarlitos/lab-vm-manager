@@ -2046,8 +2046,7 @@ function Set-LabVMUnattendedInstallMedia {
         throw "ISO '$WindowsIsoPath' could not be opened for reading ($($_.Exception.Message))."
     }
     if ($length -le 0) { throw "ISO '$WindowsIsoPath' is empty (0 bytes)." }
-    Add-VMDvdDrive -VM $vm -Confirm:$false -ErrorAction Stop
-    $windowsDrive = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)[-1]
+    $windowsDrive = Add-VMDvdDrive -VM $vm -Confirm:$false -Passthru -ErrorAction Stop
     Set-VMDvdDrive -VMDvdDrive $windowsDrive -Path $WindowsIsoPath -Confirm:$false -ErrorAction Stop
 
     # Re-validate the seed ISO immediately before attaching it, too -- so a problem with the seed ISO
@@ -2063,8 +2062,7 @@ function Set-LabVMUnattendedInstallMedia {
         throw "ISO '$SeedIsoPath' could not be opened for reading ($($_.Exception.Message))."
     }
     if ($length -le 0) { throw "ISO '$SeedIsoPath' is empty (0 bytes)." }
-    Add-VMDvdDrive -VM $vm -Confirm:$false -ErrorAction Stop
-    $seedDrive = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)[-1]
+    $seedDrive = Add-VMDvdDrive -VM $vm -Confirm:$false -Passthru -ErrorAction Stop
     Set-VMDvdDrive -VMDvdDrive $seedDrive -Path $SeedIsoPath -Confirm:$false -ErrorAction Stop
 
     # Both new drives are DVD-kind; which one ends up first doesn't matter -- UEFI firmware skips a
