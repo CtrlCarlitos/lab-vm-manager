@@ -16,6 +16,14 @@
     provisioning, credential copying, and disk file deletion are not
     implemented. This is an operator tool, not a security boundary against
     another administrator or an untrusted guest.
+
+    Copying files into a guest's .ssh directory is an ordinary file/directory
+    transfer, governed by the same path/conflict/permission rules as any
+    other transfer; it never edits authorized_keys as a side effect, and it
+    is a separate concern from the key this manager itself uses to
+    authenticate to the guest. See README.md ("SSH key roles") for the full
+    explanation, and ("Future work: optional no-SSH bootstrap with
+    Copy-VMFile") for a bounded, unimplemented design note.
 .PARAMETER ReadOnly
     Allows inventory, details and checkpoint listing; blocks all VM changes.
     A host-side audit log is still written.
