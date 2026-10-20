@@ -2802,12 +2802,30 @@ function Remove-LabBootPatchStagedMount {
 
 # Hand-builds a minimal, valid El Torito/ISO9660 byte layout: a Boot Record Volume Descriptor at
 # sector 17 ("CD001", "EL TORITO SPECIFICATION", a catalog-sector pointer at its documented offset
-# 71), a boot catalog at $CatalogSector (a Validation Entry naming platform id $PlatformId, then an
-# Initial/Default Entry whose Load RBA field -- local offset 8, so catalog offset 40 -- points at
-# $LoadRbaSector), and, when given, real content at that data sector standing in for efisys.bin's
-# own bytes.
+# 71), and a boot catalog at $CatalogSector shaped per $Layout:
+#   - 'Hybrid' (the default): mirrors a REAL Windows 11 ISO's actual boot catalog, read directly from
+#     its raw bytes -- a Validation Entry naming platform id 0x00 (BIOS), an Initial/Default Entry
+#     (catalog offset 32) pointing at a BIOS data sector ($BiosLoadRbaSector), then a final Section
+#     Header (catalog offset 64, platform id 0xEF, one Section Entry following) whose Section Entry
+#     (catalog offset 96, Load RBA at local offset 8 = catalog offset 104) points at $LoadRbaSector.
+#   - 'EfiOnly': the narrower, EFI-only shape -- Validation Entry platform id 0xEF, and the
+#     Initial/Default Entry (catalog offset 32, Load RBA at catalog offset 40) IS the EFI entry,
+#     pointing directly at $LoadRbaSector. No Section Header is written.
+#   - 'NoEfi': a BIOS Validation Entry/Initial/Default Entry exactly like 'Hybrid', but the Section
+#     Header at catalog offset 64 is the final header (0x91) with platform id 0x00 (not EFI) and zero
+#     Section Entries following -- there is no EFI boot catalog entry anywhere in this catalog.
+# When given, $SectorContent is written at $LoadRbaSector's data sector, standing in for efisys.bin's
+# own bytes (irrelevant for 'NoEfi', since that layout is refused before any content is ever read).
 function New-LabFakeElToritoIso {
-    param([string]$Path, [int]$TotalSectors = 50, [int]$CatalogSector = 22, [int]$LoadRbaSector = 40, [byte[]]$SectorContent = $null, [byte]$PlatformId = 0xEF)
+    param(
+        [string]$Path,
+        [int]$TotalSectors = 50,
+        [int]$CatalogSector = 22,
+        [int]$LoadRbaSector = 40,
+        [byte[]]$SectorContent = $null,
+        [ValidateSet('Hybrid', 'EfiOnly', 'NoEfi')][string]$Layout = 'Hybrid',
+        [int]$BiosLoadRbaSector = 30
+    )
     $sectorSize = 2048
     $bytes = New-Object byte[] ($TotalSectors * $sectorSize)
     $brvdOffset = 17 * $sectorSize
@@ -2818,13 +2836,49 @@ function New-LabFakeElToritoIso {
     [Array]::Copy([BitConverter]::GetBytes([uint32]$CatalogSector), 0, $bytes, $brvdOffset + 71, 4)
 
     $catOffset = $CatalogSector * $sectorSize
-    $bytes[$catOffset] = 0x01       # Validation Entry: header id
-    $bytes[$catOffset + 1] = $PlatformId
-    $bytes[$catOffset + 30] = 0x55  # Validation Entry: key bytes
-    $bytes[$catOffset + 31] = 0xAA
-    $bytes[$catOffset + 32] = 0x88  # Initial/Default Entry: boot indicator (bootable)
-    $bytes[$catOffset + 33] = 0x00  # Initial/Default Entry: boot media type (no emulation)
-    [Array]::Copy([BitConverter]::GetBytes([uint32]$LoadRbaSector), 0, $bytes, $catOffset + 40, 4)
+    switch ($Layout) {
+        'EfiOnly' {
+            $bytes[$catOffset] = 0x01       # Validation Entry: header id
+            $bytes[$catOffset + 1] = 0xEF   # Validation Entry: platform id (EFI)
+            $bytes[$catOffset + 30] = 0x55  # Validation Entry: key bytes
+            $bytes[$catOffset + 31] = 0xAA
+            $bytes[$catOffset + 32] = 0x88  # Initial/Default Entry (IS the EFI entry): bootable
+            $bytes[$catOffset + 33] = 0x00  # boot media type (no emulation)
+            [Array]::Copy([BitConverter]::GetBytes([uint32]$LoadRbaSector), 0, $bytes, $catOffset + 40, 4)
+        }
+        'NoEfi' {
+            $bytes[$catOffset] = 0x01       # Validation Entry: header id
+            $bytes[$catOffset + 1] = 0x00   # Validation Entry: platform id (BIOS)
+            $bytes[$catOffset + 30] = 0x55
+            $bytes[$catOffset + 31] = 0xAA
+            $bytes[$catOffset + 32] = 0x88  # BIOS Initial/Default Entry: bootable
+            $bytes[$catOffset + 33] = 0x00
+            [Array]::Copy([BitConverter]::GetBytes([uint32]$BiosLoadRbaSector), 0, $bytes, $catOffset + 40, 4)
+            # Final Section Header, platform id NOT EFI, zero Section Entries following: the walk
+            # must stop here (the 0x91 final-header flag) having found no EFI entry anywhere.
+            $bytes[$catOffset + 64] = 0x91  # Section Header: final header
+            $bytes[$catOffset + 65] = 0x00  # platform id: BIOS, not EFI
+            [Array]::Copy([BitConverter]::GetBytes([uint16]0), 0, $bytes, $catOffset + 66, 2)
+        }
+        default {
+            # 'Hybrid': the real Windows 11 ISO's own shape -- a BIOS Validation/Initial-Default
+            # Entry pair, then a separate, final Section Header naming platform id 0xEF with exactly
+            # one Section Entry following, which carries the actual EFI Load RBA.
+            $bytes[$catOffset] = 0x01       # Validation Entry: header id
+            $bytes[$catOffset + 1] = 0x00   # Validation Entry: platform id (BIOS)
+            $bytes[$catOffset + 30] = 0x55
+            $bytes[$catOffset + 31] = 0xAA
+            $bytes[$catOffset + 32] = 0x88  # BIOS Initial/Default Entry: bootable
+            $bytes[$catOffset + 33] = 0x00
+            [Array]::Copy([BitConverter]::GetBytes([uint32]$BiosLoadRbaSector), 0, $bytes, $catOffset + 40, 4)
+            $bytes[$catOffset + 64] = 0x91  # Section Header: final header (exactly one EFI section)
+            $bytes[$catOffset + 65] = 0xEF  # platform id: EFI
+            [Array]::Copy([BitConverter]::GetBytes([uint16]1), 0, $bytes, $catOffset + 66, 2)
+            $bytes[$catOffset + 96] = 0x88  # EFI Section Entry: bootable
+            $bytes[$catOffset + 97] = 0x00
+            [Array]::Copy([BitConverter]::GetBytes([uint32]$LoadRbaSector), 0, $bytes, $catOffset + 104, 4)
+        }
+    }
 
     if ($null -ne $SectorContent) {
         [Array]::Copy($SectorContent, 0, $bytes, $LoadRbaSector * $sectorSize, $SectorContent.Length)
@@ -2922,6 +2976,58 @@ Test-Case 'New-LabPatchedBootableIso: a boot catalog pointing at content that do
 
         Assert-Equal $result.Patched $false
         if ($result.Reason -notmatch 'boot catalog') { throw "Reason did not say the boot catalog didn't point where expected: $($result.Reason)" }
+        Assert-Equal $result.OutputPath $null
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
+        Assert-Equal $script:CopyCalls 0
+        Assert-Equal $script:BootPatchDismountCalls 1
+    } finally {
+        if ($stagedDir) { Remove-LabBootPatchStagedMount $stagedDir }
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableIso: EFI-only boot catalog (Validation Entry platform id 0xEF) still patches correctly' {
+    Reset-LabBootPatchFakes
+    $efisysBytes = New-LabBootPatchDistinctBytes 80 7
+    $noPromptBytes = New-LabBootPatchDistinctBytes 80 13
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $stagedDir = $null
+    try {
+        New-LabFakeElToritoIso -Path $isoPath -SectorContent $efisysBytes -Layout EfiOnly
+        $stagedDir = New-LabBootPatchStagedMount -EfisysBytes $efisysBytes -NoPromptBytes $noPromptBytes
+
+        $result = New-LabPatchedBootableIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $true
+        Assert-Equal $result.OutputPath $outputPath
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $true
+        $outputBytes = [IO.File]::ReadAllBytes($outputPath)
+        $patchOffset = 40 * 2048
+        $patchedRegion = $outputBytes[$patchOffset..($patchOffset + 79)]
+        Assert-Equal ([Convert]::ToBase64String($patchedRegion)) ([Convert]::ToBase64String($noPromptBytes))
+        Assert-Equal $script:CopyCalls 1
+    } finally {
+        if ($stagedDir) { Remove-LabBootPatchStagedMount $stagedDir }
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableIso: a boot catalog with a BIOS entry but no EFI section anywhere refuses, no copy made' {
+    Reset-LabBootPatchFakes
+    $efisysBytes = New-LabBootPatchDistinctBytes 80 7
+    $noPromptBytes = New-LabBootPatchDistinctBytes 80 13
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('labbootpatch-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $stagedDir = $null
+    try {
+        New-LabFakeElToritoIso -Path $isoPath -SectorContent $efisysBytes -Layout NoEfi
+        $stagedDir = New-LabBootPatchStagedMount -EfisysBytes $efisysBytes -NoPromptBytes $noPromptBytes
+
+        $result = New-LabPatchedBootableIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $false
+        if ($result.Reason -notmatch 'no EFI') { throw "Reason did not say no EFI boot catalog entry was found: $($result.Reason)" }
         Assert-Equal $result.OutputPath $null
         Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
         Assert-Equal $script:CopyCalls 0
