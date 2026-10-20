@@ -1676,6 +1676,44 @@ Test-Case 'Select-LabIsoPath re-validates and rejects a path that no longer exis
     }
 }
 
+Test-Case 'Select-LabIsoPath filter always matches the full scan, not the previously narrowed view' {
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('labiso-refilter-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void][IO.Directory]::CreateDirectory($tempRoot)
+    $winPath1 = Join-Path $tempRoot 'windows-2022.iso'
+    $winPath2 = Join-Path $tempRoot 'windows-2019.iso'
+    $linuxPath = Join-Path $tempRoot 'linux-ubuntu.iso'
+    try {
+        [IO.File]::WriteAllBytes($winPath1, [byte[]]@(1, 2, 3))
+        [IO.File]::WriteAllBytes($winPath2, [byte[]]@(1, 2, 3, 4))
+        [IO.File]::WriteAllBytes($linuxPath, [byte[]]@(1, 2, 3, 4, 5))
+        & {
+            $script:FakeIsoScan = [pscustomobject]@{
+                Files     = @(
+                    [pscustomobject]@{ FullName = $winPath1; Length = (Get-Item -LiteralPath $winPath1).Length; LastWriteTime = (Get-Item -LiteralPath $winPath1).LastWriteTime }
+                    [pscustomobject]@{ FullName = $winPath2; Length = (Get-Item -LiteralPath $winPath2).Length; LastWriteTime = (Get-Item -LiteralPath $winPath2).LastWriteTime }
+                    [pscustomobject]@{ FullName = $linuxPath; Length = (Get-Item -LiteralPath $linuxPath).Length; LastWriteTime = (Get-Item -LiteralPath $linuxPath).LastWriteTime }
+                )
+                Incomplete = $false
+                Errors     = @()
+            }
+            function Get-LabIsoCandidates { param([string]$IsoRoot) return $script:FakeIsoScan }
+            # 'windows' narrows the full 3-item scan down to the two Windows ISOs (linux-ubuntu.iso is
+            # filtered out of the view). 'linux' is then typed as a second, DIFFERENT filter: if the
+            # filter wrongly matched against the already-narrowed 2-item view (the bug), this would find
+            # nothing and leave the Windows-only view in place, so '1' would then wrongly select
+            # windows-2022.iso. With the fix, 'linux' matches against the full retained scan and narrows
+            # to linux-ubuntu.iso, so '1' selects it.
+            $script:IsoAnswers = [Collections.Generic.Queue[string]]::new([string[]]@('windows', 'linux', '1'))
+            function Read-LabText { param([string]$Prompt) return $script:IsoAnswers.Dequeue() }
+            foreach ($sb in (Import-LabRealFunction 'Select-LabIsoPath')) { . $sb }
+            $result = Select-LabIsoPath $tempRoot
+            Assert-Equal $result $linuxPath
+        }
+    } finally {
+        if ([IO.Directory]::Exists($tempRoot)) { [IO.Directory]::Delete($tempRoot, $true) }
+    }
+}
+
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
 Write-Host 'These are parser/helper tests, NOT Hyper-V lifecycle or restore tests.'
 if ($script:Failed -gt 0) { exit 1 }
