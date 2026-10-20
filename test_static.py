@@ -604,6 +604,17 @@ class SourceContract(unittest.TestCase):
             self.assertIn('TRUST HOST KEY', doc)
             self.assertIn('StrictHostKeyChecking=ask', doc)
         self.assertIn('SshConnections\\<VMId>.json', readme)
+    def test_iso_root_parameter_exists(self):
+        body = self.s.split('param(', 1)[1].split(')\n\n', 1)[0]
+        self.assertIn('$IsoRoot', body)
+    def test_iso_discovery_function_exists(self):
+        self.assertIn('function Get-LabIsoCandidates', self.s)
+    def test_iso_discovery_never_follows_reparse_points(self):
+        body = self.s.split('function Get-LabIsoCandidates {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('ReparsePoint', body)
+    def test_iso_discovery_reports_incomplete_not_silent_partial(self):
+        body = self.s.split('function Get-LabIsoCandidates {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Incomplete', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

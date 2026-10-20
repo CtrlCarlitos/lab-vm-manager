@@ -32,6 +32,9 @@
 .PARAMETER ExportRoot
     Optional existing local export folder, e.g. E:\HyperV-Exports.
     Each export goes into a new, unique subfolder. Otherwise prompts at export.
+.PARAMETER IsoRoot
+    Local ISO library folder to scan for installer media, e.g. E:\ISO.
+    Default: E:\ISO. Scanned recursively via Get-LabIsoCandidates.
 .PARAMETER TimeoutSeconds
     Maximum polling interval for VM start/shutdown state (default 180 seconds).
     Does not impose a timeout on Hyper-V checkpoint/export/merge operations.
@@ -107,6 +110,7 @@ param(
     [switch]$ReadOnly,
     [string]$LogRoot = '',
     [string]$ExportRoot = '',
+    [string]$IsoRoot = 'E:\ISO',
     [ValidateRange(30, 3600)]
     [int]$TimeoutSeconds = 180,
     [switch]$CopyToVM,
@@ -1290,6 +1294,44 @@ function Export-LabVM {
         throw
     }
     return 'COMPLETED'
+}
+
+# Recursively lists .iso files under $IsoRoot. A manual stack walk (not -Recurse) so a
+# mid-tree permission error is recorded and skipped rather than aborting the whole scan,
+# and so a reparse-point directory is never descended into (avoids loops/escaping the root).
+# Incomplete is $true whenever Errors is non-empty, including a missing/inaccessible root --
+# callers can then tell "nothing found" from "couldn't look everywhere".
+function Get-LabIsoCandidates {
+    param([string]$IsoRoot)
+    $files = [Collections.Generic.List[object]]::new()
+    $errors = [Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $IsoRoot -PathType Container)) {
+        $errors.Add("ISO root not found or not a directory: $IsoRoot")
+        return [pscustomobject]@{ Files = @(); Incomplete = $true; Errors = @($errors) }
+    }
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($IsoRoot)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        try {
+            $children = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
+        } catch {
+            $errors.Add("${directory}: $($_.Exception.Message)")
+            continue
+        }
+        foreach ($child in $children) {
+            $isReparse = [bool]($child.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            if ($child.PSIsContainer) {
+                # Never descend into a link: it can loop or lead outside the chosen root.
+                if (-not $isReparse) { $pending.Push($child.FullName) }
+                continue
+            }
+            if ($child.Extension -ieq '.iso') {
+                $files.Add([pscustomobject]@{ FullName = $child.FullName; Length = $child.Length; LastWriteTime = $child.LastWriteTime })
+            }
+        }
+    }
+    [pscustomobject]@{ Files = @($files); Incomplete = [bool]($errors.Count -gt 0); Errors = @($errors) }
 }
 
 function Get-LabVMRemovalPreview {
