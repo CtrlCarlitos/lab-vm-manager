@@ -1657,9 +1657,15 @@ function Test-LabWindowsIsoInScope {
 # Boot Record Volume Descriptor at sector 17 names "EL TORITO SPECIFICATION" and points at a boot
 # catalog sector; the catalog's EFI entry carries a Load RBA -- the sector firmware actually loads
 # efisys.bin's bytes from. $offset = LoadRBA * 2048 is where those bytes live in the raw ISO file.
-# Before touching anything, the content actually AT that offset is compared byte-for-byte against
-# efisys.bin's own bytes (read from the mounted volume); if they don't match, this ISO's boot
-# layout isn't one this technique understands, and nothing is patched or copied -- never patch
+# Finding the EFI entry takes two forms, both walked below: when the catalog's Validation Entry
+# itself already names platform id 0xEF, the catalog is EFI-only and the Initial/Default Entry
+# (catalog offset 32) directly carries the EFI Load RBA. Otherwise -- the real Windows 11 ISO's own
+# shape, confirmed by reading its raw boot-catalog bytes directly -- the Validation Entry names the
+# BIOS platform (0x00) and the EFI entry instead lives inside a Section Header group starting at
+# catalog offset 64, which is walked header-by-header until one with platform id 0xEF is found.
+# Before touching anything, the content actually AT the resulting offset is compared byte-for-byte
+# against efisys.bin's own bytes (read from the mounted volume); if they don't match, this ISO's
+# boot layout isn't one this technique understands, and nothing is patched or copied -- never patch
 # blind.
 #
 # Mount-DiskImage/Get-Volume/Dismount-DiskImage pairing and the $mounted dismount guard: identical
@@ -1765,20 +1771,53 @@ function New-LabPatchedBootableIso {
     }
     $catalogSector = [BitConverter]::ToUInt32($brvd, 71)
     $catalog = & $readIsoBytes $SourceIsoPath ([int64]$catalogSector * $sectorSize) $sectorSize
-    # Validation Entry (bytes 0-31): byte 1 is the platform id. This plan is Windows 11 client ISOs
-    # only, whose catalogs -- confirmed against a real one, see the design doc -- carry a single,
-    # EFI-only Validation Entry followed immediately by one Initial/Default Entry (bytes 32-63,
-    # Load RBA at local offset 8). A hybrid BIOS+EFI catalog with Section Header Entries would not
-    # match this fixed layout; the EFI platform-id check here, plus the byte comparison below,
-    # together make sure a layout this technique does not understand is refused, never patched blind.
-    $platformIdMatches = ($catalog[1] -eq 0xEF)
+    $catalogSectorBytes = $catalog.Length
     $boundsReason = "'$SourceIsoPath': the El Torito boot catalog did not point where expected " +
         "-- its EFI entry's Load RBA does not point at $bootDirName\efisys.bin's own content. " +
         'Refusing to patch blind.'
-    if (-not $platformIdMatches) {
-        return [pscustomobject]@{ Patched = $false; Reason = $boundsReason; OutputPath = $null }
+    $noEfiEntryReason = "'$SourceIsoPath': no EFI (platform id 0xEF) boot catalog entry was " +
+        'found -- neither the Validation Entry nor any Section Header in the boot catalog names ' +
+        "platform id 0xEF. This ISO's boot structure isn't one this technique understands."
+
+    # Validation Entry (catalog offset 0-31): byte 1 is its platform id. A real Windows 11 ISO's
+    # boot catalog carries BOTH a BIOS entry (Validation Entry platform id 0x00, an Initial/Default
+    # Entry at catalog offset 32 pointing at the BIOS etfsboot image) AND a separate EFI entry living
+    # inside a Section Header group starting at catalog offset 64 -- so the Initial/Default Entry at
+    # offset 32 is NOT reliably the EFI entry; that's only true when the catalog is EFI-only. Only
+    # when the Validation Entry's own platform id is already 0xEF does the Initial/Default Entry at
+    # offset 32 directly carry the EFI Load RBA (local offset 8, catalog offset 40).
+    $loadRba = $null
+    if ($catalog[1] -eq 0xEF) {
+        $loadRba = [BitConverter]::ToUInt32($catalog, 40)
+    } else {
+        # Walk 32-byte Section Header groups starting at catalog offset 64. A Section Header's byte 0
+        # is 0x90 ("more headers follow") or 0x91 ("this is the final header"); byte 1 is its platform
+        # id; bytes 2-3 are a little-endian uint16 count of Section Entries (each also 32 bytes, same
+        # Load-RBA-at-local-offset-8 shape) immediately following it. The whole catalog sector is 64
+        # entries of 32 bytes each (2048 bytes total, including the Validation Entry), so the walk
+        # never reads past $catalogSectorBytes.
+        $entryOffset = 64
+        while ($entryOffset + 32 -le $catalogSectorBytes) {
+            $headerByte0 = $catalog[$entryOffset]
+            $headerPlatformId = $catalog[$entryOffset + 1]
+            $sectionCount = [BitConverter]::ToUInt16($catalog, $entryOffset + 2)
+            if ($headerPlatformId -eq 0xEF -and $sectionCount -ge 1) {
+                # Windows's own ISOs carry exactly one EFI boot entry -- only the first Section Entry
+                # following an 0xEF header is needed; no selection logic beyond that.
+                $firstEntryOffset = $entryOffset + 32
+                if ($firstEntryOffset + 32 -le $catalogSectorBytes) {
+                    $loadRba = [BitConverter]::ToUInt32($catalog, $firstEntryOffset + 8)
+                }
+                break
+            }
+            $isFinalHeader = ($headerByte0 -eq 0x91)
+            $entryOffset += 32 * (1 + [int]$sectionCount)
+            if ($isFinalHeader) { break }
+        }
     }
-    $loadRba = [BitConverter]::ToUInt32($catalog, 40)
+    if ($null -eq $loadRba) {
+        return [pscustomobject]@{ Patched = $false; Reason = $noEfiEntryReason; OutputPath = $null }
+    }
     $offset = [int64]$loadRba * $sectorSize
     $actualBytes = & $readIsoBytes $SourceIsoPath $offset $efisysBytes.Length
     $bytesMatch = $true
