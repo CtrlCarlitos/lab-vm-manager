@@ -771,5 +771,20 @@ class SourceContract(unittest.TestCase):
         self.assertIn('byte[]', manual)
         self.assertNotIn("has not yet been verified against a live host's `Get-VMFirmware` output", readme)
 
+    # --- Windows unattended install, Task 1: edition enumeration and version-scope check ---
+    def test_windows_image_enumeration_function_exists(self):
+        self.assertIn('function Get-LabWindowsInstallImages', self.s)
+    def test_windows_image_enumeration_guards_dism_module(self):
+        body = self.s.split('function Get-LabWindowsInstallImages {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("Get-Module -ListAvailable -Name Dism", body)
+    def test_windows_image_enumeration_always_dismounts(self):
+        body = self.s.split('function Get-LabWindowsInstallImages {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('finally', body)
+        self.assertIn('Dismount-DiskImage', body)
+    def test_windows_image_enumeration_scope_rule(self):
+        body = self.s.split('function Get-LabWindowsInstallImages {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("-eq 'Client'", body)
+        self.assertIn('22000', body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

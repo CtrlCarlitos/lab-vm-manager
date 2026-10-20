@@ -1575,6 +1575,69 @@ function New-LabSeedIso {
     }
 }
 
+# Enumerates every Windows edition inside a Windows installer ISO's sources\install.wim (or, if
+# that is absent, sources\install.esd), and flags which ones are in this plan's scope: Windows 11
+# client only. "Client" (never "Server") and BuildNumber -ge 22000 (the first public Windows 11
+# build) together decide IsWindows11Client -- a high-build Server image must NOT qualify, and a
+# low-build Client image must NOT qualify. Read-only: mounts $IsoPath purely to read it and always
+# dismounts in a finally, even when a step below throws, so a bad/foreign ISO never leaves a stray
+# mount behind.
+#
+# Mount-DiskImage/Get-Volume pairing (no existing precedent in this codebase to match): uses
+# Mount-DiskImage -PassThru piped into Get-Volume, the exact pairing Plan 1 already live-verified
+# against a real ISO while building New-LabSeedIso (see MANUAL-TESTS.md, "Seed-ISO round trip
+# (verified live)": "Mount-DiskImage -ImagePath <iso> -PassThru | Get-Volume"), rather than the
+# untried Get-DiskImage-by-path alternative. Task 2 reuses this same pairing.
+function Get-LabWindowsInstallImages {
+    param([string]$IsoPath)
+    if (-not (Get-Module -ListAvailable -Name Dism)) {
+        throw 'The Dism PowerShell module is missing. Install the Windows Assessment and Deployment Kit (or run this on a full Windows installation) before reading Windows install images.'
+    }
+    try {
+        $mountResult = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
+        $volume = Get-Volume -DiskImage $mountResult -ErrorAction Stop
+        # Plain string concatenation, not Join-Path: Join-Path resolves the FileSystem provider's
+        # drive at call time, which throws "Cannot find drive" for a drive letter the mount only
+        # just assigned (and is unavailable at all in this file's fake-cmdlet harness).
+        $sourcesRoot = "$($volume.DriveLetter):\sources"
+        $imageFile = "$sourcesRoot\install.wim"
+        if (-not (Test-Path -LiteralPath $imageFile -PathType Leaf)) {
+            $imageFile = "$sourcesRoot\install.esd"
+            if (-not (Test-Path -LiteralPath $imageFile -PathType Leaf)) {
+                throw "'$IsoPath' doesn't look like a Windows installer ISO: no sources\install.wim or sources\install.esd was found after mounting it."
+            }
+        }
+        # The index-less enumeration call does not carry InstallationType/Version; each entry needs
+        # its own indexed call to read those.
+        $summaries = @(Get-WindowsImage -ImagePath $imageFile -ErrorAction Stop)
+        $images = [Collections.Generic.List[object]]::new()
+        foreach ($summary in $summaries) {
+            $detail = Get-WindowsImage -ImagePath $imageFile -Index $summary.ImageIndex -ErrorAction Stop
+            $installationType = [string]$detail.InstallationType
+            # Version's Build component (Major.Minor.Build.Revision), e.g. '10.0.26300.1000' -> 26300.
+            $buildNumber = ([version]([string]$detail.Version)).Build
+            $images.Add([pscustomobject]@{
+                Index = [int]$summary.ImageIndex
+                Name = [string]$summary.ImageName
+                InstallationType = $installationType
+                BuildNumber = $buildNumber
+                IsWindows11Client = ($installationType -eq 'Client' -and $buildNumber -ge 22000)
+            })
+        }
+        return $images.ToArray()
+    } finally {
+        Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop
+    }
+}
+
+# Pure, read-only: decides whether a list already fetched by Get-LabWindowsInstallImages contains
+# at least one in-scope edition, without re-mounting anything. Kept separate so Task 6's
+# orchestrator can call it against a list it already has.
+function Test-LabWindowsIsoInScope {
+    param([object[]]$Images)
+    return @($Images | Where-Object IsWindows11Client).Count -gt 0
+}
+
 function Test-LabVMHasKeyProtector {
     param([guid]$VMId)
     # Pure, read-only presence check -- it must never mutate. Set-LabVMBootProfile below calls this
