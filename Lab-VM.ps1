@@ -54,7 +54,8 @@
     Parameter mode: verify a SHA-256 hash of each copied file after the copy.
 .PARAMETER PermissionProfile
     Parameter mode: Default (no permission change) or PrivateFiles, which restricts each
-    finalized item to the receiving account only (Windows ACLs; see README.md).
+    finalized item to the receiving account only (Windows ACLs, or chmod 600/700 on a
+    Linux/SFTP guest; see README.md for the Linux directory-contents limitation).
 .PARAMETER Credential
     Guest Windows credential for parameter-mode transfer. Only pass an existing
     PSCredential object built in the calling elevated Windows PowerShell 5.1
@@ -2043,7 +2044,8 @@ function Copy-LabTransferItemSftp {
         [bool]$Recurse,
         [ValidateSet('Error', 'Skip', 'Overwrite')][string]$OnConflict,
         [bool]$VerifyHash,
-        [bool]$DryRun
+        [bool]$DryRun,
+        [ValidateSet('Default', 'PrivateFiles')][string]$PermissionProfile = 'Default'
     )
     # Every connection is a separate ssh.exe/sftp.exe process (no connection reuse; see README), so in
     # InteractivePassword mode each one below asks for the password: a single-file upload needs up to
@@ -2051,7 +2053,9 @@ function Copy-LabTransferItemSftp {
     # check, download, size/hash check), a directory two, plus one for cleanup after a failed upload and
     # one more to remove guest-side parent directories the failed upload created. Creating missing
     # parents costs none: the walk rides in the upfront check and the mkdir lines in the payload batch.
-    # That is the cost of checking the copy strictly before it is moved into place.
+    # PrivateFiles on an upload costs none either (its mode line rides in the finalize batch), except
+    # that a failed finalize batch then needs up to two more to tell whether the rename had already
+    # landed. That is the cost of checking the copy strictly before it is moved into place.
     if ($AuthMode -notin @('KeyAgent', 'InteractivePassword')) { throw "Unknown SSH auth mode '$AuthMode'." }
     $state = @{ Completed = 0; Skipped = 0; Failed = 0; BytesTransferred = [long]0
         Errors = [Collections.Generic.List[string]]::new() }
@@ -2062,6 +2066,7 @@ function Copy-LabTransferItemSftp {
     $fail = { param([string]$Message) $state.Failed++; $state.Errors.Add($Message) }
     $toVM = $Direction -eq 'ToVM'
     $passwordMode = $AuthMode -eq 'InteractivePassword'
+    $privateFiles = $PermissionProfile -eq 'PrivateFiles'
 
     # --- Paths: validated before any connection is made. ---
     # Characters sftp's batch parser or its globbing treat specially even inside double quotes are
@@ -2296,6 +2301,57 @@ function Copy-LabTransferItemSftp {
             if ($result.ExitCode -ne 0) { Write-Warning "Could not remove temporary transfer item '$remoteTemp' on the guest (sftp exit $($result.ExitCode))." }
         } catch { Write-Warning "Could not remove temporary transfer item '$remoteTemp' on the guest: $($_.Exception.Message)" }
     }
+    # --- PrivateFiles. The guest-side mode line is appended after the rename in the finalize batch, so
+    # when that batch fails, its exit code alone cannot say whether the rename had already run. ---
+    # $true: the rename landed (the temp is gone and the destination is there as $ExpectedMode), so only
+    # the mode line can have failed. $false: it did not land. $null: the guest could not be inspected.
+    $renameLanded = {
+        param([string]$ExpectedMode)
+        $temp = & $probeRemote $remoteTemp
+        if ($temp.Error) { return $null }
+        if ($temp.Exists) { return $false }
+        $landedItem = & $probeRemote $remotePath
+        if ($landedItem.Error) { return $null }
+        return [bool]($landedItem.Exists -and $landedItem.Mode -eq $ExpectedMode)
+    }
+    # A successful batch exit with a setstat error line in its output (OpenSSH prints "Couldn't setstat
+    # on ..." or "remote setstat ..." for a failed mode change) still counts as a failed mode change.
+    # Password mode captures no output, so there the exit code is the only signal.
+    $setstatError = {
+        param($Result)
+        return @($Result.Output | Where-Object { $_ -and $_ -notmatch '^sftp>' -and $_ -match '(?i)setstat' } | Select-Object -First 1)
+    }
+    # Host side (a download's destination): the same Set-LabTransferPrivateAcl the Windows adapter applies
+    # to its own downloads, with no session. A downloaded tree is restricted item by item, deepest first:
+    # protecting a directory before its contents would strip what they inherit from it. Returns $null,
+    # or a description of what could not be restricted.
+    $restrictLocal = {
+        param([string]$Path, [bool]$IsDirectory)
+        $items = [Collections.Generic.List[object]]::new()
+        $items.Add([pscustomobject]@{ Path = $Path; IsDirectory = $IsDirectory })
+        try {
+            if ($IsDirectory) {
+                # Parents are listed before their contents, so the reverse order below is deepest first.
+                $pending = [Collections.Generic.Stack[string]]::new()
+                $pending.Push($Path)
+                while ($pending.Count -gt 0) {
+                    foreach ($entry in ([IO.DirectoryInfo]::new($pending.Pop())).GetFileSystemInfos()) {
+                        $isDir = $entry -is [IO.DirectoryInfo]
+                        $items.Add([pscustomobject]@{ Path = $entry.FullName; IsDirectory = $isDir })
+                        if ($isDir) { $pending.Push($entry.FullName) }
+                    }
+                }
+            }
+        } catch { return "the downloaded tree could not be enumerated: $($_.Exception.Message)" }
+        $errors = [Collections.Generic.List[string]]::new()
+        for ($i = $items.Count - 1; $i -ge 0; $i--) {
+            try { Set-LabTransferPrivateAcl -Session $null -Path $items[$i].Path -IsDirectory $items[$i].IsDirectory }
+            catch { $errors.Add($_.Exception.Message) }
+        }
+        if ($errors.Count -eq 0) { return $null }
+        if ($items.Count -eq 1) { return $errors[0] }
+        return "$($errors.Count) of $($items.Count) items could not be restricted (first: $($errors[0]))"
+    }
 
     # --- Upfront check: source, then destination, then the conflict decision -- all before any payload
     # command, so a refused or skipped item moves nothing (the same guarantee as the Windows engine). ---
@@ -2413,9 +2469,29 @@ function Copy-LabTransferItemSftp {
     if ($toVM -and $Recurse) {
         # One session: rename runs only if put -r succeeded (a failing batch command stops the batch),
         # and it is a single atomic POSIX rename of the whole tree.
-        $tree = & $runBatch @($remoteMkdirLines + @(('put -r ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp)),
+        $treeBatch = @($remoteMkdirLines + @(('put -r ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp)),
             ('rename ' + (& $quote $remoteTemp) + ' ' + (& $quote $remotePath))))
-        if ($tree.ExitCode -eq 0) {
+        # PrivateFiles restricts the new directory root only (README: the files inside keep the mode the
+        # guest gives them); after the rename, so it runs only once the tree is in place.
+        if ($privateFiles) { $treeBatch += 'chmod 700 ' + (& $quote $remotePath) }
+        $tree = & $runBatch $treeBatch
+        $permissionProblem = $null
+        $treeLanded = $tree.ExitCode -eq 0
+        if ($privateFiles) {
+            if ($treeLanded) {
+                $line = & $setstatError $tree
+                if ($line) { $permissionProblem = $line }
+            } else {
+                $treeLanded = & $renameLanded 'd'
+                if ($treeLanded) { $permissionProblem = "sftp exit $($tree.ExitCode): $(& $tail $tree)" }
+            }
+        }
+        if ($null -eq $treeLanded) {
+            & $fail "${destinationLabel}: recursive upload failed (sftp exit $($tree.ExitCode): $(& $tail $tree)), and the guest could not be inspected to tell whether the directory reached its destination; inspect '$remotePath' and '$remoteTemp' on the guest by hand."
+        } elseif ($treeLanded -and $permissionProblem) {
+            # The tree is in place: nothing is rolled back, and the parents holding it are kept.
+            & $fail "${destinationLabel}: copied successfully but the private-file permission (mode 700 on the directory) could not be applied: $permissionProblem"
+        } elseif ($treeLanded) {
             $state.Completed++
             # Measured from the host-side tree that was uploaded, not parsed from sftp's progress output.
             $state.BytesTransferred += $sourceTree.Bytes
@@ -2442,13 +2518,22 @@ function Copy-LabTransferItemSftp {
                 & $fail "${destinationLabel}: the downloaded tree contains a symbolic link, junction or other reparse point ('$($landed.Reparse)'); it was not moved into place."
                 return & $summary
             }
+            $moved = $false
             try {
                 # Fails rather than overwrites if the destination appeared since the upfront check.
                 [IO.Directory]::Move($localTemp, $localPath)
-                $state.Completed++
-                # Measured from the tree that landed on this host, not parsed from sftp's progress output.
-                $state.BytesTransferred += $landed.Bytes
+                $moved = $true
             } catch { & $fail "${destinationLabel}: could not be finalized: $($_.Exception.Message)" }
+            if ($moved) {
+                $permissionProblem = if ($privateFiles) { & $restrictLocal $localPath $true } else { $null }
+                if ($permissionProblem) {
+                    & $fail "${destinationLabel}: copied successfully but the private-file permission could not be applied: $permissionProblem"
+                } else {
+                    $state.Completed++
+                    # Measured from the tree that landed on this host, not parsed from sftp's progress output.
+                    $state.BytesTransferred += $landed.Bytes
+                }
+            }
         } finally {
             & $removeLocal $localTemp
             if ($state.Completed -eq 0) { & $removeCreatedLocalParents }
@@ -2496,8 +2581,27 @@ function Copy-LabTransferItemSftp {
         $batchB = @()
         if ($action -eq 'Overwrite') { $batchB += 'rm ' + (& $quote $remotePath) }
         $batchB += 'rename ' + (& $quote $remoteTemp) + ' ' + (& $quote $remotePath)
+        # PrivateFiles: after the rename, in the same batch, so it runs only once the file is in place.
+        if ($privateFiles) { $batchB += 'chmod 600 ' + (& $quote $remotePath) }
         $finalize = & $runBatch $batchB
-        if ($finalize.ExitCode -eq 0) {
+        $permissionProblem = $null
+        $fileLanded = $finalize.ExitCode -eq 0
+        if ($privateFiles) {
+            if ($fileLanded) {
+                $line = & $setstatError $finalize
+                if ($line) { $permissionProblem = $line }
+            } else {
+                $fileLanded = & $renameLanded '-'
+                if ($fileLanded) { $permissionProblem = "sftp exit $($finalize.ExitCode): $(& $tail $finalize)" }
+            }
+        }
+        if ($null -eq $fileLanded) {
+            # Nothing is removed: the verified copy may be the only one left, at either path.
+            & $fail "${destinationLabel}: could not be finalized (sftp exit $($finalize.ExitCode): $(& $tail $finalize)), and the guest could not be inspected to tell whether the file reached its destination; inspect '$remotePath' and '$remoteTemp' on the guest by hand."
+        } elseif ($fileLanded -and $permissionProblem) {
+            # The file is in place: nothing is rolled back, and the parents holding it are kept.
+            & $fail "${destinationLabel}: copied successfully but the private-file permission (mode 600) could not be applied: $permissionProblem"
+        } elseif ($fileLanded) {
             $state.Completed++
             $state.BytesTransferred += $source.Size
         } elseif ($action -eq 'Overwrite') {
@@ -2538,6 +2642,7 @@ function Copy-LabTransferItemSftp {
         }
         if ($problem) { & $fail "${destinationLabel}: $problem"; return & $summary }
         $removed = $false
+        $moved = $false
         try {
             if ($action -eq 'Overwrite' -and [IO.File]::Exists($localPath)) {
                 [IO.File]::SetAttributes($localPath, [IO.FileAttributes]::Normal)
@@ -2545,14 +2650,22 @@ function Copy-LabTransferItemSftp {
                 $removed = $true
             }
             [IO.File]::Move($localTemp, $localPath)
-            $state.Completed++
-            $state.BytesTransferred += $copy.Size
+            $moved = $true
         } catch {
             if ($removed) {
                 # The old file is already gone: keep the verified copy rather than delete the only one left.
                 $retainTemp = $true
                 & $fail "${destinationLabel}: the existing file was removed but the verified copy could not be moved into place ($($_.Exception.Message)); the copy was kept at '$localTemp'."
             } else { & $fail "${destinationLabel}: could not be finalized: $($_.Exception.Message)" }
+        }
+        if ($moved) {
+            $permissionProblem = if ($privateFiles) { & $restrictLocal $localPath $false } else { $null }
+            if ($permissionProblem) {
+                & $fail "${destinationLabel}: copied successfully but the private-file permission could not be applied: $permissionProblem"
+            } else {
+                $state.Completed++
+                $state.BytesTransferred += $copy.Size
+            }
         }
     } finally {
         if (-not $retainTemp) { & $removeLocal $localTemp }
@@ -2604,7 +2717,7 @@ function Invoke-LabFileTransfer {
             $sshSettings = Get-LabSshConnectionSettings $VMId
             $authMode = Resolve-LabSshAuthMode $sshSettings.IdentityFilePath $NonInteractive
             $copyAttempted = $true
-            $result = Copy-LabTransferItemSftp $sshSettings.HostNameOrAddress $sshSettings.Port $sshSettings.UserName $sshSettings.IdentityFilePath $authMode $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun
+            $result = Copy-LabTransferItemSftp $sshSettings.HostNameOrAddress $sshSettings.Port $sshSettings.UserName $sshSettings.IdentityFilePath $authMode $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun $PermissionProfile
             $result = $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
             return $result
         } else {
