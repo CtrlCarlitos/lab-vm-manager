@@ -1645,6 +1645,156 @@ function Test-LabWindowsIsoInScope {
     return @($Images | Where-Object IsWindows11Client).Count -gt 0
 }
 
+# Patches a Windows installer ISO's EFI boot-loader image (efi\microsoft\boot\efisys.bin) in place
+# with its own no-prompt variant (efisys_noprompt.bin), so Hyper-V Gen2's "Press any key to boot
+# from CD or DVD" prompt never appears. Never modifies $SourceIsoPath itself -- always writes a
+# new file at $OutputPath, and only once every check below holds. On any ambiguity it returns
+# Patched=$false with a clear Reason and makes no copy at all, so a multi-gigabyte ISO is never
+# duplicated for nothing; the caller falls back to the unpatched $SourceIsoPath in that case.
+#
+# This is pure byte-array math over the ISO9660/El Torito structure, parsed by hand against a real
+# Windows 11 ISO and confirmed to work this way (see the design doc's "Already proven" section): a
+# Boot Record Volume Descriptor at sector 17 names "EL TORITO SPECIFICATION" and points at a boot
+# catalog sector; the catalog's EFI entry carries a Load RBA -- the sector firmware actually loads
+# efisys.bin's bytes from. $offset = LoadRBA * 2048 is where those bytes live in the raw ISO file.
+# Before touching anything, the content actually AT that offset is compared byte-for-byte against
+# efisys.bin's own bytes (read from the mounted volume); if they don't match, this ISO's boot
+# layout isn't one this technique understands, and nothing is patched or copied -- never patch
+# blind.
+#
+# Mount-DiskImage/Get-Volume/Dismount-DiskImage pairing and the $mounted dismount guard: identical
+# to Get-LabWindowsInstallImages above, reused verbatim, including the plain string concatenation
+# for the mounted-volume path (Join-Path resolves the FileSystem provider's drive at call time,
+# which throws "Cannot find drive" for a drive letter the mount only just assigned). The mount is
+# used only to read the two loose efisys*.bin files; the El Torito structure itself is parsed
+# straight from $SourceIsoPath on disk, never through the mount.
+#
+# Copy-Item, not [IO.File]::Copy, performs the whole-file copy: unlike New-LabSeedIso (which
+# instantiates real COM and so has no fake-able surface), this function's logic is independently
+# unit-testable, and a cmdlet -- unlike a static .NET call -- can be verified in Test-LabVM.ps1 as
+# never invoked on any of the refusal paths below, so a multi-gigabyte copy is never made for
+# nothing.
+function New-LabPatchedBootableIso {
+    param([string]$SourceIsoPath, [string]$OutputPath)
+    $sectorSize = 2048
+    $bootDirName = 'efi\microsoft\boot'
+
+    # Reads exactly $Count bytes at $Offset from the real ISO file on disk, looping Read since a
+    # single call is not guaranteed to fill the buffer. Never loads the whole, possibly
+    # multi-gigabyte, file into memory. A scriptblock, not a nested function: this function's own
+    # text is extracted and evaluated standalone by Test-LabVM.ps1's AST harness, and a second
+    # top-level "function" statement in here would confuse tooling that locates this function's
+    # body by searching for the next "function" keyword.
+    $readIsoBytes = {
+        param([string]$Path, [int64]$Offset, [int]$Count)
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            [void]$stream.Seek($Offset, [IO.SeekOrigin]::Begin)
+            $buffer = New-Object byte[] $Count
+            $readTotal = 0
+            while ($readTotal -lt $Count) {
+                $read = $stream.Read($buffer, $readTotal, $Count - $readTotal)
+                if ($read -le 0) {
+                    throw "Unexpected end of file reading $Count byte(s) at offset $Offset from '$Path'."
+                }
+                $readTotal += $read
+            }
+            return $buffer
+        } finally {
+            $stream.Dispose()
+        }
+    }
+
+    $mounted = $false
+    $efisysBytes = $null
+    $noPromptBytes = $null
+    $earlyReason = $null
+    try {
+        $mountResult = Mount-DiskImage -ImagePath $SourceIsoPath -PassThru -ErrorAction Stop
+        $mounted = $true
+        $volume = Get-Volume -DiskImage $mountResult -ErrorAction Stop
+        # Plain string concatenation, not Join-Path: Join-Path resolves the FileSystem provider's
+        # drive at call time, which throws "Cannot find drive" for a drive letter the mount only
+        # just assigned (and is unavailable at all in this file's fake-cmdlet harness).
+        $bootDir = "$($volume.DriveLetter):\$bootDirName"
+        $efisysPath = "$bootDir\efisys.bin"
+        $noPromptPath = "$bootDir\efisys_noprompt.bin"
+        if (-not (Test-Path -LiteralPath $noPromptPath -PathType Leaf)) {
+            $earlyReason = "'$SourceIsoPath' does not ship the no-prompt boot-loader variant " +
+                "($bootDirName\efisys_noprompt.bin is missing after mounting it). It will still " +
+                'prompt for a key press at boot; fall back to the unpatched ISO.'
+        } else {
+            $efisysBytes = [byte[]](Get-Content -LiteralPath $efisysPath -Encoding Byte -ReadCount 0 -ErrorAction Stop)
+            $noPromptBytes = [byte[]](Get-Content -LiteralPath $noPromptPath -Encoding Byte -ReadCount 0 -ErrorAction Stop)
+        }
+    } finally {
+        # Only dismount if Mount-DiskImage itself actually succeeded. Otherwise nothing was ever
+        # mounted, and an unconditional Dismount-DiskImage here would itself throw a confusing
+        # "not currently mounted"-style error, masking the real Mount-DiskImage failure above.
+        if ($mounted) {
+            Dismount-DiskImage -ImagePath $SourceIsoPath -ErrorAction Stop
+        }
+    }
+    if ($null -ne $earlyReason) {
+        return [pscustomobject]@{ Patched = $false; Reason = $earlyReason; OutputPath = $null }
+    }
+    if ($efisysBytes.Length -ne $noPromptBytes.Length) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath' cannot be patched: $bootDirName\efisys.bin is " +
+                "$($efisysBytes.Length) byte(s) but $bootDirName\efisys_noprompt.bin is " +
+                "$($noPromptBytes.Length) byte(s). The in-place byte swap this technique uses " +
+                'requires them to be exactly the same length.'
+            OutputPath = $null
+        }
+    }
+
+    # Parse the El Torito boot structure from the SOURCE ISO FILE ON DISK, not the mounted volume
+    # -- the mount above is only ever used to read the two loose efisys*.bin files.
+    $brvd = & $readIsoBytes $SourceIsoPath ([int64]17 * $sectorSize) $sectorSize
+    $standardIdentifier = [Text.Encoding]::ASCII.GetString($brvd, 1, 5)
+    $bootSystemIdentifier = [Text.Encoding]::ASCII.GetString($brvd, 7, 32).TrimEnd([char]0)
+    if ($brvd[0] -ne 0 -or $standardIdentifier -ne 'CD001' -or $bootSystemIdentifier -ne 'EL TORITO SPECIFICATION') {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath' has no El Torito Boot Record Volume Descriptor at sector " +
+                "17 ('EL TORITO SPECIFICATION' was not found there). This ISO's boot structure " +
+                "isn't one this technique understands."
+            OutputPath = $null
+        }
+    }
+    $catalogSector = [BitConverter]::ToUInt32($brvd, 71)
+    $catalog = & $readIsoBytes $SourceIsoPath ([int64]$catalogSector * $sectorSize) $sectorSize
+    $loadRba = [BitConverter]::ToUInt32($catalog, 40)
+    $offset = [int64]$loadRba * $sectorSize
+    $actualBytes = & $readIsoBytes $SourceIsoPath $offset $efisysBytes.Length
+    $bytesMatch = $true
+    for ($i = 0; $i -lt $actualBytes.Length; $i++) {
+        if ($actualBytes[$i] -ne $efisysBytes[$i]) { $bytesMatch = $false; break }
+    }
+    if (-not $bytesMatch) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath': the El Torito boot catalog did not point where expected " +
+                "-- the bytes at its EFI entry's Load RBA (byte offset $offset) do not match " +
+                "$bootDirName\efisys.bin's own content. Refusing to patch blind."
+            OutputPath = $null
+        }
+    }
+
+    # Only once every check above holds: copy the whole source file, then overwrite exactly
+    # efisys.bin's-length bytes at $offset with efisys_noprompt.bin's content.
+    Copy-Item -LiteralPath $SourceIsoPath -Destination $OutputPath -Force -ErrorAction Stop
+    $outputStream = [IO.File]::Open($OutputPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        [void]$outputStream.Seek($offset, [IO.SeekOrigin]::Begin)
+        $outputStream.Write($noPromptBytes, 0, $noPromptBytes.Length)
+    } finally {
+        $outputStream.Dispose()
+    }
+    return [pscustomobject]@{ Patched = $true; Reason = $null; OutputPath = $OutputPath }
+}
+
 function Test-LabVMHasKeyProtector {
     param([guid]$VMId)
     # Pure, read-only presence check -- it must never mutate. Set-LabVMBootProfile below calls this

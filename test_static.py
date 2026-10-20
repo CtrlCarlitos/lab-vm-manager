@@ -786,5 +786,17 @@ class SourceContract(unittest.TestCase):
         self.assertIn("-eq 'Client'", body)
         self.assertIn('22000', body)
 
+    # --- Windows unattended install, Task 2: no-prompt boot-loader patch ---
+    def test_boot_patch_function_exists(self):
+        self.assertIn('function New-LabPatchedBootableIso', self.s)
+    def test_boot_patch_verifies_before_writing(self):
+        body = self.s.split('function New-LabPatchedBootableIso {', 1)[1].split('\nfunction ', 1)[0]
+        # Must compare the catalog-pointed-at bytes against efisys.bin's own bytes before patching, not patch blind.
+        self.assertIn('efisys.bin', body)
+        self.assertIn('efisys_noprompt.bin', body)
+    def test_boot_patch_refuses_size_mismatch(self):
+        body = self.s.split('function New-LabPatchedBootableIso {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('.Length', body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
