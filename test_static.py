@@ -351,6 +351,51 @@ class SourceContract(unittest.TestCase):
         # only ever go red if a future change reintroduces ControlMaster/ControlPath.
         self.assertNotIn('ControlMaster', self.s)
         self.assertNotIn('ControlPath', self.s)
+    def test_sftp_engine_checks_conflict_before_put(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Get-LabTransferConflictKind', body)
+        idx_conflict = body.index('Get-LabTransferConflictKind')
+        idx_put = body.index("'put ")
+        self.assertLess(idx_conflict, idx_put)
+    def test_sftp_engine_uses_rename_for_finalize(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'rename ", body)
+    def test_sftp_engine_rejects_existing_directory_destination(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('not supported in this version', body)
+    def test_sftp_engine_hash_verification_uses_ssh_not_sftp_batch(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('sha256sum', body)
+    def test_sftp_engine_rejects_symlinks(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("-eq 'l'", body)
+    def test_sftp_engine_dry_run_skips_payload_commands(self):
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$DryRun', body)
+    def test_ssh_command_uses_same_auth_mode_flags_as_sftp(self):
+        # Controller ruling A: the follow-up ssh.exe calls (hash/size checks, password-mode probe)
+        # use the same AuthMode-driven flags as sftp: StrictHostKeyChecking=yes always, BatchMode=yes
+        # only in the KeyAgent branch, and the tooling check before any ssh.exe invocation.
+        body = self.s.split('function Invoke-LabSshCommand {', 1)[1].split('\nfunction ', 1)[0]
+        body = '\n'.join(l for l in body.splitlines() if not l.lstrip().startswith('#'))
+        idx_check = body.index('Get-LabSshToolingInfo')
+        self.assertLess(idx_check, body.index('ssh.exe @arguments'))
+        key_branch = body.split("'KeyAgent' {", 1)[1].split("'InteractivePassword' {", 1)[0]
+        password_branch = body.split("'InteractivePassword' {", 1)[1].split('default {', 1)[0]
+        self.assertIn('BatchMode=yes', key_branch)
+        self.assertIn('StrictHostKeyChecking=yes', key_branch)
+        self.assertNotIn('BatchMode', password_branch)
+        self.assertIn('StrictHostKeyChecking=yes', password_branch)
+        self.assertNotIn('2>&1', password_branch)
+    def test_sftp_engine_routes_every_process_through_helpers(self):
+        # The engine never launches ssh.exe/sftp.exe itself: every connection goes through the two
+        # helpers that own the flag rules and the tooling check. Comment lines are ignored.
+        body = self.s.split('function Copy-LabTransferItemSftp {', 1)[1].split('\nfunction ', 1)[0]
+        body = '\n'.join(l for l in body.splitlines() if not l.lstrip().startswith('#'))
+        self.assertNotIn('ssh.exe', body)
+        self.assertNotIn('sftp.exe', body)
+        self.assertIn('Invoke-LabSftpCommand ', body)
+        self.assertIn('Invoke-LabSshCommand ', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

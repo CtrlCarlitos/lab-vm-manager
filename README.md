@@ -220,6 +220,43 @@ Those findings produce a two-mode authentication design: `-o BatchMode=yes` plus
 
 **Changed host key:** if the guest's host key changes (reinstall, restored snapshot, etc.), `StrictHostKeyChecking=yes` means every connection attempt fails until the stale entry is cleared. `Update-LabSshKnownHost` handles that: it previews the exact host:port entry about to be cleared, requires the strong `UPDATE KNOWN HOST <host>` confirmation, and only then runs `ssh-keygen.exe -R` (bracket notation, `[host]:port`, for a non-default port; plain `host` for the default port 22) to remove the stale entry from the operator's own `~/.ssh/known_hosts` — it never edits that file directly. The very next connection attempt (interactive, so the real OpenSSH host-key-trust prompt reaches the operator) re-establishes trust in the new key.
 
+## Linux transfer engine (SFTP)
+
+`Copy-LabTransferItemSftp` is the Linux counterpart of the PowerShell Direct engine and returns the same summary (`Completed`, `Skipped`, `Failed`, `BytesTransferred`, `Errors`). It uses the same `Error`/`Skip`/`Overwrite` conflict rules, and it decides every conflict before any data moves. Every connection goes through `Invoke-LabSftpCommand` or `Invoke-LabSshCommand`. Both apply the same flags for the selected auth mode: `StrictHostKeyChecking=yes` always, and `BatchMode=yes` only in `KeyAgent` mode. Both also check that the OpenSSH client is installed first. A connection-level failure (OpenSSH exit code `255`: unreachable, refused, authentication or host-key failure, or a dropped connection) stops the transfer with an error that states the counts reached so far. A command that fails inside a working session only fails that item.
+
+- **Upfront check.** The source and destination are inspected before anything is copied. In `KeyAgent` mode, this is an `ls -la` of the guest-side path's parent directory. The parent is listed rather than the path itself because `sftp`'s `ls` of a symlink to a directory silently lists the target's contents. In `InteractivePassword` mode, no output can be read, because the console belongs to the operator. Instead, one `ssh` call runs a shell `if [ -L … ]; elif [ -d … ] …` test, and the guest reports the result through its exit code. A symbolic link, either as the source or as the destination, is refused and never followed. So is any other non-regular file.
+- **Single-file upload.** The upload uses two separate `sftp` batches. The first batch uploads to a `<destination>.labxfer-<id>.tmp` sibling. In `KeyAgent` mode, the same session also lists that temporary copy. The size is then checked, plus SHA-256 with `-VerifyHash`. Only after those checks pass does the second batch (`rm` the old file for `Overwrite`, then `rename`) put the copy at the real destination. A single batch could not do this, because every command in it runs before any of its output can be checked. If a check fails, the temporary copy is removed and the destination is left untouched. `Overwrite` uses an explicit `rm` before the `rename`. That is the portable choice: servers with the `posix-rename@openssh.com` extension could replace the file in a single step, but that cannot be relied on without testing the guest.
+- **Single-file download.** The file lands as a temporary sibling on this host and is checked there. It is then moved into place with the same delete-then-move finalize that the Windows engine uses on the host.
+- **Directories.** A directory is copied only when the destination does not exist yet. An existing destination directory fails with the documented "not supported in this version" message, whatever `-OnConflict` says. A fresh directory is copied with one `put -r`/`get -r` into a temporary sibling directory, followed by one `rename` (or host-side move) of the whole tree, so the tree lands all at once or not at all. It counts as one item in `Completed`. `BytesTransferred` is measured from the host-side tree, not parsed from `sftp`'s progress output. `-VerifyHash` is not applied to the files inside a recursive Linux transfer in this version, and the engine prints a warning saying so. Before an upload, the host-side source tree is scanned, and any junction or symlink inside it refuses the whole upload. A downloaded tree is scanned in the same way before it is moved into place.
+- **Paths.** Guest-side paths must be absolute POSIX paths without empty, `.` or `..` segments. Host-side paths must be absolute drive-letter paths. They are passed to `sftp.exe` with forward slashes. Characters that `sftp` treats specially even inside quotes are rejected rather than escaped: `"`, a backslash on the guest side, `*`, `?`, `[`, `]`, `{`, `}`, and control characters. Missing parent directories are not created on either side.
+
+**Password prompts.** Every connection is a separate process, because connection sharing is not available (see the design decision above). In `KeyAgent` mode this costs only time. In `InteractivePassword` mode, each connection asks for the password again:
+
+| Transfer | Password prompts |
+|---|---|
+| Single-file upload | Up to 4: upfront check, upload, size/SHA-256 check, finalize |
+| Single-file download | 3: upfront check, download, size/SHA-256 check |
+| Directory | 2: upfront check, copy |
+| Cleanup after a failed single-file upload | 1 more |
+
+This is the cost of checking every copy before it replaces anything, and it is accepted on purpose.
+
+**Guest requirements:**
+
+- An SSH server with the SFTP subsystem enabled.
+- For `-VerifyHash`, and for any transfer in `InteractivePassword` mode: shell access for the account. An `sftp`-only account (for example `ForceCommand internal-sftp`) is not enough. The account also needs a POSIX-compatible login shell (`sh`, `bash`, `dash`, `zsh`; not `fish` or `csh`).
+- **`sha256sum`** (GNU coreutils or BusyBox) on the guest for `-VerifyHash`. The guest computes the hash and compares it with the host's own `Get-FileHash`. If `sha256sum` is missing, the item fails with a message saying so.
+- `stat -c %s` on the guest for the size check in `InteractivePassword` mode.
+
+**Known limitations:**
+
+- A failed recursive upload can leave a partial `*.labxfer-*.tmp` directory tree on the guest. `sftp` has no recursive delete, so the engine cannot remove the tree. The failure message names it so you can delete it by hand. This is the same kind of accepted gap as the Windows engine's leftover temporary item after a lost connection.
+- After a lost connection, a temporary item may remain on either side.
+- `Overwrite` is `rm` then `rename`, so there is a short window in which the destination does not exist. If the `rename` then fails, the verified temporary copy is kept and named in the error, because it may be the only copy left.
+- The conflict check happens before the copy, so a file that someone else creates at the destination in between is not seen by it. On servers whose `rename` replaces an existing file, the final `rename` would then replace that file.
+- In `KeyAgent` mode, a guest parent directory that cannot be listed fails the upfront check. Nothing is copied in that case.
+- What OpenSSH's `get -r` does with a symlink nested inside a guest-side tree (follow it, skip it, or fail) has not been verified without a live guest. See `MANUAL-TESTS.md`, "Linux transfer engine".
+
 ## Primary references
 
 - Microsoft: Using checkpoints — https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/checkpoints

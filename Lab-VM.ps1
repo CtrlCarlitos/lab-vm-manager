@@ -458,6 +458,53 @@ function Invoke-LabSftpCommand {
     return [pscustomobject]@{ ExitCode = [int]$exitCode; Output = $output }
 }
 
+function Invoke-LabSshCommand {
+    param(
+        [string]$HostNameOrAddress,
+        [int]$Port,
+        [string]$UserName,
+        [AllowNull()][AllowEmptyString()][string]$IdentityFilePath,
+        [string]$AuthMode,
+        [string]$RemoteCommand
+    )
+    # The ssh.exe counterpart of Invoke-LabSftpCommand, for the few guest-side checks sftp's batch
+    # vocabulary cannot express (SHA-256, and the password-mode existence/size checks). Same flag rules,
+    # driven by the same AuthMode: StrictHostKeyChecking=yes always, BatchMode=yes only for KeyAgent.
+    # Each call is its own connection (no connection sharing, see README), so in InteractivePassword mode
+    # every call asks for the password again.
+    $ErrorActionPreference = 'Continue'
+    $tooling = Get-LabSshToolingInfo
+    if (-not $tooling.Available) {
+        throw 'ssh.exe/sftp.exe (Windows OpenSSH Client) were not found. Install the OpenSSH Client optional feature on this host.'
+    }
+    # Windows PowerShell 5.1 does not escape an embedded double quote when it builds a native command
+    # line, so a remote command containing one would reach the guest's shell altered.
+    if ($RemoteCommand.Contains('"')) { throw 'Remote SSH commands built by this script must not contain a double quote.' }
+    $target = "$UserName@$HostNameOrAddress"
+    switch ($AuthMode) {
+        'KeyAgent' {
+            $arguments = @('-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-p', $Port)
+            if (-not [string]::IsNullOrEmpty($IdentityFilePath)) { $arguments += @('-i', $IdentityFilePath) }
+            $arguments += @($target, $RemoteCommand)
+            $raw = & ssh.exe @arguments 2>&1
+            $exitCode = $LASTEXITCODE
+            $output = [string[]]@($raw | ForEach-Object { [string]$_ })
+        }
+        'InteractivePassword' {
+            $arguments = @('-o', 'StrictHostKeyChecking=yes', '-p', $Port, $target, $RemoteCommand)
+            # No -o BatchMode=yes and no stderr redirection: OpenSSH's own password and host-key-trust
+            # prompts must reach the operator's console unmodified. Out-Host only keeps any remote stdout
+            # (the commands used here print none) out of this function's return value -- inside a
+            # function, PowerShell would otherwise capture that stdout into the returned array.
+            & ssh.exe @arguments | Out-Host
+            $exitCode = $LASTEXITCODE
+            $output = [string[]]@()
+        }
+        default { throw "Unknown SSH auth mode '$AuthMode'." }
+    }
+    return [pscustomobject]@{ ExitCode = [int]$exitCode; Output = $output }
+}
+
 function Test-LabSshConnection {
     param([guid]$VMId)
     $settings = Get-LabSshConnectionSettings $VMId
@@ -1831,6 +1878,447 @@ function Copy-LabTransferItem {
         }
         return & $summary
     }
+}
+
+function ConvertFrom-LabSftpListing {
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$Output,
+        [int]$ExitCode,
+        [string]$Path
+    )
+    # Parses captured sftp batch output (KeyAgent mode only; password mode captures none) for the
+    # long-listing line naming $Path. Returns the same shape as the engine's other probes: the leading
+    # mode character ('-' file, 'd' directory, 'l' symlink, anything else a special file) and the size.
+    # The name is matched exactly, either as the bare leaf name (a server's own long name, used when
+    # listing a directory) or as the full path (the client's reformatted line) -- both forms occur.
+    $lines = @($Output | Where-Object { $_ } | ForEach-Object { $_.TrimEnd("`r") } | Where-Object { $_ -notmatch '^sftp>' })
+    if ($ExitCode -ne 0) {
+        if (@($lines | Where-Object { $_ -match 'not found|No such file' }).Count -gt 0) {
+            return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null }
+        }
+        return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1
+            Error = "the guest-side listing failed (sftp exit $ExitCode): $(@($lines | Select-Object -Last 3) -join ' ')" }
+    }
+    $leaf = $Path.Substring($Path.LastIndexOf('/') + 1)
+    $pattern = '^(?<mode>\S)\S*\s+\d+\s+\S+\s+\S+\s+(?<size>\d+)\s+\S+\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4})\s(?<name>.+)$'
+    foreach ($line in $lines) {
+        $match = [regex]::Match($line, $pattern)
+        if (-not $match.Success) { continue }
+        $name = $match.Groups['name'].Value
+        $mode = $match.Groups['mode'].Value
+        # Some servers append " -> target" to a symlink's long name.
+        if ($mode -eq 'l' -and $name.Contains(' -> ')) { $name = $name.Substring(0, $name.IndexOf(' -> ')) }
+        if ($name -ceq $leaf -or $name -ceq $Path) {
+            return [pscustomobject]@{ Exists = $true; Mode = $mode; Size = [long]$match.Groups['size'].Value; Error = $null }
+        }
+    }
+    return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null }
+}
+
+function Copy-LabTransferItemSftp {
+    param(
+        [string]$HostNameOrAddress,
+        [int]$Port,
+        [string]$UserName,
+        [AllowNull()][AllowEmptyString()][string]$IdentityFilePath,
+        [string]$AuthMode,
+        [ValidateSet('ToVM', 'FromVM')][string]$Direction,
+        [string]$SourcePath,
+        [string]$DestinationPath,
+        [bool]$Recurse,
+        [ValidateSet('Error', 'Skip', 'Overwrite')][string]$OnConflict,
+        [bool]$VerifyHash,
+        [bool]$DryRun
+    )
+    # Every connection is a separate ssh.exe/sftp.exe process (no connection reuse; see README), so in
+    # InteractivePassword mode each one below asks for the password: a single-file upload needs up to
+    # four (upfront check, upload, size/hash check, finalize), a single-file download three (upfront
+    # check, download, size/hash check), a directory two, plus one for cleanup after a failed upload.
+    # That is the cost of checking the copy strictly before it is moved into place.
+    if ($AuthMode -notin @('KeyAgent', 'InteractivePassword')) { throw "Unknown SSH auth mode '$AuthMode'." }
+    $state = @{ Completed = 0; Skipped = 0; Failed = 0; BytesTransferred = [long]0
+        Errors = [Collections.Generic.List[string]]::new() }
+    $summary = {
+        [pscustomobject]@{ Completed = [int]$state.Completed; Skipped = [int]$state.Skipped; Failed = [int]$state.Failed
+            BytesTransferred = [long]$state.BytesTransferred; Errors = [string[]]$state.Errors.ToArray() }
+    }
+    $fail = { param([string]$Message) $state.Failed++; $state.Errors.Add($Message) }
+    $toVM = $Direction -eq 'ToVM'
+    $passwordMode = $AuthMode -eq 'InteractivePassword'
+
+    # --- Paths: validated before any connection is made. ---
+    # Characters sftp's batch parser or its globbing treat specially even inside double quotes are
+    # rejected rather than escaped.
+    $localPath = if ($toVM) { $SourcePath } else { $DestinationPath }
+    $remotePath = if ($toVM) { $DestinationPath } else { $SourcePath }
+    if ($localPath -notmatch '^[A-Za-z]:[\\/]') { & $fail "${localPath}: host-side transfer paths must be absolute drive-letter paths."; return & $summary }
+    $localPath = $localPath.TrimEnd('\', '/')
+    if ($localPath -match '^[A-Za-z]:$') { & $fail "${localPath}\: a drive root cannot be a transfer source or destination."; return & $summary }
+    if ($localPath -match '[\x00-\x1F\x7F"*?\[\]{}]') {
+        & $fail "${localPath}: host-side path contains a character sftp treats specially even when quoted (`", *, ?, [, ], {, } or a control character); such paths are not supported."
+        return & $summary
+    }
+    $remoteProblem = $null
+    if (-not $remotePath.StartsWith('/')) { $remoteProblem = 'guest-side transfer paths must be absolute POSIX paths (starting with /).' }
+    else {
+        $remotePath = $remotePath.TrimEnd('/')
+        if ($remotePath -eq '') { $remoteProblem = 'the guest root directory cannot be a transfer source or destination.' }
+        elseif ($remotePath -match '[\x00-\x1F\x7F"\\*?\[\]{}]') {
+            $remoteProblem = 'guest-side path contains a character sftp treats specially even when quoted (", \, *, ?, [, ], {, } or a control character); such paths are not supported.'
+        } elseif (@($remotePath.Substring(1).Split('/') | Where-Object { $_ -in @('', '.', '..') }).Count -gt 0) {
+            $remoteProblem = 'guest-side path must not contain empty, "." or ".." segments.'
+        }
+    }
+    if ($remoteProblem) { & $fail "${remotePath}: $remoteProblem"; return & $summary }
+    $sourceLabel = if ($toVM) { $localPath } else { $remotePath }
+    $destinationLabel = if ($toVM) { $remotePath } else { $localPath }
+    # Unique sibling name, same directory as the destination so the finalize is a rename.
+    $tempSuffix = ".labxfer-$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
+    $remoteTemp = "$remotePath$tempSuffix"
+    $localTemp = "$localPath$tempSuffix"
+
+    # --- Connection helpers. Exit code 255 is OpenSSH's connection-level failure (unreachable, refused,
+    # authentication or host-key failure, dropped connection); it throws. Any other nonzero exit is a
+    # command failing inside a working session and becomes a per-item failure. ---
+    $quote = { param([string]$Path) '"' + $Path + '"' }
+    $shellQuote = { param([string]$Path) "'" + $Path.Replace("'", "'\''") + "'" }
+    $tail = { param($Result) @($Result.Output | Where-Object { $_ -and $_ -notmatch '^sftp>' } | Select-Object -Last 3) -join ' ' }
+    $connectionLost = {
+        param([string]$Tool, $Result)
+        throw ("The SSH connection failed during the transfer ({0} exit 255: {1}). Counts before the failure: Completed={2}, Skipped={3}, Failed={4}. Inspect the destination before retrying; if the copy had started, a '*.labxfer-*.tmp' item may remain next to it." -f
+            $Tool, (& $tail $Result), $state.Completed, $state.Skipped, $state.Failed)
+    }
+    $runBatch = {
+        param([string[]]$Lines)
+        $batchPath = Join-Path ([IO.Path]::GetTempPath()) ('labsftp-' + [guid]::NewGuid().ToString('N') + '.batch')
+        $result = $null
+        try {
+            [IO.File]::WriteAllText($batchPath, (($Lines -join "`n") + "`n"))
+            # In password mode sftp's own stdout (its batch echo) arrives here alongside the result
+            # object; it is shown, not parsed.
+            foreach ($item in @(Invoke-LabSftpCommand $HostNameOrAddress $Port $UserName $IdentityFilePath $batchPath $AuthMode)) {
+                if ($null -ne $item -and $null -ne $item.PSObject.Properties['ExitCode']) { $result = $item }
+                elseif ($null -ne $item) { Write-Host $item }
+            }
+        } finally {
+            if ([IO.File]::Exists($batchPath)) { [IO.File]::Delete($batchPath) }
+        }
+        if ($null -eq $result) { throw 'sftp returned no result.' }
+        if ($result.ExitCode -eq 255) { & $connectionLost 'sftp' $result }
+        return $result
+    }
+    $runSsh = {
+        param([string]$RemoteCommand)
+        $result = Invoke-LabSshCommand $HostNameOrAddress $Port $UserName $IdentityFilePath $AuthMode $RemoteCommand
+        if ($result.ExitCode -eq 255) { & $connectionLost 'ssh' $result }
+        return $result
+    }
+
+    # --- Probes: one shape for both sides, Mode being '-' file, 'd' directory, 'l' link, else special. ---
+    $probeLocal = {
+        param([string]$Path)
+        $info = @{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null }
+        try {
+            # GetAttributes reports a link itself (even a dangling one), never its target.
+            $attributes = [IO.File]::GetAttributes($Path)
+            $info.Exists = $true
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { $info.Mode = 'l' }
+            elseif ($attributes -band [IO.FileAttributes]::Directory) { $info.Mode = 'd' }
+            else { $info.Mode = '-'; $info.Size = [long]([IO.FileInfo]::new($Path)).Length }
+        } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
+            $info.Exists = $false
+        } catch { $info.Error = $_.Exception.Message }
+        return [pscustomobject]$info
+    }
+    $probeRemote = {
+        param([string]$Path)
+        if ($passwordMode) {
+            # Password mode captures no output (the console is the operator's), so the guest's shell
+            # answers through its exit code, which $LASTEXITCODE reports either way.
+            $p = & $shellQuote $Path
+            $result = & $runSsh "if [ -L $p ]; then exit 13; elif [ -d $p ]; then exit 12; elif [ -f $p ]; then exit 11; elif [ -e $p ]; then exit 14; else exit 10; fi"
+            $modes = @{ 11 = '-'; 12 = 'd'; 13 = 'l'; 14 = '?' }
+            if ($result.ExitCode -eq 10) { return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1; Error = $null } }
+            if ($modes.ContainsKey($result.ExitCode)) {
+                return [pscustomobject]@{ Exists = $true; Mode = $modes[$result.ExitCode]; Size = [long]-1; Error = $null }
+            }
+            return [pscustomobject]@{ Exists = $false; Mode = $null; Size = [long]-1
+                Error = "the guest-side check failed (ssh exit $($result.ExitCode)); password mode needs a POSIX-compatible login shell on the guest." }
+        }
+        # The parent is listed, not the path itself: sftp's ls of a symlink to a directory silently
+        # lists the target's contents, so only the parent's listing shows the entry's own mode.
+        $parent = $Path.Substring(0, $Path.LastIndexOf('/'))
+        if ($parent -eq '') { $parent = '/' }
+        $result = & $runBatch @('ls -la ' + (& $quote $parent))
+        return ConvertFrom-LabSftpListing $result.Output $result.ExitCode $Path
+    }
+    # Guest-side size/hash check, answered by exit code: 0 match, 20 size, 21 no sha256sum, 22 hash.
+    # A negative $Size skips the size test; an empty $Hash skips the hash test.
+    $verifyRemote = {
+        param([string]$Path, [long]$Size, [AllowEmptyString()][string]$Hash)
+        $p = & $shellQuote $Path
+        $parts = [Collections.Generic.List[string]]::new()
+        if ($Size -ge 0) { $parts.Add('[ $(stat -c %s ' + $p + ' 2>/dev/null) -eq ' + $Size + ' ] 2>/dev/null || exit 20') }
+        if ($Hash) {
+            $parts.Add('command -v sha256sum >/dev/null 2>&1 || exit 21')
+            $parts.Add('h=$(sha256sum ' + $p + ' 2>/dev/null) || exit 22')
+            $parts.Add('[ ${h%% *} = ' + $Hash + ' ] 2>/dev/null || exit 22')
+        }
+        $parts.Add('exit 0')
+        $result = & $runSsh ($parts -join '; ')
+        switch ($result.ExitCode) {
+            0 { return $null }
+            20 { return "size mismatch after copy (expected $Size bytes)" }
+            21 { return 'SHA-256 could not be checked: sha256sum is not available on the guest' }
+            22 { return 'SHA-256 mismatch after copy' }
+        }
+        return "the guest-side size/hash check failed (ssh exit $($result.ExitCode)); it needs a POSIX-compatible login shell on the guest."
+    }
+    # $null when the host-side file cannot be hashed; callers turn that into a per-item failure.
+    $localHash = {
+        param([string]$Path)
+        try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { return $null }
+    }
+    # Sums file sizes and reports the first reparse point; never descends into a link.
+    $scanLocalTree = {
+        param([string]$Root)
+        $scan = @{ Bytes = [long]0; Reparse = $null; Error = $null }
+        try {
+            $pending = [Collections.Generic.Stack[string]]::new()
+            $pending.Push($Root)
+            while ($pending.Count -gt 0 -and -not $scan.Reparse) {
+                foreach ($entry in ([IO.DirectoryInfo]::new($pending.Pop())).GetFileSystemInfos()) {
+                    if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { $scan.Reparse = $entry.FullName; break }
+                    if ($entry -is [IO.DirectoryInfo]) { $pending.Push($entry.FullName) } else { $scan.Bytes += $entry.Length }
+                }
+            }
+        } catch { $scan.Error = $_.Exception.Message }
+        return [pscustomobject]$scan
+    }
+    $removeLocal = {
+        param([string]$Path)
+        $removeTree = {
+            param([string]$Target)
+            $attributes = [IO.File]::GetAttributes($Target)
+            [IO.File]::SetAttributes($Target, [IO.FileAttributes]::Normal)
+            if (-not ($attributes -band [IO.FileAttributes]::Directory)) { [IO.File]::Delete($Target); return }
+            if (-not ($attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                foreach ($entry in [IO.Directory]::GetFileSystemEntries($Target)) { & $removeTree $entry }
+            }
+            [IO.Directory]::Delete($Target, $false)
+        }
+        try { if ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path)) { & $removeTree $Path } }
+        catch { Write-Warning "Could not remove temporary transfer item '$Path': $($_.Exception.Message)" }
+    }
+    $removeRemoteTemp = {
+        try {
+            $result = & $runBatch @('rm ' + (& $quote $remoteTemp))
+            if ($result.ExitCode -ne 0) { Write-Warning "Could not remove temporary transfer item '$remoteTemp' on the guest (sftp exit $($result.ExitCode))." }
+        } catch { Write-Warning "Could not remove temporary transfer item '$remoteTemp' on the guest: $($_.Exception.Message)" }
+    }
+
+    # --- Upfront check: source, then destination, then the conflict decision -- all before any payload
+    # command, so a refused or skipped item moves nothing (the same guarantee as the Windows engine). ---
+    $source = if ($toVM) { & $probeLocal $localPath } else { & $probeRemote $remotePath }
+    if ($source.Error) { & $fail "${sourceLabel}: source could not be inspected: $($source.Error)"; return & $summary }
+    if (-not $source.Exists) { & $fail "${sourceLabel}: source does not exist."; return & $summary }
+    if ($source.Mode -eq 'l') {
+        & $fail "${sourceLabel}: source is a symbolic link, junction or other reparse point; only regular files and plain directories are supported."
+        return & $summary
+    }
+    if ($Recurse -and $source.Mode -ne 'd') { & $fail "${sourceLabel}: source is not a directory; a recursive transfer requires a directory."; return & $summary }
+    if (-not $Recurse -and $source.Mode -eq 'd') { & $fail "${sourceLabel}: source is a directory; use a recursive transfer."; return & $summary }
+    if (-not $Recurse -and $source.Mode -ne '-') { & $fail "${sourceLabel}: source is not a regular file."; return & $summary }
+    $sourceTree = $null
+    if ($toVM -and $Recurse) {
+        # put -r copies a whole tree and cannot leave out one entry, so a link anywhere inside the
+        # host-side tree refuses the whole transfer instead of being followed.
+        $sourceTree = & $scanLocalTree $localPath
+        if ($sourceTree.Error) { & $fail "${sourceLabel}: source tree could not be enumerated: $($sourceTree.Error)"; return & $summary }
+        if ($sourceTree.Reparse) {
+            & $fail "${sourceLabel}: the source tree contains a symbolic link, junction or other reparse point ('$($sourceTree.Reparse)'); a recursive SFTP upload cannot exclude it, so nothing was transferred."
+            return & $summary
+        }
+    }
+    $destination = if ($toVM) { & $probeRemote $remotePath } else { & $probeLocal $localPath }
+    if ($destination.Error) { & $fail "${destinationLabel}: destination could not be inspected: $($destination.Error)"; return & $summary }
+    if ($destination.Mode -eq 'l') {
+        & $fail "${destinationLabel}: destination is a symbolic link, junction or other reparse point; refusing to write through it."
+        return & $summary
+    }
+    if ($destination.Exists -and $destination.Mode -notin @('-', 'd')) {
+        & $fail "${destinationLabel}: destination exists but is not a regular file or directory; refusing to write to it."
+        return & $summary
+    }
+    $kind = Get-LabTransferConflictKind $Recurse ([bool]$destination.Exists) ($destination.Mode -eq 'd')
+    if ($Recurse -and $kind -eq 'Exists') {
+        & $fail "Directory '$destinationLabel' already exists; merging into an existing directory on the Linux/SFTP adapter is not supported in this version."
+        return & $summary
+    }
+    $action = Resolve-LabConflictAction $kind $OnConflict
+    if ($action -eq 'Error') {
+        $why = if ($kind -eq 'TypeMismatch') { 'destination exists as a different type (file vs directory)' } else { 'destination already exists' }
+        & $fail "${destinationLabel}: $why."
+        return & $summary
+    }
+    if ($action -eq 'Skip') {
+        $state.Skipped++
+        Write-Host "Skipped (destination exists): $destinationLabel"
+        return & $summary
+    }
+    if ($Recurse -and $VerifyHash) {
+        Write-Warning 'SHA-256 verification is not applied to the files inside a recursive Linux/SFTP transfer in this version; only a single-file transfer is hash-verified.'
+    }
+    if ($DryRun) {
+        $verb = if ($action -eq 'Overwrite') { 'overwrite' } elseif ($Recurse) { 'copy directory' } else { 'copy' }
+        Write-Host "Dry run: would $verb $sourceLabel -> $destinationLabel"
+        $state.Completed++
+        return & $summary
+    }
+
+    # --- Payload. A recursive transfer counts as one item: the tree lands all at once or not at all. ---
+    # Unverified without a live guest: what OpenSSH's put -r/get -r do with a symlink nested inside the
+    # tree (follow it, skip it, or fail). A host-side tree was scanned above, so for an upload this is
+    # moot; for a download the host-side copy is scanned before it is moved into place. See
+    # MANUAL-TESTS.md ("Linux transfer engine") for the live step that settles this.
+    if ($toVM -and $Recurse) {
+        # One session: rename runs only if put -r succeeded (a failing batch command stops the batch),
+        # and it is a single atomic POSIX rename of the whole tree.
+        $tree = & $runBatch @(('put -r ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp)),
+            ('rename ' + (& $quote $remoteTemp) + ' ' + (& $quote $remotePath)))
+        if ($tree.ExitCode -eq 0) {
+            $state.Completed++
+            # Measured from the host-side tree that was uploaded, not parsed from sftp's progress output.
+            $state.BytesTransferred += $sourceTree.Bytes
+        } else {
+            # sftp has no recursive delete, so a partial temporary tree is reported, not removed.
+            & $fail "${destinationLabel}: recursive upload failed (sftp exit $($tree.ExitCode): $(& $tail $tree)); the destination was not created. A partial temporary tree may remain at '$remoteTemp' on the guest and must be removed by hand."
+        }
+        return & $summary
+    }
+    if (-not $toVM -and $Recurse) {
+        try {
+            $tree = & $runBatch @('get -r ' + (& $quote $remotePath) + ' ' + (& $quote $localTemp.Replace('\', '/')))
+            if ($tree.ExitCode -ne 0) {
+                & $fail "${destinationLabel}: recursive download failed (sftp exit $($tree.ExitCode): $(& $tail $tree)); nothing was written to the destination."
+                return & $summary
+            }
+            $landed = & $scanLocalTree $localTemp
+            if ($landed.Error) { & $fail "${destinationLabel}: the downloaded tree could not be inspected: $($landed.Error)"; return & $summary }
+            if ($landed.Reparse) {
+                & $fail "${destinationLabel}: the downloaded tree contains a symbolic link, junction or other reparse point ('$($landed.Reparse)'); it was not moved into place."
+                return & $summary
+            }
+            try {
+                # Fails rather than overwrites if the destination appeared since the upfront check.
+                [IO.Directory]::Move($localTemp, $localPath)
+                $state.Completed++
+                # Measured from the tree that landed on this host, not parsed from sftp's progress output.
+                $state.BytesTransferred += $landed.Bytes
+            } catch { & $fail "${destinationLabel}: could not be finalized: $($_.Exception.Message)" }
+        } finally {
+            & $removeLocal $localTemp
+        }
+        return & $summary
+    }
+    if ($toVM) {
+        # Upload: two batches on two connections. Batch A puts the copy beside the destination (and, in
+        # KeyAgent mode, lists it in the same session); the copy is checked between the batches; only then
+        # does batch B replace the destination. A rename in batch A itself would run before any check
+        # of its output could, letting an unverified file reach the real destination.
+        $expectedHash = ''
+        if ($VerifyHash) {
+            $expectedHash = & $localHash $localPath
+            if (-not $expectedHash) { & $fail "${sourceLabel}: the source could not be hashed for -VerifyHash; nothing was transferred."; return & $summary }
+        }
+        $batchA = @('put ' + (& $quote $localPath.Replace('\', '/')) + ' ' + (& $quote $remoteTemp))
+        if (-not $passwordMode) { $batchA += 'ls -la ' + (& $quote $remoteTemp) }
+        $upload = & $runBatch $batchA
+        if ($upload.ExitCode -ne 0) {
+            & $fail "${destinationLabel}: upload failed (sftp exit $($upload.ExitCode): $(& $tail $upload))."
+            & $removeRemoteTemp
+            return & $summary
+        }
+        $problem = $null
+        if ($passwordMode) {
+            $problem = & $verifyRemote $remoteTemp $source.Size $expectedHash
+        } else {
+            $copy = ConvertFrom-LabSftpListing $upload.Output 0 $remoteTemp
+            if (-not $copy.Exists -or $copy.Mode -ne '-') { $problem = 'the copied file is missing from the temporary location' }
+            elseif ($copy.Size -ne $source.Size) { $problem = "size mismatch after copy (source $($source.Size) bytes, copy $($copy.Size) bytes)" }
+            elseif ($VerifyHash) { $problem = & $verifyRemote $remoteTemp -1 $expectedHash }
+        }
+        if ($problem) {
+            & $fail "${destinationLabel}: $problem"
+            & $removeRemoteTemp
+            return & $summary
+        }
+        # The explicit rm keeps Overwrite portable: a server with the posix-rename@openssh.com extension
+        # would let rename replace the file atomically on its own, but that cannot be verified here
+        # without a live guest. On such a server, a file created at the destination after the upfront
+        # check (a race this check-then-act design cannot close) would also be replaced by the rename.
+        $batchB = @()
+        if ($action -eq 'Overwrite') { $batchB += 'rm ' + (& $quote $remotePath) }
+        $batchB += 'rename ' + (& $quote $remoteTemp) + ' ' + (& $quote $remotePath)
+        $finalize = & $runBatch $batchB
+        if ($finalize.ExitCode -eq 0) {
+            $state.Completed++
+            $state.BytesTransferred += $source.Size
+        } elseif ($action -eq 'Overwrite') {
+            # The rm may already have run, so the verified copy may now be the only one left.
+            & $fail "${destinationLabel}: could not be finalized (sftp exit $($finalize.ExitCode): $(& $tail $finalize)); the existing file may already have been removed, so the verified copy was kept at '$remoteTemp'."
+        } else {
+            & $fail "${destinationLabel}: could not be finalized (sftp exit $($finalize.ExitCode): $(& $tail $finalize))."
+            & $removeRemoteTemp
+        }
+        return & $summary
+    }
+    # Download: the copy lands beside the host-side destination and is checked before the host-side move.
+    $retainTemp = $false
+    try {
+        $download = & $runBatch @('get ' + (& $quote $remotePath) + ' ' + (& $quote $localTemp.Replace('\', '/')))
+        if ($download.ExitCode -ne 0) {
+            & $fail "${destinationLabel}: download failed (sftp exit $($download.ExitCode): $(& $tail $download))."
+            return & $summary
+        }
+        $copy = & $probeLocal $localTemp
+        $problem = $null
+        if ($copy.Error) { $problem = "could not inspect the copied data: $($copy.Error)" }
+        elseif (-not $copy.Exists -or $copy.Mode -ne '-') { $problem = 'the copied file is missing from the temporary location' }
+        else {
+            $expectedHash = if ($VerifyHash) { & $localHash $localTemp } else { '' }
+            if ($VerifyHash -and -not $expectedHash) {
+                $problem = 'the downloaded copy could not be hashed for -VerifyHash'
+            } elseif ($passwordMode) {
+                $problem = & $verifyRemote $remotePath $copy.Size $expectedHash
+            } elseif ($copy.Size -ne $source.Size) {
+                $problem = "size mismatch after copy (source $($source.Size) bytes, copy $($copy.Size) bytes)"
+            } elseif ($VerifyHash) {
+                $problem = & $verifyRemote $remotePath -1 $expectedHash
+            }
+        }
+        if ($problem) { & $fail "${destinationLabel}: $problem"; return & $summary }
+        $removed = $false
+        try {
+            if ($action -eq 'Overwrite' -and [IO.File]::Exists($localPath)) {
+                [IO.File]::SetAttributes($localPath, [IO.FileAttributes]::Normal)
+                [IO.File]::Delete($localPath)
+                $removed = $true
+            }
+            [IO.File]::Move($localTemp, $localPath)
+            $state.Completed++
+            $state.BytesTransferred += $copy.Size
+        } catch {
+            if ($removed) {
+                # The old file is already gone: keep the verified copy rather than delete the only one left.
+                $retainTemp = $true
+                & $fail "${destinationLabel}: the existing file was removed but the verified copy could not be moved into place ($($_.Exception.Message)); the copy was kept at '$localTemp'."
+            } else { & $fail "${destinationLabel}: could not be finalized: $($_.Exception.Message)" }
+        }
+    } finally {
+        if (-not $retainTemp) { & $removeLocal $localTemp }
+    }
+    return & $summary
 }
 
 function Invoke-LabFileTransfer {
