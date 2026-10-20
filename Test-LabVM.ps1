@@ -50,7 +50,7 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
     'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
     'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath',
-    'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind')
+    'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind', 'Test-LabSshHostName', 'Test-LabSshUserName')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -1388,6 +1388,212 @@ Test-Case 'SSH connection settings path is scoped by VM GUID' {
     $id = [guid]'11111111-1111-1111-1111-111111111111'
     $path = Get-LabSshConnectionSettingsPath $id
     Assert-Equal ($path -like "*SshConnections*$id.json") $true
+}
+
+# --- SSH value validation, settings file handling, and the real SSH helpers against fakes ---
+# Safety: every test below that loads a real function which can launch ssh.exe/sftp.exe defines a fake
+# ssh.exe/sftp.exe FUNCTION in the same child scope first, and asserts it resolves to that function
+# before calling anything; the script-level tripwires above remain in place underneath. Nothing here can
+# start a real OpenSSH process, prompt, or read or write known_hosts. Add-LabSshKnownHost is never loaded.
+function Import-LabRealFunction {
+    param([string[]]$Name)
+    foreach ($n in $Name) {
+        $found = @($definitions | Where-Object { $_.Name -ceq $n })
+        if ($found.Count -ne 1) { throw "Expected one definition of $n." }
+        # Returned as a scriptblock for the caller to dot-source into its own child scope.
+        [scriptblock]::Create($found[0].Extent.Text)
+    }
+}
+function Assert-FakeCommand {
+    param([string]$Name)
+    $command = Get-Command $Name -ErrorAction Stop
+    if ($command.CommandType -ne 'Function') { throw "SAFETY: $Name does not resolve to a fake function; refusing to continue." }
+}
+
+Test-Case 'SSH host validation: ordinary names and addresses are accepted' {
+    foreach ($value in @('192.168.1.50', 'lab-linux.local', 'fe80::1', 'guest')) { Assert-Equal (Test-LabSshHostName $value) $true }
+}
+Test-Case 'SSH host validation: a leading dash, whitespace, control characters, @ or blank are refused' {
+    foreach ($value in @('-oProxyCommand=calc', '-p', 'a b', "a`tb", "a`nb", 'user@host', '', $null)) { Assert-Equal (Test-LabSshHostName $value) $false }
+}
+Test-Case 'SSH user validation: a leading dash, whitespace, control characters or blank are refused' {
+    Assert-Equal (Test-LabSshUserName 'dev') $true
+    Assert-Equal (Test-LabSshUserName 'dev@CORP') $true
+    foreach ($value in @('-oProxyCommand=calc', 'a b', "a`tb", '', $null)) { Assert-Equal (Test-LabSshUserName $value) $false }
+}
+Test-Case 'SSH settings: saved values round-trip; invalid values are refused before anything is written' {
+    $tempLocal = Join-Path ([IO.Path]::GetTempPath()) ('labssh-settings-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $tempLocal
+        & {
+            foreach ($sb in (Import-LabRealFunction 'Get-LabSshConnectionSettings', 'Set-LabSshConnectionSettings')) { . $sb }
+            $id = [guid]'22222222-2222-2222-2222-222222222222'
+            Assert-Equal (Get-LabSshConnectionSettings $id) $null
+            Set-LabSshConnectionSettings -VMId $id -HostNameOrAddress '10.0.0.5' -Port 2222 -UserName 'dev' -IdentityFilePath ''
+            $read = Get-LabSshConnectionSettings $id
+            Assert-Equal $read.HostNameOrAddress '10.0.0.5'; Assert-Equal $read.Port 2222; Assert-Equal $read.UserName 'dev'
+            $other = [guid]'33333333-3333-3333-3333-333333333333'
+            Assert-Throws { Set-LabSshConnectionSettings -VMId $other -HostNameOrAddress '-oProxyCommand=calc' -Port 22 -UserName 'dev' -IdentityFilePath '' } 'Invalid SSH host'
+            Assert-Throws { Set-LabSshConnectionSettings -VMId $other -HostNameOrAddress '10.0.0.5' -Port 22 -UserName '-oProxyCommand=calc' -IdentityFilePath '' } 'Invalid SSH username'
+            Assert-Throws { Set-LabSshConnectionSettings -VMId $other -HostNameOrAddress '10.0.0.5' -Port 70000 -UserName 'dev' -IdentityFilePath '' } 'between 1 and 65535'
+            Assert-Equal ([IO.File]::Exists((Get-LabSshConnectionSettingsPath $other))) $false
+        }
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($tempLocal)) { [IO.Directory]::Delete($tempLocal, $true) }
+    }
+}
+Test-Case 'SSH settings: a corrupt, empty or hand-edited file throws naming the file, never reads as unconfigured' {
+    $tempLocal = Join-Path ([IO.Path]::GetTempPath()) ('labssh-settings-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $tempLocal
+        & {
+            foreach ($sb in (Import-LabRealFunction 'Get-LabSshConnectionSettings')) { . $sb }
+            $id = [guid]'44444444-4444-4444-4444-444444444444'
+            $path = Get-LabSshConnectionSettingsPath $id
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+            $cases = @('{ not json', '', '{"HostNameOrAddress":"10.0.0.5","Port":22,"UserName":"-oProxyCommand=calc","IdentityFilePath":""}',
+                '{"HostNameOrAddress":"10.0.0.5","Port":0,"UserName":"dev","IdentityFilePath":""}', '{"Port":22}')
+            foreach ($content in $cases) {
+                [IO.File]::WriteAllText($path, $content)
+                Assert-Throws { Get-LabSshConnectionSettings $id } ('cannot be used.*' + [regex]::Escape($path))
+            }
+        }
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($tempLocal)) { [IO.Directory]::Delete($tempLocal, $true) }
+    }
+}
+Test-Case 'Adapter selection: unreadable SSH settings throw instead of falling back to PSDirect' {
+    & {
+        function Get-LabSshConnectionSettings { param([guid]$VMId) throw 'The saved SSH connection settings for VM x cannot be used (bad).' }
+        Assert-Throws { Get-LabTransferAdapterKind $script:FakeId } 'cannot be used'
+    }
+}
+Test-Case 'SFTP command (InteractivePassword): stray sftp stdout stays off the return value; BatchMode=no precedes -b' {
+    & {
+        $script:FakeSftpArgs = $null
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        # Stands in for sftp.exe in batch mode, which echoes its batch on stdout.
+        function sftp.exe { $script:FakeSftpArgs = [string[]]@($args); 'sftp> pwd'; 'Remote working directory: /home/labuser'; $global:LASTEXITCODE = 0 }
+        foreach ($sb in (Import-LabRealFunction 'Invoke-LabSftpCommand')) { . $sb }
+        Assert-FakeCommand 'sftp.exe'
+        $result = @(Invoke-LabSftpCommand 'guest.invalid' 22 'labuser' '' 'C:\labssh-test-unused.batch' 'InteractivePassword')
+        Assert-Equal $result.Count 1
+        Assert-Equal $result[0].ExitCode 0
+        Assert-Equal @($result[0].Output).Count 0
+        $passed = $script:FakeSftpArgs
+        $batchModeAt = [array]::IndexOf($passed, 'BatchMode=no')
+        $batchFileAt = [array]::IndexOf($passed, '-b')
+        if ($batchModeAt -lt 1 -or $passed[$batchModeAt - 1] -ne '-o') { throw "BatchMode=no was not passed as an -o option: $($passed -join ' ')" }
+        if ($batchFileAt -lt 0 -or $batchModeAt -gt $batchFileAt) { throw "BatchMode=no must come before -b: $($passed -join ' ')" }
+        Assert-Equal ($passed -contains 'BatchMode=yes') $false
+        Assert-Equal ($passed -contains 'StrictHostKeyChecking=yes') $true
+        Assert-Equal $passed[-1] 'labuser@guest.invalid'
+    }
+}
+Test-Case 'SSH connection test (InteractivePassword): a successful login reports success, not a StrictMode failure' {
+    & {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function sftp.exe { 'sftp> pwd'; 'Remote working directory: /home/labuser'; $global:LASTEXITCODE = 0 }
+        function Get-LabSshConnectionSettings { param([guid]$VMId) [pscustomobject]@{ HostNameOrAddress = 'guest.invalid'; Port = 22; UserName = 'labuser'; IdentityFilePath = '' } }
+        foreach ($sb in (Import-LabRealFunction 'Invoke-LabSftpCommand', 'Test-LabSshConnection')) { . $sb }
+        Assert-FakeCommand 'sftp.exe'
+        $script:FakeVM.State = 'Running'
+        try { $messages = @(Test-LabSshConnection $script:FakeId 3>&1 6>&1 | ForEach-Object { [string]$_ }) -join "`n" }
+        finally { $script:FakeVM.State = 'Off' }
+        if ($messages -notmatch 'Connection succeeded \(InteractivePassword\)') { throw "Unexpected output: $messages" }
+        if ($messages -match 'failed') { throw "Unexpected failure output: $messages" }
+    }
+}
+Test-Case 'SSH connection test (KeyAgent): a failure shows sftp''s own reason and the first-trust hint' {
+    & {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function sftp.exe { 'Host key verification failed.'; 'Connection closed'; $global:LASTEXITCODE = 255 }
+        function Get-LabSshConnectionSettings { param([guid]$VMId) [pscustomobject]@{ HostNameOrAddress = 'guest.invalid'; Port = 22; UserName = 'labuser'; IdentityFilePath = 'C:\keys\id_test' } }
+        foreach ($sb in (Import-LabRealFunction 'Invoke-LabSftpCommand', 'Test-LabSshConnection')) { . $sb }
+        Assert-FakeCommand 'sftp.exe'
+        $script:FakeVM.State = 'Running'
+        try { $messages = @(Test-LabSshConnection $script:FakeId 3>&1 6>&1 | ForEach-Object { [string]$_ }) -join "`n" }
+        finally { $script:FakeVM.State = 'Off' }
+        if ($messages -notmatch 'sftp exit code 255\): Host key verification failed\. Connection closed') { throw "Reason not surfaced: $messages" }
+        if ($messages -notmatch 'option K') { throw "First-trust hint missing: $messages" }
+    }
+}
+Test-Case 'Menu copy from an SFTP VM asks for the source type and never opens PowerShell Direct' {
+    & {
+        $script:Answers = [Collections.Generic.Queue[string]]::new()
+        foreach ($a in @('/home/dev/g.txt', 'C:\labxfer-test\g.txt', 'N', '', '')) { $script:Answers.Enqueue($a) }
+        $script:TransferArgs = $null
+        function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+        function Read-LabYesNoCancel { param([string]$Prompt) return 'N' }
+        function Confirm-LabText { param([string]$Expected) return $true }
+        function Get-LabTransferAdapterKind { param([guid]$VMId) return 'SFTP' }
+        function Get-LabSshConnectionSettings { param([guid]$VMId) [pscustomobject]@{ HostNameOrAddress = 'guest.invalid'; Port = 22; UserName = 'labuser'; IdentityFilePath = '' } }
+        function Resolve-LabWindowsCredential { throw 'TRIPWIRE: Windows credentials requested for an SFTP VM.' }
+        function New-LabPSDirectSession { throw 'TRIPWIRE: PowerShell Direct session opened for an SFTP VM.' }
+        function Invoke-LabFileTransfer {
+            param($VMId, $Direction, $SourcePath, $DestinationPath, $Recurse, $OnConflict, $VerifyHash, $DryRun, $Credential, $NonInteractive, $PermissionProfile)
+            $script:TransferArgs = [pscustomobject]@{ Direction = $Direction; Recurse = $Recurse; Credential = $Credential }
+            return [pscustomobject]@{ Completed = 1; Skipped = 0; Failed = 0; BytesTransferred = [long]10; Errors = [string[]]@() }
+        }
+        foreach ($sb in (Import-LabRealFunction 'Copy-LabVMItemInteractive')) { . $sb }
+        $script:FakeVM.State = 'Running'
+        try { $status = Copy-LabVMItemInteractive $script:FakeId 'FromVM' 6>$null | Select-Object -Last 1 }
+        finally { $script:FakeVM.State = 'Off' }
+        Assert-Equal $status 'COMPLETED'
+        Assert-Equal $script:Answers.Count 0
+        Assert-Equal $script:TransferArgs.Direction 'FromVM'
+        Assert-Equal $script:TransferArgs.Recurse $false
+        Assert-Equal $script:TransferArgs.Credential $null
+    }
+}
+Test-Case 'Menu copy from a PSDirect VM still inspects the source over PowerShell Direct' {
+    & {
+        $script:Answers = [Collections.Generic.Queue[string]]::new()
+        foreach ($a in @('C:\Users\dev\g.txt', 'C:\labxfer-test\out', '', '')) { $script:Answers.Enqueue($a) }
+        $script:ProbeSessions = 0
+        function Read-LabText { param([string]$Prompt) if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:Answers.Dequeue() }
+        function Read-LabYesNoCancel { param([string]$Prompt) return 'N' }
+        function Confirm-LabText { param([string]$Expected) return $true }
+        function Get-LabTransferAdapterKind { param([guid]$VMId) return 'PSDirect' }
+        function Resolve-LabWindowsCredential { param($Credential, [bool]$NonInteractive) return 'fake-credential' }
+        function New-LabPSDirectSession { param($VMId, $Credential) $script:ProbeSessions++; return [pscustomobject]@{ State = 'Opened' } }
+        function Remove-PSSession { param($Session) }
+        function Invoke-LabTransferSide { param($Session, [bool]$Remote, [scriptblock]$ScriptBlock, [object[]]$ArgumentList) return $false }
+        function Invoke-LabFileTransfer {
+            param($VMId, $Direction, $SourcePath, $DestinationPath, $Recurse, $OnConflict, $VerifyHash, $DryRun, $Credential, $NonInteractive, $PermissionProfile)
+            $script:TransferCredential = $Credential
+            return [pscustomobject]@{ Completed = 1; Skipped = 0; Failed = 0; BytesTransferred = [long]10; Errors = [string[]]@() }
+        }
+        foreach ($sb in (Import-LabRealFunction 'Copy-LabVMItemInteractive')) { . $sb }
+        $script:FakeVM.State = 'Running'
+        try { $status = Copy-LabVMItemInteractive $script:FakeId 'FromVM' 6>$null | Select-Object -Last 1 }
+        finally { $script:FakeVM.State = 'Off' }
+        Assert-Equal $status 'COMPLETED'
+        Assert-Equal $script:ProbeSessions 1
+        Assert-Equal $script:TransferCredential 'fake-credential'
+    }
+}
+Test-Case 'SSH configuration CLI: an option-like host or user is refused before any host check or write' {
+    & {
+        function Set-LabSshConnectionSettings { throw 'TRIPWIRE: settings written for an invalid value.' }
+        function Assert-LabHost { throw 'TRIPWIRE: host checks reached for an invalid value.' }
+        foreach ($sb in (Import-LabRealFunction 'Start-LabSshConfigurationCli')) { . $sb }
+        Assert-Throws { Start-LabSshConfigurationCli -VMName 'LAB-Test' -VMId $null -SshHost '-oProxyCommand=calc' -SshPort 22 -SshUser 'dev' -SshIdentityFile '' -RequestedLogRoot '' } 'Invalid -SshHost'
+        Assert-Throws { Start-LabSshConfigurationCli -VMName 'LAB-Test' -VMId $null -SshHost '10.0.0.5' -SshPort 22 -SshUser '-oProxyCommand=calc' -SshIdentityFile '' -RequestedLogRoot '' } 'Invalid -SshUser'
+        Assert-Throws { Start-LabSshConfigurationCli -VMName 'LAB-Test' -VMId $null -SshHost '10.0.0.5' -SshPort 0 -SshUser 'dev' -SshIdentityFile '' -RequestedLogRoot '' } 'Invalid -SshPort'
+    }
+}
+Test-Case 'Gate: the real script rejects an out-of-range -SshPort at parameter binding' {
+    # Parameter binding fails before the script body runs: no host check, log, settings write or SSH call.
+    $ErrorActionPreference = 'Continue'
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $output = @(& $exe -NoProfile -NonInteractive -File $resolved -ConfigureSsh -VMName 'LAB-x' -SshHost '10.0.0.5' -SshUser 'dev' -SshPort 70000 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    if ($LASTEXITCODE -eq 0) { throw "Expected a non-zero exit code: $output" }
+    if (-not ($output -replace '\s', '').Contains('SshPort')) { throw "Unexpected output: $output" }
 }
 
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
