@@ -50,7 +50,7 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
     'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
     'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath',
-    'Resolve-LabSshAuthMode')
+    'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -68,6 +68,14 @@ function Get-VM {
     param([guid]$Id)
     if ($Id -eq $script:FakeId) { return $script:FakeVM }
     return @()
+}
+
+# Fake for Get-LabSshConnectionSettings (Task 2): a single-dependency pure wrapper
+# (Get-LabTransferAdapterKind) is tested by overriding its one dependency, same as Get-VM above.
+$script:FakeSshSettings = $null
+function Get-LabSshConnectionSettings {
+    param([guid]$VMId)
+    return $script:FakeSshSettings
 }
 
 Test-Case 'Uppercase LAB- prefix accepted' { Assert-Equal (Test-LabVMName 'LAB-WINDOWS') $true }
@@ -202,6 +210,15 @@ Test-Case 'No identity file under NonInteractive throws' {
     Assert-Throws { Resolve-LabSshAuthMode '' $true } 'identity file'
 }
 Test-Case 'Identity file present under NonInteractive still selects KeyAgent' { Assert-Equal (Resolve-LabSshAuthMode 'C:\keys\id_ed25519' $true) 'KeyAgent' }
+Test-Case 'Configured SSH settings select the SFTP adapter' {
+    $script:FakeSshSettings = [pscustomobject]@{ HostNameOrAddress = '10.0.0.5'; Port = 22; UserName = 'dev'; IdentityFilePath = 'C:\keys\id_ed25519' }
+    try { Assert-Equal (Get-LabTransferAdapterKind $script:FakeId) 'SFTP' }
+    finally { $script:FakeSshSettings = $null }
+}
+Test-Case 'No SSH settings select the PSDirect adapter' {
+    $script:FakeSshSettings = $null
+    Assert-Equal (Get-LabTransferAdapterKind $script:FakeId) 'PSDirect'
+}
 
 # --- Transfer engine (Copy-LabTransferItem) against a local temp tree ---
 # The engine's functions are loaded from the AST with only the PSSession parameter type loosened,

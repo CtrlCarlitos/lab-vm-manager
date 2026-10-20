@@ -2476,6 +2476,12 @@ function Copy-LabTransferItemSftp {
     return & $summary
 }
 
+function Get-LabTransferAdapterKind {
+    param([guid]$VMId)
+    if ($null -ne (Get-LabSshConnectionSettings $VMId)) { return 'SFTP' }
+    return 'PSDirect'
+}
+
 function Invoke-LabFileTransfer {
     param(
         [guid]$VMId,
@@ -2508,12 +2514,21 @@ function Invoke-LabFileTransfer {
                 Errors = [string[]]@('Read-only mode: a real file copy is blocked under -ReadOnly. Retry with a dry run.') }
             return $result
         }
-        $resolvedCredential = Resolve-LabWindowsCredential $Credential $NonInteractive
-        $session = New-LabPSDirectSession $VMId $resolvedCredential
-        $copyAttempted = $true
-        $result = Copy-LabTransferItem $session $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun $PermissionProfile
-        $result = $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
-        return $result
+        if ((Get-LabTransferAdapterKind $VMId) -eq 'SFTP') {
+            $sshSettings = Get-LabSshConnectionSettings $VMId
+            $authMode = Resolve-LabSshAuthMode $sshSettings.IdentityFilePath $NonInteractive
+            $copyAttempted = $true
+            $result = Copy-LabTransferItemSftp $sshSettings.HostNameOrAddress $sshSettings.Port $sshSettings.UserName $sshSettings.IdentityFilePath $authMode $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun
+            $result = $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
+            return $result
+        } else {
+            $resolvedCredential = Resolve-LabWindowsCredential $Credential $NonInteractive
+            $session = New-LabPSDirectSession $VMId $resolvedCredential
+            $copyAttempted = $true
+            $result = Copy-LabTransferItem $session $Direction $SourcePath $DestinationPath $Recurse $OnConflict $VerifyHash $DryRun $PermissionProfile
+            $result = $result | Add-Member -NotePropertyName VMId -NotePropertyValue $VMId -PassThru
+            return $result
+        }
     } catch {
         $transferError = $_
         throw
