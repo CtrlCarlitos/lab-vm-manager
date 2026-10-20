@@ -1593,8 +1593,10 @@ function Get-LabWindowsInstallImages {
     if (-not (Get-Module -ListAvailable -Name Dism)) {
         throw 'The Dism PowerShell module is missing. Install the Windows Assessment and Deployment Kit (or run this on a full Windows installation) before reading Windows install images.'
     }
+    $mounted = $false
     try {
         $mountResult = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
+        $mounted = $true
         $volume = Get-Volume -DiskImage $mountResult -ErrorAction Stop
         # Plain string concatenation, not Join-Path: Join-Path resolves the FileSystem provider's
         # drive at call time, which throws "Cannot find drive" for a drive letter the mount only
@@ -1626,7 +1628,12 @@ function Get-LabWindowsInstallImages {
         }
         return $images.ToArray()
     } finally {
-        Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop
+        # Only dismount if Mount-DiskImage itself actually succeeded. Otherwise nothing was ever
+        # mounted, and an unconditional Dismount-DiskImage here would itself throw a confusing
+        # "not currently mounted"-style error, masking the real Mount-DiskImage failure above.
+        if ($mounted) {
+            Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop
+        }
     }
 }
 
