@@ -134,16 +134,23 @@ git commit -m "feat: add interactive ISO browse/select"
 ### Task 3: VM boot profile (Secure Boot + vTPM)
 
 **Files:**
-- Modify: `Lab-VM.ps1` (add `Set-LabVMBootProfile`)
+- Modify: `Lab-VM.ps1` (add `Test-LabVMHasKeyProtector`, `Set-LabVMBootProfile`)
 - Test: `Test-LabVM.ps1`, `test_static.py`
 
 **Interfaces:**
 - Consumes: `Get-LabVM`, `Assert-LabVMOff` (existing).
-- Produces: `Set-LabVMBootProfile([guid]$VMId, [ValidateSet('Windows11','UbuntuDesktop')][string]$OsProfile)` → `[pscustomobject]@{ SecureBootTemplateChanged = [bool]; KeyProtectorAdded = [bool]; TpmEnabled = [bool] }`, reporting exactly what changed versus what was already present, for an accurate preview/confirm and audit detail upstream. Throws clearly, before changing anything, if the VM's `Generation` is not `2`. For `'Windows11'`: sets `SecureBootTemplate` to `MicrosoftWindows` (no-op, reported as unchanged, if already set); if no key protector exists yet, adds a local one (`Set-VMKeyProtector -NewLocalKeyProtector`) and enables vTPM (`Enable-VMTPM`) — if a key protector already exists, does not touch it, and reports `KeyProtectorAdded = $false`. For `'UbuntuDesktop'`: sets `SecureBootTemplate` to `MicrosoftUEFICertificateAuthority`; never touches key protector/vTPM at all for this profile.
+- Produces:
+  - `Test-LabVMHasKeyProtector([guid]$VMId)` → `[bool]`, a pure read-only check (no mutation, no `Off` requirement — safe to call for a preview before any confirmation). `Set-LabVMBootProfile` below calls this itself to decide whether to add one; Task 6's preview calls it standalone to decide whether to show the existing-encryption warning, **without triggering any mutation just to find that out.**
+  - `Set-LabVMBootProfile([guid]$VMId, [ValidateSet('Windows11','UbuntuDesktop')][string]$OsProfile)` → `[pscustomobject]@{ SecureBootTemplateChanged = [bool]; KeyProtectorAdded = [bool]; TpmEnabled = [bool] }`, reporting exactly what changed versus what was already present, for an accurate audit detail. Throws clearly, before changing anything, if the VM's `Generation` is not `2`. For `'Windows11'`: sets `SecureBootTemplate` to `MicrosoftWindows` (no-op, reported as unchanged, if already set); if `Test-LabVMHasKeyProtector` is `$false`, adds a local one (`Set-VMKeyProtector -NewLocalKeyProtector`) and enables vTPM (`Enable-VMTPM`) — if one already exists, does not touch it, and reports `KeyProtectorAdded = $false`. For `'UbuntuDesktop'`: sets `SecureBootTemplate` to `MicrosoftUEFICertificateAuthority`; never touches key protector/vTPM at all for this profile.
 
 - [ ] **Step 1: Write failing tests**
 
 ```python
+def test_key_protector_check_is_read_only(self):
+    self.assertIn('function Test-LabVMHasKeyProtector', self.s)
+    body = self.s.split('function Test-LabVMHasKeyProtector {', 1)[1].split('\nfunction ', 1)[0]
+    self.assertNotIn('Set-VMKeyProtector', body)
+    self.assertNotIn('Enable-VMTPM', body)
 def test_boot_profile_function_exists(self):
     self.assertIn('function Set-LabVMBootProfile', self.s)
 def test_boot_profile_rejects_generation_1(self):
@@ -154,17 +161,25 @@ def test_boot_profile_never_rotates_existing_key_protector(self):
     self.assertIn('KeyProtectorAdded', body)
 def test_boot_profile_linux_never_touches_tpm(self):
     body = self.s.split('function Set-LabVMBootProfile {', 1)[1].split('\nfunction ', 1)[0]
-    idx_ubuntu = body.index("'UbuntuDesktop'")
-    idx_windows = body.index("'Windows11'")
-    # The Ubuntu branch's own text must not mention vTPM/key-protector cmdlets at all.
+    # rindex, not index: the [ValidateSet('Windows11','UbuntuDesktop')] parameter
+    # declaration contains both literal strings before either branch body does, so the
+    # FIRST occurrence of each is always inside that declaration, not inside the actual
+    # branch logic -- using the LAST occurrence of each is what actually lands inside
+    # each branch's own code, regardless of switch/if-elseif/hashtable-dispatch style.
+    idx_ubuntu = body.rindex("'UbuntuDesktop'")
+    idx_windows = body.rindex("'Windows11'")
     ubuntu_branch = body[idx_ubuntu:idx_windows] if idx_ubuntu < idx_windows else body[idx_ubuntu:]
     self.assertNotIn('Enable-VMTPM', ubuntu_branch)
     self.assertNotIn('Set-VMKeyProtector', ubuntu_branch)
 ```
 
-Run: `python test_static.py` — expect FAIL on all four.
+Run: `python test_static.py` — expect FAIL on all five.
 
 ```powershell
+Test-Case 'Test-LabVMHasKeyProtector reads existing state without calling any mutating cmdlet' {
+    # Fake the VM as already having a key protector; call it; assert it returns $true and
+    # that neither the Set-VMKeyProtector nor Enable-VMTPM fakes were ever invoked.
+}
 Test-Case 'Set-LabVMBootProfile rejects a Generation 1 VM before changing anything' {
     # Fake Get-LabVM to return Generation=1; assert it throws and that the fakes for
     # Set-VMFirmware/Set-VMKeyProtector/Enable-VMTPM were never invoked.
@@ -185,9 +200,9 @@ Test-Case 'Set-LabVMBootProfile applies the Ubuntu Secure Boot template without 
 
 Run: `powershell.exe -NoProfile -File .\Test-LabVM.ps1` — expect FAIL.
 
-- [ ] **Step 2: Implement `Set-LabVMBootProfile`**
+- [ ] **Step 2: Implement `Test-LabVMHasKeyProtector` and `Set-LabVMBootProfile`**
 
-Use `Get-VMSecurity`/`Get-VMKeyProtector`-equivalent inspection (confirm the exact read-side cmdlet during implementation — this codebase hasn't needed to *read back* key-protector presence before, only set it) to decide whether a key protector is already present before deciding to add one.
+`Test-LabVMHasKeyProtector` uses `Get-VMSecurity`/`Get-VMKeyProtector`-equivalent inspection (confirm the exact read-side cmdlet during implementation — this codebase hasn't needed to *read back* key-protector presence before, only set it). `Set-LabVMBootProfile` calls it to decide whether to add one.
 
 - [ ] **Step 3: Run tests, confirm pass**
 
@@ -328,9 +343,9 @@ git commit -m "feat: add native seed-ISO builder and provisioning workspace"
 - Test: `test_static.py`, `README.md`, `MANUAL-TESTS.md`
 
 **Interfaces:**
-- Consumes: `Select-LabIsoPath` (Task 2), `Set-LabVMBootProfile` (Task 3), `Set-LabVMInstallMedia`/`Remove-LabVMInstallMedia`/`Set-LabVMBootOrder` (Task 4), `Assert-LabVMOff`, `Invoke-LabAction`, `Read-LabYesNoCancel` (existing).
+- Consumes: `Select-LabIsoPath` (Task 2), `Test-LabVMHasKeyProtector`/`Set-LabVMBootProfile` (Task 3), `Set-LabVMInstallMedia`/`Remove-LabVMInstallMedia`/`Set-LabVMBootOrder` (Task 4), `Assert-LabVMOff`, `Invoke-LabAction`, `Read-LabYesNoCancel` (existing).
 - Produces: `Set-LabVMInstallationMediaInteractive([guid]$VMId)` → no return value. Prompts for the OS profile (`Windows11`/`UbuntuDesktop`), then `Select-LabIsoPath`, shows a preview (chosen ISO, target VM, DVD drive that will be used or added, the Secure Boot/vTPM changes `Set-LabVMBootProfile` would make, the boot-order change — stated plainly as a **persistent firmware preference, not a one-time boot setting**, since `Set-VMFirmware -FirstBootDevice` is checked on every subsequent boot, not just the next one), asks a `Read-LabYesNoCancel` confirmation (not a typed `Confirm-LabText` phrase — same reasoning as menu `C`: this writes local VM configuration, not an irreversible destination mutation, and it requires `Off` already, which is its own safety gate), then applies `Set-LabVMBootProfile` → `Set-LabVMInstallMedia` → `Set-LabVMBootOrder -Preference Dvd` in that order. Also offers "eject current media" and "inspect current DVD/boot configuration" (read-only, available under `-ReadOnly`) from the same entry point, per the issue's own framing of this as one media menu.
-  - **Two safety checks before the preview, not after confirmation:** (1) if `Set-LabVMBootProfile` reports an *existing* key protector was left alone (not newly added), the preview says plainly that this VM already has encryption-related state configured and that security/firmware changes on an already-encrypted guest can require recovery material — the issue's own explicit warning, not something to skip because this plan's main case is fresh VMs. (2) if the VM already has at least one checkpoint, or its attached VHDX's actual on-disk size is non-trivial (a few hundred MB or more — a real check against the file, never an inference from its name or the VM's name), warn that booting installer media can overwrite an existing OS/data, suggest the existing checkpoint/export workflow first, and require an explicit extra confirmation beyond the normal one — defaulting to cancel, never silently proceeding, per the issue's own "do not inspect a disk's filename and assume it is empty."
+  - **Two safety checks in the preview itself, both read-only — nothing here may mutate the VM before the operator confirms:** (1) call `Test-LabVMHasKeyProtector` directly (never `Set-LabVMBootProfile`, which would mutate the VM to find this out) — if it returns `$true`, the preview says plainly that this VM already has encryption-related state configured and that security/firmware changes on an already-encrypted guest can require recovery material — the issue's own explicit warning, not something to skip because this plan's main case is fresh VMs. (2) if the VM already has at least one checkpoint, or its attached VHDX's actual on-disk size is non-trivial (a few hundred MB or more — a real check against the file, never an inference from its name or the VM's name), warn that booting installer media can overwrite an existing OS/data, suggest the existing checkpoint/export workflow first, and require an explicit extra confirmation beyond the normal one — defaulting to cancel, never silently proceeding, per the issue's own "do not inspect a disk's filename and assume it is empty." Only after both checks and the normal confirmation does the apply step run `Set-LabVMBootProfile` → `Set-LabVMInstallMedia` → `Set-LabVMBootOrder`.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -354,13 +369,16 @@ def test_installation_media_warns_on_existing_key_protector(self):
 def test_installation_media_warns_before_overwriting_existing_data(self):
     body = self.s.split('function Set-LabVMInstallationMediaInteractive {', 1)[1].split('\nfunction ', 1)[0]
     self.assertIn('Checkpoint', body)
+def test_installation_media_gates_mutation_internally_under_readonly(self):
+    body = self.s.split('function Set-LabVMInstallationMediaInteractive {', 1)[1].split('\nfunction ', 1)[0]
+    self.assertIn('$script:LabReadOnly', body)
 ```
 
-Run: `python test_static.py` — expect FAIL on all six.
+Run: `python test_static.py` — expect FAIL on all seven.
 
 - [ ] **Step 2: Implement and wire the menu entry**
 
-Add a new letter (not already used by `T`/`C`/`K`/`U`/`X`/`R`/`B`/`Q` — e.g. `M`) to both menu-text blocks in `Show-LabVMMenu`, marked `[requires Off]` since every mutating path here needs it (the read-only "inspect current configuration" sub-action is the exception that still works under `-ReadOnly`, same pattern as menu `1`). Route the mutating sub-actions through `Invoke-LabAction` for the mutex/audit/confirm treatment every other VM-changing menu entry gets.
+Add a new letter (not already used by `T`/`C`/`K`/`U`/`X`/`R`/`B`/`Q` — e.g. `M`) to **both** menu-text blocks in `Show-LabVMMenu` (it has a real read-only-safe capability, so it belongs in the read-only block too, same as `T`/`C`/`K`/`U`), wired the same way menu items `13`/`14` are: `Invoke-LabAction $VMId 'install-media-menu' -AllowReadOnly { param($id) Set-LabVMInstallationMediaInteractive $id }`. Follow the established convention for a function with both a read-only-safe path and a mutating one (`New-LabVM`'s own `if ($script:LabReadOnly) { ...; return 'CANCELLED' }` pattern, but scoped narrower): at the top of `Set-LabVMInstallationMediaInteractive`, when `$script:LabReadOnly` is set, offer only the "inspect current configuration" sub-action and refuse to even prompt for OS profile/ISO/attach — never let the read-only gate be enforced only by the menu wrapper.
 
 - [ ] **Step 3: Run tests, confirm pass**
 
