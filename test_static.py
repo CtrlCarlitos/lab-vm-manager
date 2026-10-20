@@ -424,6 +424,21 @@ class SourceContract(unittest.TestCase):
         self.assertIn("'-rmdir '", body)
         self.assertIn('[IO.Directory]::CreateDirectory(', body)
         self.assertLess(body.index("'mkdir '"), body.index("'put "))
+    def test_menu_t_entry_is_adapter_aware(self):
+        body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Get-LabTransferAdapterKind', body)
+        self.assertIn('Test-LabSshConnection', body)
+    def test_configure_ssh_menu_entry_exists(self):
+        body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'C'", body)
+        self.assertIn('Configure-LabSshConnectionInteractive', body)
+    def test_configure_ssh_cli_params_exist(self):
+        body = self.s.split('param(', 1)[1].split(')\n\n', 1)[0]
+        for p in ['$ConfigureSsh', '$SshHost', '$SshPort', '$SshUser', '$SshIdentityFile']:
+            self.assertIn(p, body)
+    def test_configure_ssh_does_not_prompt(self):
+        body = self.s.rsplit("if ($MyInvocation.InvocationName -ne '.')", 1)[1]
+        self.assertIn('ConfigureSsh', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

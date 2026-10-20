@@ -66,6 +66,19 @@
     The transfer-only parameters above (-VMName through -Credential) are
     rejected with an error, rather than ignored, when neither -CopyToVM nor
     -CopyFromVM is supplied; the menu is not opened in that case.
+.PARAMETER ConfigureSsh
+    Parameter mode: save an SSH connection setting (host/port/user/identity file) for a VM,
+    then exit, instead of launching the menu. Requires exactly one of -VMName/-VMId plus
+    -SshHost and -SshUser; never prompts. Mutually exclusive with -CopyToVM/-CopyFromVM.
+.PARAMETER SshHost
+    Parameter mode: the SSH hostname or IP address to save, with -ConfigureSsh.
+.PARAMETER SshPort
+    Parameter mode: the SSH port to save, with -ConfigureSsh (default 22).
+.PARAMETER SshUser
+    Parameter mode: the SSH username to save, with -ConfigureSsh.
+.PARAMETER SshIdentityFile
+    Parameter mode: an optional identity-file path to save, with -ConfigureSsh. Omit it to
+    save password authentication instead.
 .EXAMPLE
     powershell.exe -NoProfile -File .\Lab-VM.ps1 -ReadOnly
 .EXAMPLE
@@ -73,6 +86,8 @@
 .EXAMPLE
     $cred = Get-Credential
     & .\Lab-VM.ps1 -CopyToVM -VMName LAB-dev -SourcePath C:\keys\id_ed25519 -DestinationPath C:\Users\dev\.ssh\id_ed25519 -PermissionProfile PrivateFiles -NonInteractive -Credential $cred
+.EXAMPLE
+    powershell.exe -NoProfile -File .\Lab-VM.ps1 -ConfigureSsh -VMName LAB-linux -SshHost 192.168.1.50 -SshUser dev -SshIdentityFile C:\keys\id_ed25519
 .NOTES
     Version: 1.0.0
     Written for Windows PowerShell 5.1. Does not change execution policy.
@@ -99,7 +114,12 @@ param(
     [switch]$VerifyHash,
     [ValidateSet('Default', 'PrivateFiles')]
     [string]$PermissionProfile = 'Default',
-    [PSCredential]$Credential
+    [PSCredential]$Credential,
+    [switch]$ConfigureSsh,
+    [string]$SshHost,
+    [int]$SshPort = 22,
+    [string]$SshUser,
+    [string]$SshIdentityFile
 )
 
 Set-StrictMode -Version Latest
@@ -544,6 +564,72 @@ function Update-LabSshKnownHost {
     } else {
         Write-Warning "ssh-keygen -R exited with code $LASTEXITCODE; known_hosts may be unchanged."
     }
+}
+
+function Configure-LabSshConnectionInteractive {
+    param([guid]$VMId)
+    $vm = Get-LabVM $VMId
+    $existing = Get-LabSshConnectionSettings $VMId
+    if ($null -ne $existing) {
+        $existingAuth = $(if ([string]::IsNullOrEmpty($existing.IdentityFilePath)) { 'password' } else { "identity file: $($existing.IdentityFilePath)" })
+        Write-Host "Current saved settings: $($existing.UserName)@$($existing.HostNameOrAddress):$($existing.Port) ($existingAuth)"
+    } else {
+        Write-Host 'No SSH connection is saved for this VM yet.'
+    }
+
+    # Suggestions only: never auto-selected. The operator must type or explicitly pick one.
+    $candidates = @(Get-LabGuestAddressCandidates $VMId)
+    if ($candidates.Count -gt 0) {
+        Write-Host 'Guest address candidates (type one of these, or any other address):'
+        for ($i = 0; $i -lt $candidates.Count; $i++) { Write-Host ("  {0}  {1}" -f ($i + 1), $candidates[$i]) }
+    } else {
+        Write-Host 'No guest address candidates were found for this VM.'
+    }
+
+    $hostNameOrAddress = ''
+    while ($hostNameOrAddress -eq '') {
+        $hostAnswer = Read-LabText 'Hostname or IP address for SSH (blank re-prompts; a listed number also works)'
+        $candidateIndex = ConvertTo-LabMenuIndex $hostAnswer $candidates.Count
+        if ($candidateIndex -ge 0) { $hostNameOrAddress = $candidates[$candidateIndex] }
+        elseif ($hostAnswer -ne '') { $hostNameOrAddress = $hostAnswer }
+        else { Write-Host 'Enter a hostname or address.' }
+    }
+
+    $port = 22
+    $portAnswer = Read-LabText 'SSH port [22]'
+    if ($portAnswer -ne '') {
+        $parsedPort = 0
+        while (-not ([int]::TryParse($portAnswer, [ref]$parsedPort) -and $parsedPort -ge 1 -and $parsedPort -le 65535)) {
+            Write-Host 'Enter a valid port number (1-65535), or blank for 22.'
+            $portAnswer = Read-LabText 'SSH port [22]'
+            if ($portAnswer -eq '') { break }
+        }
+        if ($portAnswer -ne '') { $port = $parsedPort }
+    }
+
+    $userName = ''
+    while ($userName -eq '') {
+        $userName = Read-LabText 'SSH username (blank re-prompts)'
+        if ($userName -eq '') { Write-Host 'Enter a username.' }
+    }
+
+    $identityFilePath = Read-LabText 'Identity-file path (blank = password authentication)'
+
+    Write-Host "`n=== SSH connection preview ==="
+    [pscustomobject]@{
+        VMName = $vm.Name
+        VMId = $vm.Id
+        HostNameOrAddress = $hostNameOrAddress
+        Port = $port
+        UserName = $userName
+        AuthMode = $(if ($identityFilePath -eq '') { 'Password (prompted at connection time)' } else { "Key file: $identityFilePath" })
+    } | Format-List | Out-Host
+
+    $confirmAnswer = Read-LabYesNoCancel 'Save these SSH connection settings for this VM?'
+    if ($confirmAnswer -ne 'Y') { Write-Host 'Cancelled. No settings were changed.'; return }
+
+    Set-LabSshConnectionSettings -VMId $VMId -HostNameOrAddress $hostNameOrAddress -Port $port -UserName $userName -IdentityFilePath $identityFilePath
+    Write-Host 'SSH connection settings saved.'
 }
 
 function Wait-LabVMState {
@@ -2707,7 +2793,8 @@ function Show-LabVMMenu {
   4  List checkpoints
  13  Copy file/directory to VM          [requires Running]
  14  Copy file/directory from VM        [requires Running]
-  T  Test Windows guest connectivity (PowerShell Direct)
+  T  Test guest connectivity (PowerShell Direct or SSH, adapter-aware)
+  C  Configure SSH connection for this VM
   R  Refresh
   B  Choose another VM
   Q  Quit
@@ -2729,7 +2816,8 @@ READ-ONLY: VM-changing operations are disabled.
  12  Delete VM (retain virtual disks)          [requires Off]
  13  Copy file/directory to VM          [requires Running]
  14  Copy file/directory from VM        [requires Running]
-  T  Test Windows guest connectivity (PowerShell Direct) [requires Running]
+  T  Test guest connectivity (PowerShell Direct or SSH, adapter-aware) [requires Running]
+  C  Configure SSH connection for this VM
   X  EMERGENCY power-off                       [risk of data loss]
   R  Refresh
   B  Choose another VM
@@ -2753,7 +2841,11 @@ READ-ONLY: VM-changing operations are disabled.
                 '12' { Invoke-LabAction $VMId 'delete-vm-menu' { param($id) Remove-LabVM $id } }
                 '13' { Invoke-LabAction $VMId 'copy-to-vm-menu' -AllowReadOnly { param($id) Copy-LabVMItemInteractive $id 'ToVM' } }
                 '14' { Invoke-LabAction $VMId 'copy-from-vm-menu' -AllowReadOnly { param($id) Copy-LabVMItemInteractive $id 'FromVM' } }
-                'T'  { Test-LabTransferConnection $VMId }
+                'T'  {
+                    if ((Get-LabTransferAdapterKind $VMId) -eq 'SFTP') { Test-LabSshConnection $VMId }
+                    else { Test-LabTransferConnection $VMId }
+                }
+                'C'  { Configure-LabSshConnectionInteractive $VMId }
                 'X'  { Invoke-LabAction $VMId 'emergency-power-off' { param($id) Stop-LabVMPower $id } }
                 'R'  { continue vmMenu }
                 'B'  { return 'BACK' }
@@ -2794,6 +2886,34 @@ function Get-LabTransferOnlyParameter {
     $transferOnly = @('VMName', 'VMId', 'SourcePath', 'DestinationPath', 'Recurse', 'OnConflict', 'DryRun',
         'NonInteractive', 'VerifyHash', 'PermissionProfile', 'Credential')
     return @($transferOnly | Where-Object { $BoundParameterNames -contains $_ })
+}
+
+function Start-LabSshConfigurationCli {
+    param(
+        [string]$VMName, [Nullable[guid]]$VMId, [string]$SshHost, [int]$SshPort,
+        [string]$SshUser, [AllowNull()][AllowEmptyString()][string]$SshIdentityFile, [string]$RequestedLogRoot
+    )
+    $hasVMName = -not [string]::IsNullOrEmpty($VMName)
+    $hasVMId = $null -ne $VMId
+    if ($hasVMName -eq $hasVMId) { throw 'Supply exactly one of -VMName or -VMId.' }
+    if ([string]::IsNullOrEmpty($SshHost)) { throw 'Supply -SshHost with -ConfigureSsh.' }
+    if ([string]::IsNullOrEmpty($SshUser)) { throw 'Supply -SshUser with -ConfigureSsh.' }
+    $ErrorActionPreference = 'Stop'
+    Assert-LabHost
+    Initialize-LabLog $RequestedLogRoot
+    Write-LabAudit 'session' 'STARTED' $null ("ReadOnly={0}" -f $script:LabReadOnly)
+    try {
+        $resolvedVMId = Resolve-LabVMByNameOrId -VMName $VMName -VMId $VMId
+        $vm = Get-LabVM $resolvedVMId
+        Set-LabSshConnectionSettings -VMId $resolvedVMId -HostNameOrAddress $SshHost -Port $SshPort -UserName $SshUser -IdentityFilePath $SshIdentityFile
+        Write-LabAudit 'configure-ssh-cli' 'COMPLETED' $vm ("HostNameOrAddress={0}; Port={1}; UserName={2}; IdentityFileConfigured={3}" -f
+            $SshHost, $SshPort, $SshUser, (-not [string]::IsNullOrEmpty($SshIdentityFile)))
+        Write-Host "SSH connection settings saved for VM '$($vm.Name)' [$resolvedVMId]."
+    } finally {
+        try { Write-LabAudit 'session' 'ENDED' }
+        catch { Write-Warning 'Could not write the final audit entry.' }
+        Write-Host "Audit log: $script:LabLogFile"
+    }
 }
 
 function Start-LabFileTransferCli {
@@ -2844,7 +2964,21 @@ function Start-LabFileTransferCli {
 
 # Dot-sourcing loads functions without launching the UI; normal invocation runs it.
 if ($MyInvocation.InvocationName -ne '.') {
-    if ($CopyToVM -or $CopyFromVM) {
+    if ($ConfigureSsh -and ($CopyToVM -or $CopyFromVM)) {
+        Write-Error -Message 'Supply only one of -ConfigureSsh, -CopyToVM, or -CopyFromVM; one action per invocation.' -ErrorAction Continue
+        exit 1
+    }
+    if ($ConfigureSsh) {
+        try {
+            Start-LabSshConfigurationCli -VMName $VMName -VMId $VMId -SshHost $SshHost -SshPort $SshPort `
+                -SshUser $SshUser -SshIdentityFile $SshIdentityFile -RequestedLogRoot $LogRoot
+            exit 0
+        }
+        catch {
+            Write-Error -Message $_.Exception.Message -ErrorAction Continue
+            exit 1
+        }
+    } elseif ($CopyToVM -or $CopyFromVM) {
         try {
             $failedCount = Start-LabFileTransferCli -CopyToVM ([bool]$CopyToVM) -CopyFromVM ([bool]$CopyFromVM) `
                 -VMName $VMName -VMId $VMId -SourcePath $SourcePath -DestinationPath $DestinationPath `
