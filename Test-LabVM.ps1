@@ -60,7 +60,8 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Set-LabVMInstallMedia', 'Remove-LabVMInstallMedia', 'Set-LabVMBootOrder', 'Get-LabProperty',
     'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
     'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope',
-    'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning')
+    'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning',
+    'New-LabWindowsAnswerFileXml')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -675,6 +676,84 @@ Test-Case 'Complete-LabWindowsProvisioning throws clearly when neither known ISO
         Assert-Equal $script:RemoveVMDvdDriveCalls.Count 0
     } finally {
         $script:FakeDvdDrives.Clear()
+    }
+}
+
+# --- Windows unattended install, Task 4: Autounattend.xml content builder ---
+# Pure function -- no fakes needed, call it directly. Namespace-agnostic XPath (local-name()) is
+# used throughout because the real unattend.xml document declares a default namespace, and
+# PowerShell's dot-notation adapter is not reliably trustworthy to assert against here.
+function Select-LabXmlNode {
+    param([xml]$Xml, [string]$LocalName)
+    return $Xml.SelectSingleNode("//*[local-name()='$LocalName']")
+}
+Test-Case 'New-LabWindowsAnswerFileXml returns well-formed XML containing the given computer name, locale, timezone and username' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 1 'labadmin' $securePassword
+    $xml = [xml]$result
+    Assert-Equal (Select-LabXmlNode $xml 'ComputerName').InnerText 'LAB-PC01'
+    Assert-Equal (Select-LabXmlNode $xml 'TimeZone').InnerText 'Pacific Standard Time'
+    Assert-Equal (Select-LabXmlNode $xml 'SystemLocale').InnerText 'en-US'
+    Assert-Equal (Select-LabXmlNode $xml 'InputLocale').InnerText 'en-US'
+    Assert-Equal (Select-LabXmlNode $xml 'UILanguage').InnerText 'en-US'
+    Assert-Equal (Select-LabXmlNode $xml 'UserLocale').InnerText 'en-US'
+    Assert-Equal (Select-LabXmlNode $xml 'Username').InnerText 'labadmin'
+    Assert-Equal ($xml.SelectSingleNode("//*[local-name()='LocalAccount']/*[local-name()='Name']")).InnerText 'labadmin'
+}
+Test-Case 'New-LabWindowsAnswerFileXml selects the passed ImageIndex in InstallFrom metadata, with no product key' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 3 'labadmin' $securePassword
+    $xml = [xml]$result
+    $installFrom = $xml.SelectSingleNode("//*[local-name()='InstallFrom']")
+    Assert-Equal ($installFrom.SelectSingleNode("*[local-name()='MetaData']/*[local-name()='Key']")).InnerText '/IMAGE/INDEX'
+    Assert-Equal ($installFrom.SelectSingleNode("*[local-name()='MetaData']/*[local-name()='Value']")).InnerText '3'
+    Assert-Equal ($result.Contains('ProductKey')) $false
+}
+Test-Case 'New-LabWindowsAnswerFileXml enables AutoLogon for exactly one logon' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 1 'labadmin' $securePassword
+    $xml = [xml]$result
+    $autoLogon = $xml.SelectSingleNode("//*[local-name()='AutoLogon']")
+    Assert-Equal ($autoLogon.SelectSingleNode("*[local-name()='LogonCount']")).InnerText '1'
+    Assert-Equal ($autoLogon.SelectSingleNode("*[local-name()='Enabled']")).InnerText 'true'
+}
+Test-Case 'New-LabWindowsAnswerFileXml puts the identical plaintext password in both the local account and AutoLogon' {
+    $plainPassword = 'Tr0ub4dor&3'
+    $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 1 'labadmin' $securePassword
+    $xml = [xml]$result
+    $accountPassword = ($xml.SelectSingleNode("//*[local-name()='LocalAccount']/*[local-name()='Password']/*[local-name()='Value']")).InnerText
+    $autoLogonPassword = ($xml.SelectSingleNode("//*[local-name()='AutoLogon']/*[local-name()='Password']/*[local-name()='Value']")).InnerText
+    Assert-Equal $accountPassword $plainPassword
+    Assert-Equal $autoLogonPassword $plainPassword
+    Assert-Equal $accountPassword $autoLogonPassword
+}
+Test-Case 'New-LabWindowsAnswerFileXml output varies with its inputs' {
+    $securePasswordA = ConvertTo-SecureString 'Secret1!' -AsPlainText -Force
+    $securePasswordB = ConvertTo-SecureString 'Secret2!' -AsPlainText -Force
+    $resultA = New-LabWindowsAnswerFileXml 'LAB-ONE' 'en-US' 'Pacific Standard Time' 1 'alice' $securePasswordA
+    $resultB = New-LabWindowsAnswerFileXml 'LAB-TWO' 'fr-FR' 'W. Europe Standard Time' 2 'bob' $securePasswordB
+    Assert-Equal ($resultA -eq $resultB) $false
+    $xmlA = [xml]$resultA
+    $xmlB = [xml]$resultB
+    Assert-Equal (Select-LabXmlNode $xmlA 'ComputerName').InnerText 'LAB-ONE'
+    Assert-Equal (Select-LabXmlNode $xmlB 'ComputerName').InnerText 'LAB-TWO'
+    Assert-Equal (Select-LabXmlNode $xmlA 'SystemLocale').InnerText 'en-US'
+    Assert-Equal (Select-LabXmlNode $xmlB 'SystemLocale').InnerText 'fr-FR'
+    Assert-Equal (Select-LabXmlNode $xmlA 'TimeZone').InnerText 'Pacific Standard Time'
+    Assert-Equal (Select-LabXmlNode $xmlB 'TimeZone').InnerText 'W. Europe Standard Time'
+    $installFromA = $xmlA.SelectSingleNode("//*[local-name()='InstallFrom']/*[local-name()='MetaData']/*[local-name()='Value']")
+    $installFromB = $xmlB.SelectSingleNode("//*[local-name()='InstallFrom']/*[local-name()='MetaData']/*[local-name()='Value']")
+    Assert-Equal $installFromA.InnerText '1'
+    Assert-Equal $installFromB.InnerText '2'
+}
+Test-Case 'New-LabWindowsAnswerFileXml skips every OOBE prompt this plan depends on' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 1 'labadmin' $securePassword
+    $xml = [xml]$result
+    foreach ($elementName in @('HideEULAPage', 'HideOEMRegistrationScreen', 'HideWirelessSetupInOOBE', 'NetworkLocation', 'ProtectYourPC')) {
+        $node = Select-LabXmlNode $xml $elementName
+        if ($null -eq $node) { throw "Missing OOBE element: $elementName" }
     }
 }
 

@@ -2087,6 +2087,154 @@ function Complete-LabWindowsProvisioning {
     Set-LabVMBootOrder $VMId 'Disk'
 }
 
+function New-LabWindowsAnswerFileXml {
+    # Pure string builder: no I/O, no COM, no Hyper-V. Its only job is to hand back a well-formed
+    # Windows unattend.xml answer file for Task 6's orchestrator to write into the seed ISO via
+    # New-LabSeedIso. Partition layout (EFI system partition + MSR + a single primary OS partition
+    # filling the rest of the disk) is the standard whole-disk UEFI/GPT shape for a single-disk
+    # Gen2 VM -- no separate Windows RE partition, since nothing here needs to recover this VM.
+    param(
+        [string]$ComputerName,
+        [string]$Locale,
+        [string]$TimeZone,
+        [int]$ImageIndex,
+        [string]$UserName,
+        [securestring]$Password
+    )
+    # The SecureString is decrypted to plaintext only in this narrow scope, for exactly as long as
+    # it takes to interpolate it into the XML below, then the unmanaged memory holding it is
+    # explicitly zeroed and freed in the finally -- never logged, never written anywhere by this
+    # function itself.
+    $passwordPtr = [IntPtr]::Zero
+    try {
+        $passwordPtr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Password)
+        $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($passwordPtr)
+        $escapedComputerName = [Security.SecurityElement]::Escape($ComputerName)
+        $escapedLocale = [Security.SecurityElement]::Escape($Locale)
+        $escapedTimeZone = [Security.SecurityElement]::Escape($TimeZone)
+        $escapedUserName = [Security.SecurityElement]::Escape($UserName)
+        $escapedPassword = [Security.SecurityElement]::Escape($plainPassword)
+        return @"
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+    <settings pass="windowsPE">
+        <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <DiskConfiguration>
+                <Disk wcm:action="add">
+                    <DiskID>0</DiskID>
+                    <WillWipeDisk>true</WillWipeDisk>
+                    <CreatePartitions>
+                        <CreatePartition wcm:action="add">
+                            <Order>1</Order>
+                            <Type>EFI</Type>
+                            <Size>300</Size>
+                        </CreatePartition>
+                        <CreatePartition wcm:action="add">
+                            <Order>2</Order>
+                            <Type>MSR</Type>
+                            <Size>128</Size>
+                        </CreatePartition>
+                        <CreatePartition wcm:action="add">
+                            <Order>3</Order>
+                            <Type>Primary</Type>
+                            <Extend>true</Extend>
+                        </CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                        <ModifyPartition wcm:action="add">
+                            <Order>1</Order>
+                            <PartitionID>1</PartitionID>
+                            <Label>System</Label>
+                            <Format>FAT32</Format>
+                        </ModifyPartition>
+                        <ModifyPartition wcm:action="add">
+                            <Order>2</Order>
+                            <PartitionID>2</PartitionID>
+                        </ModifyPartition>
+                        <ModifyPartition wcm:action="add">
+                            <Order>3</Order>
+                            <PartitionID>3</PartitionID>
+                            <Label>Windows</Label>
+                            <Format>NTFS</Format>
+                            <Letter>C</Letter>
+                        </ModifyPartition>
+                    </ModifyPartitions>
+                </Disk>
+            </DiskConfiguration>
+            <UserData>
+                <AcceptEula>true</AcceptEula>
+            </UserData>
+            <ImageInstall>
+                <OSImage>
+                    <InstallFrom>
+                        <MetaData wcm:action="add">
+                            <Key>/IMAGE/INDEX</Key>
+                            <Value>$ImageIndex</Value>
+                        </MetaData>
+                    </InstallFrom>
+                    <InstallTo>
+                        <DiskID>0</DiskID>
+                        <PartitionID>3</PartitionID>
+                    </InstallTo>
+                </OSImage>
+            </ImageInstall>
+        </component>
+    </settings>
+    <settings pass="specialize">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <ComputerName>$escapedComputerName</ComputerName>
+            <TimeZone>$escapedTimeZone</TimeZone>
+        </component>
+    </settings>
+    <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <UserAccounts>
+                <LocalAccounts>
+                    <LocalAccount wcm:action="add">
+                        <Name>$escapedUserName</Name>
+                        <Group>Administrators</Group>
+                        <Password>
+                            <Value>$escapedPassword</Value>
+                            <PlainText>true</PlainText>
+                        </Password>
+                    </LocalAccount>
+                </LocalAccounts>
+            </UserAccounts>
+            <AutoLogon>
+                <Enabled>true</Enabled>
+                <LogonCount>1</LogonCount>
+                <Username>$escapedUserName</Username>
+                <Password>
+                    <Value>$escapedPassword</Value>
+                    <PlainText>true</PlainText>
+                </Password>
+            </AutoLogon>
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <NetworkLocation>Work</NetworkLocation>
+                <ProtectYourPC>3</ProtectYourPC>
+                <SkipMachineOOBE>true</SkipMachineOOBE>
+                <SkipUserOOBE>true</SkipUserOOBE>
+            </OOBE>
+        </component>
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>$escapedLocale</InputLocale>
+            <SystemLocale>$escapedLocale</SystemLocale>
+            <UILanguage>$escapedLocale</UILanguage>
+            <UserLocale>$escapedLocale</UserLocale>
+        </component>
+    </settings>
+</unattend>
+"@
+    } finally {
+        if ($passwordPtr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($passwordPtr)
+        }
+    }
+}
+
 function Format-LabBootEntry {
     param($Entry)
     $kind = Get-LabBootEntryKind $Entry
