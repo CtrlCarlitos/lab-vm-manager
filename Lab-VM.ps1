@@ -1482,9 +1482,17 @@ function Write-LabIStreamToFile {
     [LabIsoStreamWriter]::WriteToFile($Stream, $Path)
 }
 
-# Builds a plain, non-bootable data ISO at $OutputPath. $Files keys are relative in-image paths;
-# each value is either the path to an existing local file to copy in, or -- when it is not itself an
-# existing file -- literal string content written to a throwaway temp file first. Deliberately knows
+# Builds a plain, non-bootable data ISO at $OutputPath. $Files keys are relative in-image paths
+# ('Autounattend.xml', 'sub/dir/file.txt'); a rooted key ('\x', 'C:\x', 'C:x'), a ':' anywhere, an
+# empty segment, a '..' segment, or two keys naming the same in-image file is refused before anything
+# is staged. Each value says explicitly what it is -- nothing is ever inferred from whether a string
+# happens to name an existing file:
+#   - a plain [string] is ALWAYS the literal file content (written as UTF-8, no BOM), even if that
+#     text looks like a path;
+#   - @{ SourcePath = 'C:\...' } copies that local file in byte-for-byte, and a missing source file
+#     is an error, never silently replaced by its path text;
+#   - anything else ($null, numbers, byte arrays, FileInfo, other hashtables) is refused.
+# Every key and value is validated before the COM image or the staging directory is created. Deliberately knows
 # nothing about Autounattend.xml or cloud-init: the Windows/Linux unattended-install plans decide
 # that content and pass it through this one generic function. BootImageOptions is never set, so the
 # image stays non-bootable; FileSystemsToCreate is left at IMAPI2FS's own default (which includes
@@ -1507,6 +1515,35 @@ function New-LabSeedIso {
     if ($null -eq $Files -or $Files.Count -eq 0) {
         throw 'New-LabSeedIso requires at least one entry in -Files.'
     }
+    $staged = [Collections.Generic.List[object]]::new()
+    $seenPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $Files.GetEnumerator()) {
+        $key = [string]$entry.Key
+        $relativePath = $key.Replace('/', '\')
+        if ([string]::IsNullOrWhiteSpace($relativePath)) { throw "Invalid in-image path '$key': it is empty." }
+        if ([IO.Path]::IsPathRooted($relativePath) -or $relativePath.Contains(':')) {
+            throw "Invalid in-image path '$key': it must be a relative path inside the image (no drive, ':' or leading slash)."
+        }
+        foreach ($segment in $relativePath.Split('\')) {
+            if ($segment -eq '' -or $segment -eq '.' -or $segment -eq '..') {
+                throw "Invalid in-image path '$key': it must not contain empty, '.' or '..' segments."
+            }
+        }
+        if (-not $seenPaths.Add($relativePath)) { throw "Invalid in-image path '$key': another key names the same file." }
+        $value = $entry.Value
+        if ($value -is [string]) {
+            $staged.Add([pscustomobject]@{ RelativePath = $relativePath; Content = $value; SourcePath = $null })
+        } elseif ($value -is [Collections.IDictionary] -and $value.Count -eq 1 -and $value.Contains('SourcePath')) {
+            $sourcePath = [string]$value['SourcePath']
+            if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                throw "Source file '$sourcePath' for in-image path '$key' does not exist."
+            }
+            $staged.Add([pscustomobject]@{ RelativePath = $relativePath; Content = $null; SourcePath = $sourcePath })
+        } else {
+            $typeName = if ($null -eq $value) { '$null' } else { $value.GetType().FullName }
+            throw "Unsupported value for in-image path '$key' ($typeName): use a [string] for literal content or @{ SourcePath = '<local file>' } to copy a file."
+        }
+    }
     try {
         $image = New-Object -ComObject IMAPI2FS.MsftFileSystemImage -ErrorAction Stop
     } catch {
@@ -1516,16 +1553,18 @@ function New-LabSeedIso {
     $stagingDir = Join-Path ([IO.Path]::GetTempPath()) ('labseediso-' + [guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($stagingDir)
     try {
-        foreach ($entry in $Files.GetEnumerator()) {
-            $relativePath = ([string]$entry.Key).Replace('/', '\').TrimStart('\')
-            if ([string]::IsNullOrWhiteSpace($relativePath)) { throw "Invalid in-image path '$($entry.Key)'." }
-            $value = $entry.Value
-            $destinationPath = Join-Path $stagingDir $relativePath
+        $stagingRoot = [IO.Path]::GetFullPath($stagingDir).TrimEnd('\') + '\'
+        foreach ($item in $staged) {
+            $destinationPath = [IO.Path]::GetFullPath((Join-Path $stagingDir $item.RelativePath))
+            # Belt and braces behind the key validation above: never write outside the staging directory.
+            if (-not $destinationPath.StartsWith($stagingRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Invalid in-image path '$($item.RelativePath)': it resolves outside the staging directory."
+            }
             [void][IO.Directory]::CreateDirectory((Split-Path -Parent $destinationPath))
-            if ($value -is [string] -and (Test-Path -LiteralPath $value -PathType Leaf)) {
-                [IO.File]::Copy($value, $destinationPath, $true)
+            if ($null -ne $item.SourcePath) {
+                [IO.File]::Copy($item.SourcePath, $destinationPath, $true)
             } else {
-                [IO.File]::WriteAllText($destinationPath, [string]$value)
+                [IO.File]::WriteAllText($destinationPath, $item.Content)
             }
         }
         $image.Root.AddTree($stagingDir, $false)
@@ -1541,11 +1580,26 @@ function Test-LabVMHasKeyProtector {
     # Pure, read-only presence check -- it must never mutate. Set-LabVMBootProfile below calls this
     # to decide whether to add a key protector, and a standalone preview (Task 6) calls it before
     # any confirmation, so merely checking "does this VM already have one" can never itself create
-    # one. Get-VMKeyProtector is the read-side counterpart of the cmdlet that creates one: a VM with
-    # no key protector configured returns a zero-length RawKeyProtector, never $null.
+    # one.
+    #
+    # Output shape, CONFIRMED by reflection against the installed Hyper-V module (no elevation, no VM
+    # touched): GetVMKeyProtector.ProcessOneOperand calls VMSecurity.GetKeyProtector, which returns a
+    # bare System.Byte[], and hands it to Cmdlet.WriteObject(object) without enumerating it. The
+    # cmdlet therefore emits ONE raw byte[] -- there is no wrapper object, and no type anywhere in the
+    # module has a RawKeyProtector or RawData property (RawData in Microsoft's docs belongs to the
+    # HgsClient's New-HgsKeyProtector object, not to Hyper-V). Test-LabVM.ps1's drift guard re-checks
+    # this against the installed module on every run.
+    #
+    # Not knowable by reflection: the exact bytes Hyper-V returns for a VM with NO key protector (they
+    # come from WMI at run time; reportedly empty or the 4-byte header 0,0,0,4). A real local key
+    # protector is kilobytes. So "present" means longer than 4 bytes. This errs on the safe side: if
+    # the empty form were ever longer, the VM would be reported as already protected, which skips
+    # creation and never rotates; a wrong "absent" would need a real protector of 4 bytes or fewer.
+    # $null and an enumerated array (count of items) are normalized too, so neither can throw.
     $vm = Get-LabVM $VMId
-    $protector = Get-VMKeyProtector -VM $vm -ErrorAction Stop
-    return ($null -ne $protector.RawKeyProtector -and $protector.RawKeyProtector.Length -gt 0)
+    $raw = Get-VMKeyProtector -VM $vm -ErrorAction Stop
+    $length = if ($null -eq $raw) { 0 } elseif ($raw -is [byte[]]) { $raw.Length } else { @($raw).Count }
+    return ($length -gt 4)
 }
 
 function Set-LabVMBootProfile {
@@ -1582,8 +1636,19 @@ function Set-LabVMBootProfile {
             }
         }
     }
+    # Both profiles need Secure Boot actually ON, not just the right template: a VM whose Secure Boot
+    # was turned off (e.g. to boot some other distro) would otherwise keep the right template and
+    # still not be Secure-Boot-protected. VMFirmware.SecureBoot is an OnOffState (reflection-checked),
+    # read from the same Get-VMFirmware snapshot the template decision used. Turning it on touches no
+    # key protector or encryption state.
+    $secureBootEnabled = $false
+    if ([string]$firmware.SecureBoot -ne 'On') {
+        Set-VMFirmware -VM $vm -EnableSecureBoot On -Confirm:$false -ErrorAction Stop
+        $secureBootEnabled = $true
+    }
     return [pscustomobject]@{
         SecureBootTemplateChanged = $secureBootTemplateChanged
+        SecureBootEnabled = $secureBootEnabled
         KeyProtectorAdded = $keyProtectorAdded
         TpmEnabled = $tpmEnabled
     }
@@ -1604,24 +1669,11 @@ function Set-LabVMInstallMedia {
     if ($drives.Count -gt 1) {
         throw "'$($vm.Name)': more than one DVD drive exists; this version doesn't choose among them. Attach the ISO to one of them manually in Hyper-V Manager."
     }
-    $dvdDriveAdded = $false
-    if ($drives.Count -eq 0) {
-        Add-VMDvdDrive -VM $vm -Confirm:$false -ErrorAction Stop
-        $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
-        $dvdDriveAdded = $true
-    }
-    $drive = $drives[0]
-    $previousAttachment = [string]$drive.Path
 
-    # Before changing anything (the ISO attachment below), record the drive's current attachment
-    # (which may be $null/empty for a newly added drive) so a later "show previous attachment" or
-    # restore can use it.
-    $path = Get-LabVMInstallMediaPath $VMId
-    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
-    ([ordered]@{ PreviousAttachment = $previousAttachment } | ConvertTo-Json) | Set-Content -LiteralPath $path
-
-    # Re-validate immediately before attaching: the ISO may have been deleted, moved, or truncated
-    # since it was selected. Same checks as Select-LabIsoPath's own selection-time validation.
+    # Re-validate BEFORE any change (adding a drive, writing the record, attaching): the ISO may have
+    # been deleted, moved, or truncated since it was selected, and callers outside the menu's preview
+    # flow (the unattended-install plans) rely on this function never half-applying. Same checks as
+    # Select-LabIsoPath's own selection-time validation.
     if (-not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) {
         throw "ISO '$IsoPath' no longer exists."
     }
@@ -1632,6 +1684,21 @@ function Set-LabVMInstallMedia {
         throw "ISO '$IsoPath' could not be opened for reading ($($_.Exception.Message))."
     }
     if ($length -le 0) { throw "ISO '$IsoPath' is empty (0 bytes)." }
+
+    $dvdDriveAdded = $false
+    if ($drives.Count -eq 0) {
+        Add-VMDvdDrive -VM $vm -Confirm:$false -ErrorAction Stop
+        $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+        $dvdDriveAdded = $true
+    }
+    $drive = $drives[0]
+    $previousAttachment = [string]$drive.Path
+
+    # Before the ISO attachment below, record the drive's current attachment (which may be
+    # $null/empty for a newly added drive) so a later "show previous attachment" or restore can use it.
+    $path = Get-LabVMInstallMediaPath $VMId
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+    ([ordered]@{ PreviousAttachment = $previousAttachment } | ConvertTo-Json) | Set-Content -LiteralPath $path
 
     Set-VMDvdDrive -VMDvdDrive $drive -Path $IsoPath -Confirm:$false -ErrorAction Stop
     return [pscustomobject]@{ PreviousAttachment = $previousAttachment; DvdDriveAdded = $dvdDriveAdded }
@@ -1652,10 +1719,14 @@ function Remove-LabVMInstallMedia {
 
 function Get-LabBootEntryKind {
     param($Entry)
-    # Get-VMFirmware's BootOrder may hold the device objects themselves or VMBootSource wrappers whose
-    # Device property is the device (not yet verified on a live host, see MANUAL-TESTS.md), and the
-    # device class may surface as VMDvdDrive or DvdDrive. Classify by the underlying device's type
-    # name either way; anything unrecognized is 'Other' and is never dropped by a reorder.
+    # CONFIRMED by reflection against the installed Hyper-V module (no elevation, no VM touched; the
+    # drift guard in Test-LabVM.ps1 re-checks it): VMFirmware.BootOrder is a
+    # Microsoft.HyperV.PowerShell.VMBootSource[] whose entries carry BootType (Unknown/Drive/Network/
+    # File), Description, FirmwarePath and Device, and the DVD/disk device classes are named DvdDrive
+    # and HardDiskDrive -- with NO 'VM' prefix. So the real shape is VMBootSource{ Device = DvdDrive }.
+    # Classifying by the device's type-name suffix covers that and also a bare device or a VM-prefixed
+    # name; anything unrecognized is 'Other' and is never dropped by a reorder. Still live-only (see
+    # MANUAL-TESTS.md): what .Device holds for BootType = File entries such as "Windows Boot Manager".
     $device = $Entry
     $deviceProperty = $Entry.PSObject.Properties['Device']
     if ($null -ne $deviceProperty -and $null -ne $deviceProperty.Value) { $device = $deviceProperty.Value }
@@ -1726,8 +1797,10 @@ function Show-LabVMInstallMediaConfiguration {
     }
     $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
     Write-Host "Secure Boot: $(Get-LabProperty $firmware 'SecureBoot' '-'); template: $(Get-LabProperty $firmware 'SecureBootTemplate' '-')"
+    # Each security sub-read is guarded on its own: the inspect view must never die part-way on one.
     try { $tpm = Get-LabProperty (Get-VMSecurity -VM $vm -ErrorAction Stop) 'TpmEnabled' '-' } catch { $tpm = 'unknown' }
-    Write-Host "Key protector configured: $(Test-LabVMHasKeyProtector $VMId); vTPM enabled: $tpm"
+    try { $keyProtector = Test-LabVMHasKeyProtector $VMId } catch { $keyProtector = "unknown ($($_.Exception.Message))" }
+    Write-Host "Key protector configured: $keyProtector; vTPM enabled: $tpm"
     Write-Host 'Firmware boot order (persistent; checked on every boot):'
     $order = @($firmware.BootOrder)
     if ($order.Count -eq 0) { Write-Host '  (empty)' }
@@ -1741,8 +1814,16 @@ function Get-LabVMInstallationMediaPreview {
     # read-only Test-LabVMHasKeyProtector, never by running the boot-profile apply step to find out.
     $vm = Get-LabVM $VMId
     $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
-    $dvdPlan = if ($drives.Count -eq 0) { 'A new DVD drive will be added (none exists yet).' }
+    $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
+    $order = @($firmware.BootOrder)
+    # With exactly one DVD drive, its boot entry already exists, so whether the DVD-first step can
+    # recognize it is checked NOW, with the same classifier that step uses, rather than after the boot
+    # profile and media have already been applied. With no drive yet, the entry only appears once the
+    # drive is added, so it can only be verified at that last step ($null here).
+    $dvdBootEntryRecognized = $null
+    $dvdPlan = if ($drives.Count -eq 0) { 'A new DVD drive will be added (none exists yet); its firmware boot entry is verified at the last step.' }
         elseif ($drives.Count -eq 1) {
+            $dvdBootEntryRecognized = (@($order | Where-Object { (Get-LabBootEntryKind $_) -eq 'Dvd' }).Count -gt 0)
             $current = [string](Get-LabProperty $drives[0] 'Path' '')
             'The existing DVD drive ({0} {1}:{2}) will be used; current media: {3}.' -f
                 (Get-LabProperty $drives[0] 'ControllerType' '?'), (Get-LabProperty $drives[0] 'ControllerNumber' '?'),
@@ -1751,18 +1832,22 @@ function Get-LabVMInstallationMediaPreview {
 
     # Mirrors the boot-profile apply step's own decisions so the preview states exactly what it will do.
     $hasKeyProtector = Test-LabVMHasKeyProtector $VMId
-    $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
     $currentTemplate = [string](Get-LabProperty $firmware 'SecureBootTemplate' '')
+    $secureBootState = [string](Get-LabProperty $firmware 'SecureBoot' '')
     $profileChanges = [Collections.Generic.List[string]]::new()
     $targetTemplate = if ($OsProfile -eq 'Windows11') { 'MicrosoftWindows' } else { 'MicrosoftUEFICertificateAuthority' }
     if ($currentTemplate -ne $targetTemplate) {
         $profileChanges.Add("Secure Boot template: '$currentTemplate' -> '$targetTemplate'.")
     }
+    # The template alone is not protection: Secure Boot itself must be on (same test as the apply step).
+    if ($secureBootState -ne 'On') {
+        $shownState = if ([string]::IsNullOrEmpty($secureBootState)) { '(unknown)' } else { $secureBootState }
+        $profileChanges.Add("Secure Boot: $shownState -> On.")
+    }
     if ($OsProfile -eq 'Windows11' -and -not $hasKeyProtector) {
         $profileChanges.Add('A new local key protector will be created and vTPM enabled.')
     }
     try { $tpmEnabled = Get-LabProperty (Get-VMSecurity -VM $vm -ErrorAction Stop) 'TpmEnabled' $null } catch { $tpmEnabled = $null }
-    $order = @($firmware.BootOrder)
     $firstBoot = if ($order.Count -gt 0) { Format-LabBootEntry $order[0] } else { '(empty)' }
 
     # Existing-data check: real checkpoints and real on-disk sizes, never names. A differencing disk's
@@ -1798,6 +1883,8 @@ function Get-LabVMInstallationMediaPreview {
         IsoPath = $IsoPath
         DvdDriveCount = $drives.Count
         DvdPlan = $dvdPlan
+        DvdBootEntryRecognized = $dvdBootEntryRecognized
+        SecureBootState = $secureBootState
         BootProfileChanges = [string[]]$profileChanges.ToArray()
         HasKeyProtector = $hasKeyProtector
         TpmEnabled = $tpmEnabled
@@ -1840,6 +1927,7 @@ function Set-LabVMInstallationMediaInteractive {
             Write-Host "Eject '$attached' from '$($vm.Name)'. The DVD drive itself stays; the firmware boot order is not changed (an empty DVD entry is skipped at boot)."
             if ((Read-LabYesNoCancel 'Eject now?') -ne 'Y') { return 'CANCELLED' }
             Remove-LabVMInstallMedia $VMId
+            Write-LabAudit 'eject-install-media' 'COMPLETED' $vm ("Ejected={0}; DvdDriveKept=True; BootOrderChanged=False" -f $attached)
             Write-Host 'Media ejected.'
             return 'COMPLETED'
         }
@@ -1867,6 +1955,11 @@ function Set-LabVMInstallationMediaInteractive {
     $preview = Get-LabVMInstallationMediaPreview $VMId $osProfile $isoPath
     if ($preview.DvdDriveCount -gt 1) {
         Write-Warning "'$($preview.VMName)': more than one DVD drive exists; this version doesn't choose among them. Attach the ISO manually in Hyper-V Manager. Nothing was changed."
+        return 'CANCELLED'
+    }
+    if ($preview.DvdDriveCount -eq 1 -and $preview.DvdBootEntryRecognized -eq $false) {
+        # Refuse now rather than apply the boot profile and media and only then fail at the boot-order step.
+        Write-Warning "'$($preview.VMName)': the existing DVD drive has no recognizable entry in the firmware boot order, so DVD-first could not be set. Check Firmware > Boot order in Hyper-V Manager (and run I to see the entries). Nothing was changed."
         return 'CANCELLED'
     }
     Write-Host "`n=== Installation media preview (nothing has been changed yet) ==="
@@ -1904,8 +1997,14 @@ function Set-LabVMInstallationMediaInteractive {
     $done = [Collections.Generic.List[string]]::new()
     try {
         $profileResult = Set-LabVMBootProfile $VMId $osProfile
-        $done.Add(('boot profile (template changed: {0}; key protector added: {1}; vTPM enabled: {2})' -f
-            $profileResult.SecureBootTemplateChanged, $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled))
+        $done.Add(('boot profile (template changed: {0}; Secure Boot turned on: {1}; key protector added: {2}; vTPM enabled: {3})' -f
+            $profileResult.SecureBootTemplateChanged, $profileResult.SecureBootEnabled, $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled))
+        if ($profileResult.KeyProtectorAdded -or $profileResult.TpmEnabled) {
+            # Security-relevant and hard to undo: recorded on its own, immediately, so the audit log
+            # shows it even if a later step (media, boot order) fails.
+            Write-LabAudit 'add-key-protector' 'COMPLETED' $vm ("OsProfile={0}; NewLocalKeyProtector={1}; VTpmEnabled={2}" -f
+                $osProfile, $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled)
+        }
         $mediaResult = Set-LabVMInstallMedia $VMId $isoPath
         $previous = if ([string]::IsNullOrEmpty($mediaResult.PreviousAttachment)) { '(empty)' } else { $mediaResult.PreviousAttachment }
         $done.Add(('ISO attached (DVD drive added: {0}; previous media: {1})' -f $mediaResult.DvdDriveAdded, $previous))
@@ -1915,6 +2014,10 @@ function Set-LabVMInstallationMediaInteractive {
         $completedText = if ($done.Count -eq 0) { 'none' } else { $done -join '; ' }
         throw "Installation media setup stopped partway: $($_.Exception.Message) Steps already applied: $completedText. Use I to inspect the VM before retrying."
     }
+    Write-LabAudit 'attach-install-media' 'COMPLETED' $vm (("OsProfile={0}; Iso={1}; SecureBootTemplateChanged={2}; SecureBootEnabled={3}; " +
+        "KeyProtectorAdded={4}; VTpmEnabled={5}; DvdDriveAdded={6}; PreviousMedia={7}; BootOrder=DvdFirst") -f
+        $osProfile, $isoPath, $profileResult.SecureBootTemplateChanged, $profileResult.SecureBootEnabled,
+        $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled, $mediaResult.DvdDriveAdded, $previous)
     foreach ($line in $done) { Write-Host "Done: $line" }
     Write-Host 'Start the VM to boot the installer. No OS is installed automatically by this action.'
     return 'COMPLETED'

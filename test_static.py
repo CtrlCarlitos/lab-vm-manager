@@ -710,5 +710,66 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Show-LabVMMenu {', 1)[1].split('\nfunction ', 1)[0]
         self.assertEqual(body.count('  M  Installation media'), 2)
 
+    # --- Final-review fix wave ---
+    def _body(self, name):
+        return self.s.split('function %s {' % name, 1)[1].split('\nfunction ', 1)[0]
+    def test_key_protector_reads_the_real_byte_array_shape(self):
+        # Reflection-confirmed: Get-VMKeyProtector emits a bare byte[]; no wrapper property exists.
+        body = self._body('Test-LabVMHasKeyProtector')
+        self.assertNotIn('.RawKeyProtector', body)
+        self.assertNotIn('.RawData', body)
+        self.assertIn('-is [byte[]]', body)
+        self.assertIn('-gt 4', body)
+    def test_seed_iso_never_infers_content_from_an_existing_path(self):
+        body = self._body('New-LabSeedIso')
+        self.assertIn('SourcePath', body)
+        self.assertNotIn('$value -is [string] -and (Test-Path', body)
+        self.assertIn('IsPathRooted', body)
+        self.assertIn("'..'", body)
+        # Every key/value is validated before the COM image is created.
+        self.assertLess(body.index('IsPathRooted'), body.index('IMAPI2FS.MsftFileSystemImage'))
+        self.assertLess(body.index('does not exist'), body.index('IMAPI2FS.MsftFileSystemImage'))
+    def test_install_media_revalidates_iso_before_adding_a_drive_or_writing_the_record(self):
+        body = self._body('Set-LabVMInstallMedia')
+        idx_validate = body.index('no longer exists')
+        self.assertLess(idx_validate, body.index('Add-VMDvdDrive'))
+        self.assertLess(body.index('is empty (0 bytes)'), body.index('Add-VMDvdDrive'))
+        self.assertLess(idx_validate, body.index('Set-Content'))
+    def test_boot_profile_turns_secure_boot_on_when_off(self):
+        body = self._body('Set-LabVMBootProfile')
+        self.assertIn('$firmware.SecureBoot', body)
+        self.assertIn('-EnableSecureBoot On', body)
+        self.assertIn('SecureBootEnabled', body)
+    def test_preview_checks_secure_boot_state_and_dvd_boot_entry(self):
+        body = self._body('Get-LabVMInstallationMediaPreview')
+        self.assertIn("'SecureBoot'", body)
+        self.assertIn('-> On.', body)
+        self.assertIn('Get-LabBootEntryKind', body)
+        self.assertIn('DvdBootEntryRecognized', body)
+        interactive = self._body('Set-LabVMInstallationMediaInteractive')
+        self.assertLess(interactive.index('DvdBootEntryRecognized'), interactive.index("Read-LabYesNoCancel 'Apply these changes'"))
+    def test_installation_media_audits_key_protector_attach_and_eject(self):
+        body = self._body('Set-LabVMInstallationMediaInteractive')
+        self.assertIn("Write-LabAudit 'add-key-protector' 'COMPLETED'", body)
+        self.assertIn("Write-LabAudit 'attach-install-media' 'COMPLETED'", body)
+        self.assertIn("Write-LabAudit 'eject-install-media' 'COMPLETED'", body)
+        # The key-protector record is written right after the boot-profile step, before media/boot order.
+        self.assertLess(body.index("'add-key-protector'"), body.index('Set-LabVMInstallMedia $VMId'))
+    def test_inspect_guards_the_key_protector_read(self):
+        body = self._body('Show-LabVMInstallMediaConfiguration')
+        self.assertIn('try { $keyProtector = Test-LabVMHasKeyProtector $VMId } catch', body)
+    def test_docs_state_reflection_findings_acl_and_press_any_key(self):
+        readme = SCRIPT.with_name('README.md').read_text(encoding='utf-8-sig')
+        manual = SCRIPT.with_name('MANUAL-TESTS.md').read_text(encoding='utf-8-sig')
+        self.assertNotIn('It is never written to:', readme)
+        self.assertIn('access-control entry', readme)
+        self.assertIn('Press any key to boot from CD or DVD', readme)
+        self.assertIn('Get-Acl', manual)
+        self.assertIn('VMBootSource', readme)
+        self.assertIn('VMBootSource', manual)
+        self.assertIn('byte[]', readme)
+        self.assertIn('byte[]', manual)
+        self.assertNotIn("has not yet been verified against a live host's `Get-VMFirmware` output", readme)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
