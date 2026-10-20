@@ -12,9 +12,10 @@
     both from the interactive menu and, via -CopyToVM/-CopyFromVM and their
     related parameters below, as a non-interactive parameter-mode CLI
     surface that runs one transfer and exits; see README.md ("Parameter
-    mode: file transfer") for the full parameter list and examples. Guest
-    provisioning, credential copying, and disk file deletion are not
-    implemented. This is an operator tool, not a security boundary against
+    mode: file transfer") for the full parameter list and examples. A new
+    LAB- VM can also be created with Windows 11 installed unattended (menu W,
+    or -ProvisionWindowsVM). Other guest provisioning, credential copying, and
+    disk file deletion are not implemented. This is an operator tool, not a security boundary against
     another administrator or an untrusted guest.
 
     Copying files into a guest's .ssh directory is an ordinary file/directory
@@ -92,6 +93,46 @@
 .PARAMETER SshIdentityFile
     Parameter mode: an optional identity-file path to save, with -ConfigureSsh. Omit it to
     save password authentication instead.
+.PARAMETER ProvisionWindowsVM
+    Parameter mode: create a new LAB- VM and install Windows 11 on it unattended (menu option W does
+    the same with all defaults), then exit. Shows one combined preview and asks once before creating
+    anything; with -NonInteractive it never prompts and requires -NewVMName, -WindowsIsoPath and
+    -Credential. Mutually exclusive with -ConfigureSsh/-CopyToVM/-CopyFromVM. The parameters
+    -NewVMName through -ProvisioningTimeoutSeconds are rejected, rather than ignored, without it.
+.PARAMETER NewVMName
+    Name of the VM to CREATE with -ProvisionWindowsVM (must start with LAB- and be unique). Distinct
+    from -VMName, which always names an existing VM. Prompted for when omitted (unless -NonInteractive).
+.PARAMETER WindowsIsoPath
+    Windows 11 installer ISO for -ProvisionWindowsVM. When omitted, pick one from -IsoRoot interactively.
+.PARAMETER ComputerName
+    Guest computer name (1-15 letters, digits or hyphens). Default: derived from -NewVMName.
+.PARAMETER Locale
+    Guest input/system/UI/user locale, e.g. en-US (default en-US). Must be a language the ISO contains.
+.PARAMETER TimeZone
+    Guest Windows time zone ID, e.g. 'Pacific Standard Time' (see tzutil /l). Default: this host's.
+.PARAMETER OsEdition
+    Windows 11 edition on the ISO, by full image name ('Windows 11 Pro') or short name ('Pro').
+    Default: a picker preselecting Pro; with -NonInteractive, Pro (or the ISO's only edition).
+.PARAMETER VhdxSizeGB
+    New dynamic VHDX maximum size in GB (default 150; 64-65536).
+.PARAMETER VCpuCount
+    New VM's vCPU count (default 2, capped to this host's logical processor count).
+.PARAMETER MemoryMinimumGB
+    Dynamic memory minimum in GB (default 2).
+.PARAMETER MemoryStartupGB
+    Dynamic memory startup in GB (default 4).
+.PARAMETER MemoryMaximumGB
+    Dynamic memory maximum in GB (default 8).
+.PARAMETER SwitchName
+    Virtual switch for the new VM's network adapter (default: none, Disconnected; PowerShell Direct
+    needs no network).
+.PARAMETER VmStorageRoot
+    Existing local folder that receives the new VM's own folder (default: the Hyper-V host default).
+.PARAMETER VhdxStorageRoot
+    Existing local folder that receives the new VHDX's own folder (default: the Hyper-V host default).
+.PARAMETER ProvisioningTimeoutSeconds
+    How long to wait for each PowerShell Direct sign-in proving Windows is installed/boots cleanly
+    (default 1800; 300-7200). Separate from -TimeoutSeconds, which bounds short VM state changes.
 .EXAMPLE
     powershell.exe -NoProfile -File .\Lab-VM.ps1 -ReadOnly
 .EXAMPLE
@@ -101,6 +142,9 @@
     & .\Lab-VM.ps1 -CopyToVM -VMName LAB-dev -SourcePath C:\keys\id_ed25519 -DestinationPath C:\Users\dev\.ssh\id_ed25519 -PermissionProfile PrivateFiles -NonInteractive -Credential $cred
 .EXAMPLE
     powershell.exe -NoProfile -File .\Lab-VM.ps1 -ConfigureSsh -VMName LAB-linux -SshHost 192.168.1.50 -SshUser dev -SshIdentityFile C:\keys\id_ed25519
+.EXAMPLE
+    $cred = Get-Credential
+    & .\Lab-VM.ps1 -ProvisionWindowsVM -NewVMName LAB-win11 -WindowsIsoPath E:\ISO\Win11_24H2_English_x64.iso -OsEdition Pro -NonInteractive -Credential $cred
 .NOTES
     Version: 1.0.0
     Written for Windows PowerShell 5.1. Does not change execution policy.
@@ -134,7 +178,29 @@ param(
     [ValidateRange(1, 65535)]
     [int]$SshPort = 22,
     [string]$SshUser,
-    [string]$SshIdentityFile
+    [string]$SshIdentityFile,
+    [switch]$ProvisionWindowsVM,
+    [string]$NewVMName,
+    [string]$WindowsIsoPath,
+    [string]$ComputerName,
+    [string]$Locale,
+    [string]$TimeZone,
+    [string]$OsEdition,
+    [ValidateRange(64, 65536)]
+    [int]$VhdxSizeGB = 150,
+    [ValidateRange(1, 1024)]
+    [int]$VCpuCount = 2,
+    [ValidateRange(1, 4096)]
+    [int]$MemoryMinimumGB = 2,
+    [ValidateRange(1, 4096)]
+    [int]$MemoryStartupGB = 4,
+    [ValidateRange(1, 4096)]
+    [int]$MemoryMaximumGB = 8,
+    [string]$SwitchName = '',
+    [string]$VmStorageRoot = '',
+    [string]$VhdxStorageRoot = '',
+    [ValidateRange(300, 7200)]
+    [int]$ProvisioningTimeoutSeconds = 1800
 )
 
 Set-StrictMode -Version Latest
@@ -823,7 +889,7 @@ function Select-LabVM {
             Sort-Object Name, Id)
         if ($items.Count -eq 0) {
             if (-not $script:LabReadOnly) {
-                Write-Host 'No local VMs whose names begin with LAB- were found. Choose N to create one.'
+                Write-Host 'No local VMs whose names begin with LAB- were found. Choose N to create one, or W to provision a Windows 11 VM unattended.'
             } else {
                 Write-Host 'No local VMs whose names begin with LAB- were found. Read-only mode: VM creation is disabled.'
             }
@@ -837,7 +903,7 @@ function Select-LabVM {
             $rows | Format-Table -AutoSize -Wrap | Out-Host
         }
         if (-not $script:LabReadOnly) {
-            $answer = Read-LabText 'VM number; N create VM; R refresh; Q quit'
+            $answer = Read-LabText 'VM number; N create VM; W provision Windows 11 VM (unattended); R refresh; Q quit'
         } else {
             $answer = Read-LabText 'VM number; R refresh; Q quit'
         }
@@ -845,9 +911,19 @@ function Select-LabVM {
         if ($answer -ieq 'R') { continue }
         # New-LabVM returns a status string; discard it so it cannot leak into Select-LabVM's output.
         if ($answer -ieq 'N' -and -not $script:LabReadOnly) { $null = New-LabVM; continue }
+        if ($answer -ieq 'W' -and -not $script:LabReadOnly) {
+            # Same status-string discard as N. Unlike New-LabVM this throws on failure (its CLI wrapper
+            # needs that for the exit code), so the error -- which names the steps already applied and
+            # the kept workspace -- is shown here and held on screen before the list is redrawn.
+            try { $null = Start-LabWindowsVMProvisioning @{} }
+            catch [Management.Automation.PipelineStoppedException] { throw }
+            catch { Write-Warning $_.Exception.Message }
+            $null = Read-LabText 'Press Enter to continue'
+            continue
+        }
         $index = ConvertTo-LabMenuIndex $answer $items.Count
         if ($index -ge 0) { return Get-LabVM ([guid]$items[$index].Id) }
-        if (-not $script:LabReadOnly) { Write-Host 'Choose a listed number, N, R or Q.' }
+        if (-not $script:LabReadOnly) { Write-Host 'Choose a listed number, N, W, R or Q.' }
         else { Write-Host 'Choose a listed number, R or Q.' }
     }
 }
@@ -897,6 +973,17 @@ function Stop-LabVMGracefully {
     if (-not (Confirm-LabText "SHUTDOWN $($vm.Name)")) { return 'CANCELLED' }
     $vm = Get-LabVM $VMId
     if ([string]$vm.State -ne 'Running') { throw 'VM state changed; no shutdown request was sent.' }
+    Request-LabVMGuestShutdown $VMId
+    Write-Host 'Shutdown requested without forcing applications closed. Waiting for Off...'
+    $null = Wait-LabVMState $VMId 'Off'
+    Write-Host 'VM is Off.'
+    return 'COMPLETED'
+}
+
+function Request-LabVMGuestShutdown {
+    param([guid]$VMId, [string]$Reason = 'LAB VM Manager: operator requested graceful shutdown')
+    # Sends the request only; no confirmation and no wait (callers decide both). Shared by
+    # Stop-LabVMGracefully and the Windows provisioning orchestrator's post-install shutdown.
     # Explicit non-forced integration-service request, avoiding a Stop-VM fallback prompt.
     $system = @(Get-CimInstance -Namespace 'root/virtualization/v2' -ClassName Msvm_ComputerSystem `
         -Filter ("Name='{0}'" -f $VMId) -OperationTimeoutSec 30 -ErrorAction Stop)
@@ -905,17 +992,13 @@ function Stop-LabVMGracefully {
         -ResultClassName Msvm_ShutdownComponent -OperationTimeoutSec 30 -ErrorAction Stop)
     if ($component.Count -ne 1) { throw 'Guest shutdown integration component unavailable. Shut down inside the guest.' }
     $result = Invoke-CimMethod -InputObject $component[0] -MethodName InitiateShutdown `
-        -Arguments @{ Force = $false; Reason = 'LAB VM Manager: operator requested graceful shutdown' } `
+        -Arguments @{ Force = $false; Reason = $Reason } `
         -OperationTimeoutSec 30 -ErrorAction Stop
     if ($null -eq $result.ReturnValue) { throw 'Shutdown request returned no status; inspect the guest.' }
     $code = [uint32]$result.ReturnValue
     if ($code -notin @(0, 4096, 32782)) {
         throw "Guest rejected shutdown (Hyper-V code $code). It may have unsaved work, be locked, or lack shutdown integration. No forced fallback. Use the guest console."
     }
-    Write-Host 'Shutdown requested without forcing applications closed. Waiting for Off...'
-    $null = Wait-LabVMState $VMId 'Off'
-    Write-Host 'VM is Off.'
-    return 'COMPLETED'
 }
 
 function New-LabVMCore {
@@ -2532,6 +2615,353 @@ function Set-LabVMInstallationMediaInteractive {
     foreach ($line in $done) { Write-Host "Done: $line" }
     Write-Host 'Start the VM to boot the installer. No OS is installed automatically by this action.'
     return 'COMPLETED'
+}
+
+# --- Windows unattended install, Task 6: "Provision Windows VM" orchestrator ---
+function ConvertTo-LabLocalAccountName {
+    param([PSCredential]$Credential)
+    # The answer file creates a LOCAL account, so a 'COMPUTER\' or '.\' prefix the operator typed is
+    # dropped for the account name; the credential itself is used unchanged for PowerShell Direct.
+    $userName = [string]$Credential.UserName
+    $accountName = $userName.Substring($userName.LastIndexOf('\') + 1)
+    if ($accountName.Length -lt 1 -or $accountName.Length -gt 20 -or $accountName -ne $accountName.Trim() -or
+        $accountName -match '["/\\\[\]:;|=,+*?<>@\x00-\x1F]' -or $accountName -match '^\.+$') {
+        throw "Guest account name '$accountName' is not a valid local Windows account name: 1-20 characters, no leading/trailing spaces, none of `" / \ [ ] : ; | = , + * ? < > @."
+    }
+    if ($Credential.Password.Length -eq 0) {
+        throw 'The guest account password must not be empty: the new account signs in through PowerShell Direct with it.'
+    }
+    return $accountName
+}
+
+function Select-LabWindowsEdition {
+    param([object[]]$Images, [AllowNull()][AllowEmptyString()][string]$OsEdition, [bool]$NonInteractive)
+    # Only Windows 11 client editions are ever offered; anything else on the ISO cannot be chosen.
+    # Returns the chosen image object, or $null if the operator cancelled the picker.
+    $choices = @($Images | Where-Object IsWindows11Client | Sort-Object Index)
+    $available = ($choices | ForEach-Object { "'$($_.Name)'" }) -join ', '
+    if (-not [string]::IsNullOrWhiteSpace($OsEdition)) {
+        # A full image name ('Windows 11 Pro') or its short form ('Pro'), case-insensitive, exact.
+        $wanted = $OsEdition.Trim()
+        $match = @($choices | Where-Object { $_.Name -ieq $wanted -or ($_.Name -replace '^Windows 11 ', '') -ieq $wanted })
+        if ($match.Count -eq 1) { return $match[0] }
+        if ($NonInteractive) { throw "Edition '$OsEdition' is not one of this ISO's Windows 11 client editions. Available: $available." }
+        Write-Host "Edition '$OsEdition' is not one of this ISO's Windows 11 client editions. Choose one of these instead."
+    }
+    $defaultIndex = -1
+    for ($i = 0; $i -lt $choices.Count; $i++) {
+        if ($choices[$i].Name -match '(^|\s)Pro$') { $defaultIndex = $i; break }
+    }
+    if ($NonInteractive) {
+        if ($defaultIndex -ge 0) { return $choices[$defaultIndex] }
+        if ($choices.Count -eq 1) { return $choices[0] }
+        throw "Supply -OsEdition: this ISO has several Windows 11 client editions and no 'Pro' edition to default to. Available: $available."
+    }
+    $rows = for ($i = 0; $i -lt $choices.Count; $i++) {
+        [pscustomobject]@{ No = $i + 1; Edition = $choices[$i].Name; ImageIndex = $choices[$i].Index
+            Build = $choices[$i].BuildNumber; Default = $(if ($i -eq $defaultIndex) { '*' } else { '' }) }
+    }
+    $rows | Format-Table -AutoSize | Out-Host
+    $prompt = if ($defaultIndex -ge 0) { "Edition number (blank = $($defaultIndex + 1), $($choices[$defaultIndex].Name)); B cancel" }
+        else { 'Edition number; B cancel' }
+    while ($true) {
+        $answer = Read-LabText $prompt
+        if ($answer -ieq 'B') { return $null }
+        if ($answer -eq '' -and $defaultIndex -ge 0) { return $choices[$defaultIndex] }
+        $index = ConvertTo-LabMenuIndex $answer $choices.Count
+        if ($index -ge 0) { return $choices[$index] }
+        Write-Host 'Choose a listed number or B.'
+    }
+}
+
+function Start-LabWindowsVMProvisioning {
+    param([hashtable]$Options = @{})
+    # Creates a new LAB- VM and installs Windows 11 on it unattended: menu W (all defaults) and the
+    # engine behind -ProvisionWindowsVM ($Options carries only the parameters the caller bound).
+    # Returns COMPLETED or CANCELLED; throws on any failure. Not wrapped in Invoke-LabAction, since
+    # the VM does not exist yet when this starts: like New-LabVM, it takes the create-name lock around
+    # New-LabVMCore, then the new VM's own per-VM lock for everything after, and writes its own audit
+    # records. Unlike New-LabVM's per-field wizard, VM hardware comes from $Options or the defaults
+    # below and is shown in ONE combined preview with the Windows settings, so the same code serves
+    # -NonInteractive. Defaults here must match the documented top-level parameter defaults.
+    if ($script:LabReadOnly) { Write-Warning 'Read-only mode: VM creation is disabled.'; return 'CANCELLED' }
+    $getOption = {
+        param([string]$Key, $Default)
+        if ($Options.ContainsKey($Key) -and $null -ne $Options[$Key] -and -not ($Options[$Key] -is [string] -and $Options[$Key] -eq '')) {
+            return $Options[$Key]
+        }
+        return $Default
+    }
+    $nonInteractive = [bool](& $getOption 'NonInteractive' $false)
+    $suppliedCredential = & $getOption 'Credential' $null
+    # Checked now, before an ISO is read or a VM exists: Resolve-LabWindowsCredential runs after VM
+    # creation (it may prompt), and would otherwise only then refuse a scripted run without -Credential.
+    if ($null -ne $suppliedCredential) { $null = ConvertTo-LabLocalAccountName $suppliedCredential }
+    elseif ($nonInteractive) { throw 'Guest Windows credentials are required in non-interactive mode. Supply -Credential.' }
+
+    # --- 1. ISO, then its editions: refused here, before any VM exists, unless it has Windows 11 client.
+    $isoPath = [string](& $getOption 'WindowsIsoPath' '')
+    if ($isoPath -eq '') {
+        if ($nonInteractive) { throw 'Supply -WindowsIsoPath in non-interactive mode.' }
+        $isoPath = Select-LabIsoPath $script:LabIsoRoot
+        if ($null -eq $isoPath) { return 'CANCELLED' }
+    } else {
+        # Same checks as Select-LabIsoPath's own selection-time validation.
+        if (-not (Test-Path -LiteralPath $isoPath -PathType Leaf)) { throw "Windows ISO '$isoPath' does not exist." }
+        try {
+            $stream = [IO.File]::OpenRead($isoPath)
+            try { $isoLength = $stream.Length } finally { $stream.Close() }
+        } catch { throw "Windows ISO '$isoPath' could not be opened for reading ($($_.Exception.Message))." }
+        if ($isoLength -le 0) { throw "Windows ISO '$isoPath' is empty (0 bytes)." }
+    }
+    Write-Host "Reading the Windows editions in '$isoPath'..."
+    $images = @(Get-LabWindowsInstallImages $isoPath)
+    if (-not (Test-LabWindowsIsoInScope $images)) {
+        $found = if ($images.Count -eq 0) { '(no images)' } else {
+            ($images | ForEach-Object { "#$($_.Index) '$($_.Name)' ($($_.InstallationType), build $($_.BuildNumber))" }) -join '; ' }
+        throw "Refusing '$isoPath': it contains no Windows 11 client edition (installation type Client, build 22000 or later), which is the only thing this action installs. Found: $found. No VM was created."
+    }
+    $edition = Select-LabWindowsEdition $images ([string](& $getOption 'OsEdition' '')) $nonInteractive
+    if ($null -eq $edition) { return 'CANCELLED' }
+
+    # --- 2. VM hardware and Windows settings: explicit values are validated strictly, never adjusted.
+    $defaults = Get-LabHostDefaults
+    $existingNames = @(Get-VM -ErrorAction Stop | ForEach-Object { [string]$_.Name })
+    $nameRule = 'it must start with LAB- (case-insensitive), be unique, be at most 100 characters, and contain no path, wildcard or control characters.'
+    $name = [string](& $getOption 'NewVMName' '')
+    while (-not (Test-LabNewVMName $name $existingNames)) {
+        if ($nonInteractive) {
+            if ($name -eq '') { throw 'Supply -NewVMName in non-interactive mode.' }
+            throw "Invalid -NewVMName '$name': $nameRule"
+        }
+        if ($name -ne '') { Write-Host "VM name '$name' cannot be used: $nameRule" }
+        $name = Read-LabText 'New VM name, must start with LAB- and be unique (blank cancels)'
+        if ($name -eq '') { return 'CANCELLED' }
+    }
+    $vmRoot = [string](& $getOption 'VmStorageRoot' $defaults.VirtualMachinePath)
+    $vhdxRoot = [string](& $getOption 'VhdxStorageRoot' $defaults.VirtualHardDiskPath)
+    foreach ($root in @(@{ Label = 'VM storage root (-VmStorageRoot)'; Path = $vmRoot }, @{ Label = 'VHDX storage root (-VhdxStorageRoot)'; Path = $vhdxRoot })) {
+        # Same local-only rules as New-LabVM's storage prompts.
+        if ($root.Path -notmatch '^[A-Za-z]:\\' -or -not (Test-Path -LiteralPath $root.Path -PathType Container) -or
+            [IO.DriveInfo]::new([IO.Path]::GetPathRoot($root.Path)).DriveType -eq [IO.DriveType]::Network) {
+            throw "$($root.Label) '$($root.Path)' must be an existing folder on a local drive (absolute path, not UNC or a mapped network drive)."
+        }
+    }
+    $vmStoragePath = Join-Path $vmRoot $name
+    $vhdxPath = Join-Path (Join-Path $vhdxRoot $name) "$name.vhdx"
+    $requestedVCpu = & $getOption 'VCpuCount' $null
+    $vCpuCount = if ($null -eq $requestedVCpu) { [math]::Min(2, [int]$defaults.LogicalProcessorCount) } else { [int]$requestedVCpu }
+    if (-not (Test-LabVCpuCount $vCpuCount $defaults.LogicalProcessorCount)) {
+        throw "-VCpuCount $vCpuCount is outside 1-$($defaults.LogicalProcessorCount) (this host's logical processor count)."
+    }
+    $minimumBytes = [long](& $getOption 'MemoryMinimumGB' 2) * 1GB
+    $startupBytes = [long](& $getOption 'MemoryStartupGB' 4) * 1GB
+    $maximumBytes = [long](& $getOption 'MemoryMaximumGB' 8) * 1GB
+    if (-not (Test-LabMemorySpec $minimumBytes $startupBytes $maximumBytes $true)) {
+        throw 'Memory must satisfy 0 < -MemoryMinimumGB <= -MemoryStartupGB <= -MemoryMaximumGB.'
+    }
+    $vhdxSizeGB = [int](& $getOption 'VhdxSizeGB' 150)
+    if ($vhdxSizeGB -lt 64) { throw "-VhdxSizeGB $vhdxSizeGB is below Windows 11's 64 GB minimum." }
+    $switchName = [string](& $getOption 'SwitchName' '')
+    if ($switchName -ne '' -and (Get-LabSwitchNames) -notcontains $switchName) {
+        throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to leave the adapter Disconnected."
+    }
+    $defaultComputerName = ($name -replace '[^A-Za-z0-9-]', '')
+    $defaultComputerName = $defaultComputerName.Substring(0, [math]::Min(15, $defaultComputerName.Length)).Trim('-')
+    $computerName = [string](& $getOption 'ComputerName' $defaultComputerName)
+    if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
+        throw "Computer name '$computerName' is invalid: use 1-15 letters, digits or hyphens, not digits only. Supply -ComputerName."
+    }
+    $locale = [string](& $getOption 'Locale' 'en-US')
+    if ($locale -notmatch '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$') { throw "Locale '$locale' is not a language tag such as en-US." }
+    $timeZone = [string](& $getOption 'TimeZone' ([TimeZoneInfo]::Local.Id))
+    try { $null = [TimeZoneInfo]::FindSystemTimeZoneById($timeZone) }
+    catch { throw "Time zone '$timeZone' is not a Windows time zone ID such as 'Pacific Standard Time' (list them with tzutil /l)." }
+    $timeoutSeconds = [int](& $getOption 'ProvisioningTimeoutSeconds' 1800)
+    if ($timeoutSeconds -lt 300 -or $timeoutSeconds -gt 7200) { throw "-ProvisioningTimeoutSeconds $timeoutSeconds is outside 300-7200." }
+    $workspaceHint = Join-Path $env:LOCALAPPDATA 'LabVmManager\Provisioning\<new VM id>'
+
+    # --- 3. One combined preview, one confirmation. Nothing has been created or changed above.
+    Write-Host "`n=== Provision Windows VM preview (nothing has been created yet) ==="
+    [pscustomobject]@{
+        Name = $name
+        VMStoragePath = $vmStoragePath
+        VhdxPath = $vhdxPath
+        VhdxMaximumGiB = $vhdxSizeGB
+        VCpuCount = $vCpuCount
+        DynamicMemoryGiB = '{0} min / {1} startup / {2} max' -f ($minimumBytes / 1GB), ($startupBytes / 1GB), ($maximumBytes / 1GB)
+        Switch = $(if ($switchName -eq '') { 'Disconnected' } else { $switchName })
+        Generation = 2
+        CheckpointPolicy = 'Standard; automatic checkpoints disabled'
+        WindowsIso = $isoPath
+        Edition = '{0} (image {1}, build {2})' -f $edition.Name, $edition.Index, $edition.BuildNumber
+        ComputerName = $computerName
+        Locale = $locale
+        TimeZone = $timeZone
+        GuestAccount = $(if ($null -ne $suppliedCredential) { "$(ConvertTo-LabLocalAccountName $suppliedCredential) (local administrator)" } else { 'prompted for after the VM is created (local administrator)' })
+        BootProfile = 'Windows11: Secure Boot (MicrosoftWindows template), new local key protector + vTPM'
+        WaitPerSignIn = "$timeoutSeconds seconds"
+    } | Format-List | Out-Host
+    Write-Host 'The VM is created, Windows is installed unattended from the ISO plus a generated answer-file ISO, and the VM'
+    Write-Host 'boots twice: once to install (proven by a PowerShell Direct sign-in and a note on the guest desktop), then,'
+    Write-Host 'after the install media are removed, once more to prove it boots cleanly on its own.'
+    Write-Warning ("Until the end of the run, the provisioning workspace ($workspaceHint) holds a copy of the ISO and " +
+        'the answer file containing the account password in plain text. It is deleted after a successful run and KEPT if a step fails.')
+    if (-not $nonInteractive) {
+        Write-Host 'To change any value above, cancel and rerun with -ProvisionWindowsVM and the matching parameter.'
+        if ((Read-LabYesNoCancel 'Create this VM and install Windows now') -ne 'Y') { return 'CANCELLED' }
+    }
+
+    # --- 4. Create the VM under the create-name lock (same lock as New-LabVM), then hand over to the VM's own lock.
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $getAuditDetail = { 'Iso={0}; Edition={1} (index {2}); ComputerName={3}; ElapsedSeconds={4}' -f
+        $isoPath, $edition.Name, $edition.Index, $computerName, [int]$watch.Elapsed.TotalSeconds }
+    $createMutex = [Threading.Mutex]::new($false, "Global\LabVmManager-Create-$($name.ToUpperInvariant())")
+    $createHeld = $false
+    $vmMutex = $null
+    $vmHeld = $false
+    try {
+        try { $createHeld = $createMutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $createHeld = $true }
+        if (-not $createHeld) { throw 'Another copy of this script is already creating a VM with this name. No operation was started here.' }
+        try {
+            $vm = New-LabVMCore -Name $name -VmStoragePath $vmStoragePath -VCpuCount $vCpuCount `
+                -MinimumBytes $minimumBytes -StartupBytes $startupBytes -MaximumBytes $maximumBytes `
+                -IsDynamic $true -VhdxPath $vhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName
+        } catch [Management.Automation.PipelineStoppedException] {
+            throw
+        } catch {
+            $message = $_.Exception.Message
+            try { Write-LabAudit 'provision-windows-vm' 'FAILED_OR_UNCONFIRMED' $null "$name`: VM creation: $message; $(& $getAuditDetail)" }
+            catch { Write-Warning 'Audit logging also failed.' }
+            throw "Creating '$name' failed or is unconfirmed: $message Inspect Hyper-V inventory; do not assume nothing was created. No Windows provisioning step ran, so no workspace or password file was written."
+        }
+        $vmId = [guid]$vm.Id
+
+        # --- 5. Everything after creation: one catch, which names what was applied and keeps the workspace.
+        $done = [Collections.Generic.List[string]]::new()
+        $done.Add("VM '$name' [$vmId] created")
+        $workspace = $null
+        $seedIsoBuilt = $false
+        $workspaceRemoved = $false
+        $session = $null
+        $completed = $false
+        $reported = $false
+        $getFailureText = {
+            param([string]$Cause)
+            $workspaceText = if ($null -eq $workspace) {
+                'No provisioning workspace was created, so no password was written to disk.'
+            } elseif ($workspaceRemoved) {
+                'The provisioning workspace (and the password in it) was already deleted.'
+            } elseif ($seedIsoBuilt) {
+                "The provisioning workspace was KEPT, not deleted: $workspace -- it contains the account password in plain text (the answer file inside seed.iso). Delete that folder yourself once you no longer need it."
+            } else {
+                "The provisioning workspace was KEPT, not deleted: $workspace -- no password had been written to it yet, but check it and delete that folder yourself once you no longer need it."
+            }
+            "Windows provisioning of '$name' stopped partway: $Cause Steps already applied: $($done -join '; '). The VM was left exactly as it is (not powered off, not deleted); inspect it before retrying. $workspaceText"
+        }
+        try {
+            # A brand-new VM id: nobody else can hold this lock yet, but take it before releasing the
+            # create lock so there is no moment when the new VM is unlocked.
+            $vmMutex = [Threading.Mutex]::new($false, "Global\LabVmManager-$vmId")
+            try { $vmHeld = $vmMutex.WaitOne(0) }
+            catch [Threading.AbandonedMutexException] { $vmHeld = $true }
+            if (-not $vmHeld) { throw 'Another copy of this script is already operating on the new VM.' }
+            $createMutex.ReleaseMutex()
+            $createHeld = $false
+            Write-LabAudit 'provision-windows-vm' 'STARTED' $vm (& $getAuditDetail)
+
+            $guestCredential = Resolve-LabWindowsCredential -Credential $suppliedCredential -NonInteractive $nonInteractive
+            $accountName = ConvertTo-LabLocalAccountName $guestCredential
+            $done.Add("guest credential resolved (account '$accountName')")
+            $workspace = Get-LabProvisioningWorkspacePath $vmId
+            $done.Add("provisioning workspace created ($workspace)")
+            Write-Host 'Writing a no-prompt boot copy of the ISO into the workspace (this can take a few minutes)...'
+            $patchResult = New-LabPatchedBootableIso -SourceIsoPath $isoPath -OutputPath (Join-Path $workspace 'windows-noprompt.iso')
+            # OutputPath is $null when nothing was patched: fall back to the original ISO here, by design.
+            $windowsIsoPath = if ($patchResult.Patched) { [string]$patchResult.OutputPath } else { $isoPath }
+            if ($patchResult.Patched) {
+                $done.Add('no-prompt boot copy of the ISO written')
+            } else {
+                Write-Warning ("The ISO's boot loader was not patched ($($patchResult.Reason)); the original ISO is used. When the VM " +
+                    "first starts, its console may show 'Press any key to boot from CD or DVD': open it in Hyper-V Manager and press a key within a few seconds.")
+                $done.Add("boot loader not patched ($($patchResult.Reason)); original ISO used")
+            }
+            # Splatted: the SecureString goes straight through; it is never turned into plaintext here.
+            $answerFileArguments = @{ ComputerName = $computerName; Locale = $locale; TimeZone = $timeZone
+                ImageIndex = $edition.Index; UserName = $accountName; Password = $guestCredential.Password }
+            $answerFileXml = New-LabWindowsAnswerFileXml @answerFileArguments
+            $seedIsoPath = Join-Path $workspace 'seed.iso'
+            # From here on the workspace holds the password, so mark that before the write, not after.
+            $seedIsoBuilt = $true
+            New-LabSeedIso -Files @{ 'Autounattend.xml' = $answerFileXml } -OutputPath $seedIsoPath
+            $answerFileXml = $null
+            $done.Add('answer-file seed ISO built')
+            Set-LabVMUnattendedInstallMedia -VMId $vmId -WindowsIsoPath $windowsIsoPath -SeedIsoPath $seedIsoPath
+            $done.Add('Windows and seed ISOs attached, DVD first in boot order')
+            $profileResult = Set-LabVMBootProfile $vmId 'Windows11'
+            $done.Add(('Windows11 boot profile (template changed: {0}; Secure Boot turned on: {1}; key protector added: {2}; vTPM enabled: {3})' -f
+                $profileResult.SecureBootTemplateChanged, $profileResult.SecureBootEnabled, $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled))
+            if ($profileResult.KeyProtectorAdded -or $profileResult.TpmEnabled) {
+                # Same separate, immediate record as the installation-media menu action writes.
+                Write-LabAudit 'add-key-protector' 'COMPLETED' $vm ("OsProfile=Windows11; NewLocalKeyProtector={0}; VTpmEnabled={1}" -f
+                    $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled)
+            }
+            $null = Start-LabVM $vmId
+            $done.Add('VM started (Windows setup running)')
+            Write-Host "Windows setup is running unattended. Waiting up to $timeoutSeconds seconds for the first PowerShell Direct sign-in..."
+            $session = Wait-LabPSDirectSession -VMId $vmId -Credential $guestCredential -TimeoutSeconds $timeoutSeconds
+            $done.Add('first PowerShell Direct sign-in succeeded (Windows installed)')
+            $note = (@(
+                "This VM ($name) was installed unattended by LAB VM Manager from $env:COMPUTERNAME on $(Get-Date -Format 'yyyy-MM-dd HH:mm').",
+                "Edition: $($edition.Name). Computer name: $computerName. Local administrator account: $accountName.",
+                'Right after this note was written, the host shut the VM down once, removed the installer and answer-file media,',
+                'deleted its host-side copy of the answer file, and started the VM again.'
+            ) -join [Environment]::NewLine)
+            Write-LabProvisioningNote -Session $session -Content $note
+            $done.Add('completion note written to the guest desktop')
+            Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+            $session = $null
+            Request-LabVMGuestShutdown $vmId 'LAB VM Manager: Windows unattended install finished; removing install media'
+            $null = Wait-LabVMState $vmId 'Off'
+            $done.Add('VM shut down')
+            Complete-LabWindowsProvisioning -VMId $vmId -WindowsIsoPath $windowsIsoPath -SeedIsoPath $seedIsoPath
+            $done.Add('seed drive removed, installer ISO ejected, disk first in boot order')
+            Remove-LabProvisioningWorkspace $vmId
+            $workspaceRemoved = $true
+            $done.Add('provisioning workspace deleted')
+            $null = Start-LabVM $vmId
+            $done.Add('VM restarted without install media')
+            Write-Host "Waiting up to $timeoutSeconds seconds for a PowerShell Direct sign-in after the clean restart..."
+            $session = Wait-LabPSDirectSession -VMId $vmId -Credential $guestCredential -TimeoutSeconds $timeoutSeconds
+            $done.Add('second PowerShell Direct sign-in succeeded (boots cleanly on its own)')
+            $completed = $true
+        } catch [Management.Automation.PipelineStoppedException] {
+            throw
+        } catch {
+            $failureText = & $getFailureText $_.Exception.Message
+            $reported = $true
+            try { Write-LabAudit 'provision-windows-vm' 'FAILED_OR_UNCONFIRMED' $vm "$($_.Exception.Message); $(& $getAuditDetail)" }
+            catch { Write-Warning 'Audit logging also failed. Inspect the VM; do not assume nothing changed.' }
+            throw $failureText
+        } finally {
+            if ($null -ne $session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+            if (-not $completed -and -not $reported) {
+                # Interrupted (e.g. Ctrl+C): the catch above never ran, so say where things stand here.
+                try { $Host.UI.WriteWarningLine((& $getFailureText 'the run was interrupted.')) } catch { }
+                try { Write-LabAudit 'provision-windows-vm' 'FAILED_OR_UNCONFIRMED' $vm "interrupted; $(& $getAuditDetail)" } catch { }
+            }
+        }
+        Write-LabAudit 'provision-windows-vm' 'COMPLETED' $vm (& $getAuditDetail)
+        foreach ($line in $done) { Write-Host "Done: $line" }
+        Write-Host "'$name' is installed and running, signed in once as '$accountName'. A note is on that account's desktop."
+        return 'COMPLETED'
+    } finally {
+        if ($createHeld) { $createMutex.ReleaseMutex() }
+        $createMutex.Dispose()
+        if ($vmHeld) { $vmMutex.ReleaseMutex() }
+        if ($null -ne $vmMutex) { $vmMutex.Dispose() }
+    }
 }
 
 function Get-LabVMRemovalPreview {
@@ -4411,6 +4841,40 @@ function Get-LabTransferOnlyParameter {
     return @($transferOnly | Where-Object { $BoundParameterNames -contains $_ })
 }
 
+function Get-LabProvisioningOnlyParameter {
+    param([AllowEmptyCollection()][string[]]$BoundParameterNames)
+    # -NonInteractive and -Credential are shared with file transfer, so they stay in the transfer list only.
+    $provisioningOnly = @('NewVMName', 'WindowsIsoPath', 'ComputerName', 'Locale', 'TimeZone', 'OsEdition', 'VhdxSizeGB',
+        'VCpuCount', 'MemoryMinimumGB', 'MemoryStartupGB', 'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot',
+        'VhdxStorageRoot', 'ProvisioningTimeoutSeconds')
+    return @($provisioningOnly | Where-Object { $BoundParameterNames -contains $_ })
+}
+
+function Start-LabWindowsVMProvisioningCli {
+    param([hashtable]$Options, [string]$RequestedLogRoot)
+    # $Options carries only the parameters the caller actually bound, plus NonInteractive/Credential,
+    # so Start-LabWindowsVMProvisioning's own defaults (e.g. vCPUs capped to the host) apply to the rest.
+    # Required-value checks run here as well, so a scripted run fails before any host check or log.
+    if ($Options['NonInteractive']) {
+        foreach ($required in @('NewVMName', 'WindowsIsoPath', 'Credential')) {
+            if (-not $Options.ContainsKey($required) -or $null -eq $Options[$required] -or [string]$Options[$required] -eq '') {
+                throw "Supply -$required with -ProvisionWindowsVM -NonInteractive."
+            }
+        }
+    }
+    $ErrorActionPreference = 'Stop'
+    Assert-LabHost
+    Initialize-LabLog $RequestedLogRoot
+    Write-LabAudit 'session' 'STARTED' $null ("ReadOnly={0}" -f $script:LabReadOnly)
+    try {
+        return Start-LabWindowsVMProvisioning $Options
+    } finally {
+        try { Write-LabAudit 'session' 'ENDED' }
+        catch { Write-Warning 'Could not write the final audit entry.' }
+        Write-Host "Audit log: $script:LabLogFile"
+    }
+}
+
 function Start-LabSshConfigurationCli {
     param(
         [string]$VMName, [Nullable[guid]]$VMId, [string]$SshHost, [int]$SshPort,
@@ -4491,11 +4955,41 @@ function Start-LabFileTransferCli {
 
 # Dot-sourcing loads functions without launching the UI; normal invocation runs it.
 if ($MyInvocation.InvocationName -ne '.') {
-    if ($ConfigureSsh -and ($CopyToVM -or $CopyFromVM)) {
-        Write-Error -Message 'Supply only one of -ConfigureSsh, -CopyToVM, or -CopyFromVM; one action per invocation.' -ErrorAction Continue
+    if (@(@([bool]$ConfigureSsh, [bool]($CopyToVM -or $CopyFromVM), [bool]$ProvisionWindowsVM) | Where-Object { $_ }).Count -gt 1) {
+        Write-Error -Message 'Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, or -ProvisionWindowsVM; one action per invocation.' -ErrorAction Continue
         exit 1
     }
-    if ($ConfigureSsh) {
+    # Provisioning parameters without -ProvisionWindowsVM are refused in every other mode (menu,
+    # -ConfigureSsh, -CopyToVM/-CopyFromVM) rather than silently ignored, mirroring the transfer gate below.
+    $boundParameterNames = @($PSBoundParameters.Keys)
+    if (-not $ProvisionWindowsVM) {
+        $orphanProvisioningParameters = @(Get-LabProvisioningOnlyParameter $boundParameterNames)
+        if ($orphanProvisioningParameters.Count -gt 0) {
+            Write-Error -Message ('{0} only apply to -ProvisionWindowsVM; add it. Nothing was run.' -f
+                (($orphanProvisioningParameters | ForEach-Object { "-$_" }) -join ', ')) -ErrorAction Continue
+            exit 1
+        }
+    }
+    if ($ProvisionWindowsVM) {
+        # -VMName/-VMId always mean an EXISTING VM; the VM to create is named with -NewVMName. Transfer
+        # parameters other than the shared -NonInteractive/-Credential are refused rather than ignored.
+        $foreignParameters = @(Get-LabTransferOnlyParameter $boundParameterNames | Where-Object { $_ -notin @('NonInteractive', 'Credential') })
+        if ($foreignParameters.Count -gt 0) {
+            Write-Error -Message ('{0} do not apply to -ProvisionWindowsVM (name the new VM with -NewVMName). Nothing was run.' -f
+                (($foreignParameters | ForEach-Object { "-$_" }) -join ', ')) -ErrorAction Continue
+            exit 1
+        }
+        $provisioningOptions = @{ NonInteractive = [bool]$NonInteractive; Credential = $Credential }
+        foreach ($key in (Get-LabProvisioningOnlyParameter $boundParameterNames)) { $provisioningOptions[$key] = $PSBoundParameters[$key] }
+        try {
+            $status = Start-LabWindowsVMProvisioningCli -Options $provisioningOptions -RequestedLogRoot $LogRoot
+            exit $(if ($status -eq 'COMPLETED') { 0 } else { 1 })
+        }
+        catch {
+            Write-Error -Message $_.Exception.Message -ErrorAction Continue
+            exit 1
+        }
+    } elseif ($ConfigureSsh) {
         try {
             Start-LabSshConfigurationCli -VMName $VMName -VMId $VMId -SshHost $SshHost -SshPort $SshPort `
                 -SshUser $SshUser -SshIdentityFile $SshIdentityFile -RequestedLogRoot $LogRoot

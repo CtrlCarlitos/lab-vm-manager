@@ -839,5 +839,46 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Write-LabProvisioningNote {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("GetFolderPath('Desktop')", body)
 
+    # --- Windows unattended install, Task 6: "Provision Windows VM" orchestrator and wiring ---
+    def test_provisioning_orchestrator_exists(self):
+        self.assertIn('function Start-LabWindowsVMProvisioning {', self.s)
+    def test_provisioning_scope_check_before_vm_creation(self):
+        body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        # Call-shaped substrings, not bare names: a leading comment describing the function's own
+        # reuse of New-LabVMCore (this codebase's implementers write exactly this kind of comment,
+        # e.g. Test-LabVMHasKeyProtector's own wording) would contain the bare name "New-LabVMCore"
+        # before the real call and silently defeat a bare .index() comparison.
+        self.assertLess(body.index('Test-LabWindowsIsoInScope '), body.index('New-LabVMCore -Name'))
+    def test_provisioning_uses_create_mutex(self):
+        body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('LabVmManager-Create-', body)
+    def test_provisioning_failure_names_workspace_and_password(self):
+        body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('password', body.lower())
+    def test_new_vm_name_is_distinct_param(self):
+        self.assertIn('[string]$NewVMName', self.s)
+    def test_provision_switch_wired_in_dispatcher(self):
+        self.assertIn('[switch]$ProvisionWindowsVM', self.s)
+    def test_provisioning_timeout_is_its_own_param(self):
+        self.assertIn('$ProvisioningTimeoutSeconds', self.s)
+    def test_w_menu_entry_wired(self):
+        body = self.s.split('function Select-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("-ieq 'W'", body)
+    def test_provisioning_cli_and_orphan_guard_exist(self):
+        self.assertIn('function Start-LabWindowsVMProvisioningCli {', self.s)
+        self.assertIn('function Get-LabProvisioningOnlyParameter {', self.s)
+        dispatcher = self.s.split("if ($MyInvocation.InvocationName -ne '.') {", 1)[1]
+        self.assertIn('Get-LabProvisioningOnlyParameter', dispatcher)
+        self.assertIn('Start-LabWindowsVMProvisioningCli', dispatcher)
+    def test_provisioning_mode_is_in_the_one_action_check(self):
+        dispatcher = self.s.split("if ($MyInvocation.InvocationName -ne '.') {", 1)[1]
+        first_check = dispatcher.split('exit 1', 1)[0]
+        self.assertIn('$ProvisionWindowsVM', first_check)
+        self.assertIn('$ConfigureSsh', first_check)
+    def test_provisioning_patch_output_is_coalesced(self):
+        body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('$patchResult.Patched', body)
+        self.assertIn('$patchResult.OutputPath', body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
