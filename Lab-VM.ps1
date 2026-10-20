@@ -1334,6 +1334,73 @@ function Get-LabIsoCandidates {
     [pscustomobject]@{ Files = @($files); Incomplete = [bool]($errors.Count -gt 0); Errors = @($errors) }
 }
 
+function Select-LabIsoPath {
+    param([string]$IsoRoot)
+    $items = @()
+    $needsScan = $true
+    while ($true) {
+        if ($needsScan) {
+            $scan = Get-LabIsoCandidates $IsoRoot
+            $items = @($scan.Files)
+            if ($scan.Incomplete) {
+                Write-Host "ISO scan under '$IsoRoot' did not finish; the list below may be missing files."
+                foreach ($scanError in $scan.Errors) { Write-Host "  $scanError" }
+            }
+            $needsScan = $false
+        }
+        Write-Host "`n=== Select an ISO ($($items.Count) found under $IsoRoot) ==="
+        if ($items.Count -eq 0) {
+            Write-Host 'No ISO files match. Choose R to refresh or B to go back.'
+        } else {
+            $rows = for ($i = 0; $i -lt $items.Count; $i++) {
+                $iso = $items[$i]
+                [pscustomobject]@{
+                    No           = $i + 1
+                    Name         = Split-Path -Leaf $iso.FullName
+                    FullName     = $iso.FullName
+                    SizeMB       = [math]::Round($iso.Length / 1MB, 1)
+                    LastWriteTime = $iso.LastWriteTime
+                }
+            }
+            $rows | Format-Table -AutoSize -Wrap | Out-Host
+        }
+        $answer = Read-LabText 'ISO number; text to filter the list above; R refresh; B back'
+        if ($answer -ieq 'B') { return $null }
+        if ($answer -ieq 'R') { $needsScan = $true; continue }
+        $index = ConvertTo-LabMenuIndex $answer $items.Count
+        if ($index -ge 0) {
+            $chosen = $items[$index].FullName
+            if (-not (Test-Path -LiteralPath $chosen -PathType Leaf)) {
+                Write-Host "Cannot select '$chosen': it no longer exists. Pick again or R to refresh."
+                continue
+            }
+            try {
+                $stream = [IO.File]::OpenRead($chosen)
+                try { $size = $stream.Length } finally { $stream.Close() }
+            } catch {
+                Write-Host "Cannot select '$chosen': it could not be opened for reading ($($_.Exception.Message)). Pick again or R to refresh."
+                continue
+            }
+            if ($size -le 0) {
+                Write-Host "Cannot select '$chosen': the file is empty (0 bytes). Pick again or R to refresh."
+                continue
+            }
+            return $chosen
+        }
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            Write-Host 'Choose a listed number, text to filter, R or B.'
+            continue
+        }
+        # Plain-text substring filter against the list already shown -- not a new scan.
+        $filtered = @($items | Where-Object { $_.FullName.IndexOf($answer, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        if ($filtered.Count -eq 0) {
+            Write-Host "No currently listed ISO matches '$answer'. Showing the previous list; R re-scans from disk."
+        } else {
+            $items = $filtered
+        }
+    }
+}
+
 function Get-LabVMRemovalPreview {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId
