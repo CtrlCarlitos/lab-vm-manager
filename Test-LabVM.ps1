@@ -50,7 +50,8 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
     'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
     'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath',
-    'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind', 'Test-LabSshHostName', 'Test-LabSshUserName')
+    'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind', 'Test-LabSshHostName', 'Test-LabSshUserName',
+    'Test-LabVMHasKeyProtector', 'Set-LabVMBootProfile')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -62,7 +63,7 @@ foreach ($name in $allowlist) {
 
 # No Hyper-V cmdlet is invoked by these tests.
 $script:FakeId = [guid]'00000000-0000-0000-0000-000000000123'
-$script:FakeVM = [pscustomobject]@{ Id = $script:FakeId; Name = 'LAB-Test'; State = 'Off' }
+$script:FakeVM = [pscustomobject]@{ Id = $script:FakeId; Name = 'LAB-Test'; State = 'Off'; Generation = 2 }
 function Get-VM {
     [CmdletBinding()]
     param([guid]$Id)
@@ -127,6 +128,102 @@ Test-Case 'Paused VM is not Off' {
     try { Assert-Throws { Assert-LabVMOff $script:FakeId } 'requires Off' }
     finally { $script:FakeVM.State = 'Off' }
 }
+# --- Boot profile (Task 3): Secure Boot template + vTPM/key-protector preparation ---
+# Fakes for the Hyper-V cmdlets Set-LabVMBootProfile and Test-LabVMHasKeyProtector call. No real
+# Hyper-V cmdlet is invoked by these tests. Get-VMKeyProtector mirrors the real cmdlet: a VM with
+# no key protector configured returns a zero-length RawKeyProtector, never $null.
+$script:FakeFirmware = [pscustomobject]@{ SecureBootTemplate = 'MicrosoftWindows' }
+$script:FakeHasKeyProtector = $false
+$script:SetVMFirmwareCalls = [Collections.Generic.List[string]]::new()
+$script:SetVMKeyProtectorCalls = 0
+$script:EnableVMTPMCalls = 0
+function Get-VMFirmware {
+    [CmdletBinding()]
+    param($VM, [switch]$Confirm)
+    return $script:FakeFirmware
+}
+function Set-VMFirmware {
+    [CmdletBinding()]
+    param($VM, [string]$SecureBootTemplate, [switch]$Confirm)
+    $script:SetVMFirmwareCalls.Add($SecureBootTemplate)
+    $script:FakeFirmware.SecureBootTemplate = $SecureBootTemplate
+}
+function Get-VMKeyProtector {
+    [CmdletBinding()]
+    param($VM, [switch]$Confirm)
+    $bytes = if ($script:FakeHasKeyProtector) { [byte[]]@(1, 2, 3) } else { [byte[]]@() }
+    return [pscustomobject]@{ RawKeyProtector = $bytes }
+}
+function Set-VMKeyProtector {
+    [CmdletBinding()]
+    param($VM, [switch]$NewLocalKeyProtector, [switch]$Confirm)
+    $script:SetVMKeyProtectorCalls++
+    $script:FakeHasKeyProtector = $true
+}
+function Enable-VMTPM {
+    [CmdletBinding()]
+    param($VM, [switch]$Confirm)
+    $script:EnableVMTPMCalls++
+}
+
+Test-Case 'Test-LabVMHasKeyProtector reads existing state without calling any mutating cmdlet' {
+    $script:FakeHasKeyProtector = $true
+    $script:SetVMKeyProtectorCalls = 0
+    $script:EnableVMTPMCalls = 0
+    try {
+        Assert-Equal (Test-LabVMHasKeyProtector $script:FakeId) $true
+        Assert-Equal $script:SetVMKeyProtectorCalls 0
+        Assert-Equal $script:EnableVMTPMCalls 0
+    } finally { $script:FakeHasKeyProtector = $false }
+}
+Test-Case 'Set-LabVMBootProfile rejects a Generation 1 VM before changing anything' {
+    $script:FakeVM.Generation = 1
+    $script:SetVMFirmwareCalls.Clear()
+    $script:SetVMKeyProtectorCalls = 0
+    $script:EnableVMTPMCalls = 0
+    try {
+        Assert-Throws { Set-LabVMBootProfile $script:FakeId 'Windows11' } 'Generation'
+        Assert-Equal $script:SetVMFirmwareCalls.Count 0
+        Assert-Equal $script:SetVMKeyProtectorCalls 0
+        Assert-Equal $script:EnableVMTPMCalls 0
+    } finally { $script:FakeVM.Generation = 2 }
+}
+Test-Case 'Set-LabVMBootProfile leaves an existing key protector alone' {
+    $script:FakeHasKeyProtector = $true
+    $script:FakeFirmware.SecureBootTemplate = 'MicrosoftWindows'
+    $script:SetVMKeyProtectorCalls = 0
+    $script:EnableVMTPMCalls = 0
+    try {
+        $result = Set-LabVMBootProfile $script:FakeId 'Windows11'
+        Assert-Equal $script:SetVMKeyProtectorCalls 0
+        Assert-Equal $script:EnableVMTPMCalls 0
+        Assert-Equal $result.KeyProtectorAdded $false
+    } finally { $script:FakeHasKeyProtector = $false }
+}
+Test-Case 'Set-LabVMBootProfile adds a key protector and vTPM when absent' {
+    $script:FakeHasKeyProtector = $false
+    $script:FakeFirmware.SecureBootTemplate = 'MicrosoftWindows'
+    $script:SetVMKeyProtectorCalls = 0
+    $script:EnableVMTPMCalls = 0
+    try {
+        $result = Set-LabVMBootProfile $script:FakeId 'Windows11'
+        Assert-Equal $script:SetVMKeyProtectorCalls 1
+        Assert-Equal $script:EnableVMTPMCalls 1
+        Assert-Equal $result.KeyProtectorAdded $true
+        Assert-Equal $result.TpmEnabled $true
+    } finally { $script:FakeHasKeyProtector = $false }
+}
+Test-Case 'Set-LabVMBootProfile applies the Ubuntu Secure Boot template without touching vTPM' {
+    $script:FakeFirmware.SecureBootTemplate = 'MicrosoftWindows'
+    $script:SetVMFirmwareCalls.Clear()
+    $script:SetVMKeyProtectorCalls = 0
+    $script:EnableVMTPMCalls = 0
+    $result = Set-LabVMBootProfile $script:FakeId 'UbuntuDesktop'
+    Assert-Equal $script:SetVMFirmwareCalls[-1] 'MicrosoftUEFICertificateAuthority'
+    Assert-Equal $script:SetVMKeyProtectorCalls 0
+    Assert-Equal $script:EnableVMTPMCalls 0
+}
+
 Test-Case 'New VM name must start with LAB-' { Assert-Equal (Test-LabNewVMName 'OTHER-Test' @()) $false }
 Test-Case 'New VM name rejects case-insensitive duplicate' { Assert-Equal (Test-LabNewVMName 'lab-test' @('LAB-Test')) $false }
 Test-Case 'New VM name accepts unique name' { Assert-Equal (Test-LabNewVMName 'LAB-New' @('LAB-Test')) $true }

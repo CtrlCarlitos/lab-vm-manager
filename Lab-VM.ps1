@@ -1405,6 +1405,59 @@ function Select-LabIsoPath {
     }
 }
 
+function Test-LabVMHasKeyProtector {
+    param([guid]$VMId)
+    # Pure, read-only presence check -- it must never mutate. Set-LabVMBootProfile below calls this
+    # to decide whether to add a key protector, and a standalone preview (Task 6) calls it before
+    # any confirmation, so merely checking "does this VM already have one" can never itself create
+    # one. Get-VMKeyProtector is the read-side counterpart of the cmdlet that creates one: a VM with
+    # no key protector configured returns a zero-length RawKeyProtector, never $null.
+    $vm = Get-LabVM $VMId
+    $protector = Get-VMKeyProtector -VM $vm -ErrorAction Stop
+    return ($null -ne $protector.RawKeyProtector -and $protector.RawKeyProtector.Length -gt 0)
+}
+
+function Set-LabVMBootProfile {
+    param([guid]$VMId, [ValidateSet('Windows11', 'UbuntuDesktop')][string]$OsProfile)
+    $vm = Assert-LabVMOff $VMId
+    if ([int]$vm.Generation -ne 2) {
+        throw "'$($vm.Name)' is Generation $($vm.Generation). Secure Boot and vTPM boot profiles require Generation 2."
+    }
+    $secureBootTemplateChanged = $false
+    $keyProtectorAdded = $false
+    $tpmEnabled = $false
+    switch ($OsProfile) {
+        'Windows11' {
+            $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
+            if ([string]$firmware.SecureBootTemplate -ne 'MicrosoftWindows') {
+                Set-VMFirmware -VM $vm -SecureBootTemplate MicrosoftWindows -Confirm:$false -ErrorAction Stop
+                $secureBootTemplateChanged = $true
+            }
+            if (-not (Test-LabVMHasKeyProtector $VMId)) {
+                # Only add a key protector when none exists yet: rotating an existing one would
+                # invalidate anything already encrypted under it.
+                Set-VMKeyProtector -VM $vm -NewLocalKeyProtector -Confirm:$false -ErrorAction Stop
+                Enable-VMTPM -VM $vm -Confirm:$false -ErrorAction Stop
+                $keyProtectorAdded = $true
+                $tpmEnabled = $true
+            }
+        }
+        'UbuntuDesktop' {
+            # Ubuntu's Secure Boot template never touches the key protector or vTPM.
+            $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
+            if ([string]$firmware.SecureBootTemplate -ne 'MicrosoftUEFICertificateAuthority') {
+                Set-VMFirmware -VM $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority -Confirm:$false -ErrorAction Stop
+                $secureBootTemplateChanged = $true
+            }
+        }
+    }
+    return [pscustomobject]@{
+        SecureBootTemplateChanged = $secureBootTemplateChanged
+        KeyProtectorAdded = $keyProtectorAdded
+        TpmEnabled = $tpmEnabled
+    }
+}
+
 function Get-LabVMRemovalPreview {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId

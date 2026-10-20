@@ -620,6 +620,31 @@ class SourceContract(unittest.TestCase):
     def test_iso_selection_revalidates_before_returning(self):
         body = self.s.split('function Select-LabIsoPath {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('OpenRead', body)
+    def test_key_protector_check_is_read_only(self):
+        self.assertIn('function Test-LabVMHasKeyProtector', self.s)
+        body = self.s.split('function Test-LabVMHasKeyProtector {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn('Set-VMKeyProtector', body)
+        self.assertNotIn('Enable-VMTPM', body)
+    def test_boot_profile_function_exists(self):
+        self.assertIn('function Set-LabVMBootProfile', self.s)
+    def test_boot_profile_rejects_generation_1(self):
+        body = self.s.split('function Set-LabVMBootProfile {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Generation', body)
+    def test_boot_profile_never_rotates_existing_key_protector(self):
+        body = self.s.split('function Set-LabVMBootProfile {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('KeyProtectorAdded', body)
+    def test_boot_profile_linux_never_touches_tpm(self):
+        body = self.s.split('function Set-LabVMBootProfile {', 1)[1].split('\nfunction ', 1)[0]
+        # rindex, not index: the [ValidateSet('Windows11','UbuntuDesktop')] parameter
+        # declaration contains both literal strings before either branch body does, so the
+        # FIRST occurrence of each is always inside that declaration, not inside the actual
+        # branch logic -- using the LAST occurrence of each is what actually lands inside
+        # each branch's own code, regardless of switch/if-elseif/hashtable-dispatch style.
+        idx_ubuntu = body.rindex("'UbuntuDesktop'")
+        idx_windows = body.rindex("'Windows11'")
+        ubuntu_branch = body[idx_ubuntu:idx_windows] if idx_ubuntu < idx_windows else body[idx_ubuntu:]
+        self.assertNotIn('Enable-VMTPM', ubuntu_branch)
+        self.assertNotIn('Set-VMKeyProtector', ubuntu_branch)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
