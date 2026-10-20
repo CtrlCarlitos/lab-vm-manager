@@ -1336,12 +1336,14 @@ function Get-LabIsoCandidates {
 
 function Select-LabIsoPath {
     param([string]$IsoRoot)
+    $allItems = @()
     $items = @()
     $needsScan = $true
     while ($true) {
         if ($needsScan) {
             $scan = Get-LabIsoCandidates $IsoRoot
-            $items = @($scan.Files)
+            $allItems = @($scan.Files)
+            $items = $allItems
             if ($scan.Incomplete) {
                 Write-Host "ISO scan under '$IsoRoot' did not finish; the list below may be missing files."
                 foreach ($scanError in $scan.Errors) { Write-Host "  $scanError" }
@@ -1391,10 +1393,12 @@ function Select-LabIsoPath {
             Write-Host 'Choose a listed number, text to filter, R or B.'
             continue
         }
-        # Plain-text substring filter against the list already shown -- not a new scan.
-        $filtered = @($items | Where-Object { $_.FullName.IndexOf($answer, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        # Plain-text substring filter -- always matched against the full retained scan
+        # ($allItems), never against whatever is currently displayed ($items), so typing
+        # a different filter can still find an item that a prior filter narrowed out.
+        $filtered = @($allItems | Where-Object { $_.FullName.IndexOf($answer, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
         if ($filtered.Count -eq 0) {
-            Write-Host "No currently listed ISO matches '$answer'. Showing the previous list; R re-scans from disk."
+            Write-Host "No ISO in the full scan matches '$answer'. Showing the previous list; R re-scans from disk."
         } else {
             $items = $filtered
         }
