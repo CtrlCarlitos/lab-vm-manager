@@ -85,15 +85,26 @@ The selected-VM menu provides:
 | 12 | Delete the VM (retain virtual disks); VM must be Off; blocked by non-Standard checkpoints |
 | 13 | Copy a file or directory from this host to the VM; VM must be Running |
 | 14 | Copy a file or directory from the VM to this host; VM must be Running |
-| T | Test Windows guest connectivity over PowerShell Direct; VM must be Running |
+| T | Test guest connectivity; adapter-aware (PowerShell Direct or SSH); VM must be Running |
+| C | Configure the SSH connection settings saved for this VM |
 | X | Emergency power-off, with strong confirmation and data-loss warning |
 | R / B / Q | Refresh / choose another VM / quit |
 
-`-ReadOnly` allows only inspection, listing, the connectivity test (option `T`) and the file-copy options (`13`/`14`); it performs no mutation. The copy options still remain listed because a real copy is blocked deeper inside the transfer itself (reported as a failed item, not a generic read-only warning), not by the menu dispatch gate. It still writes a host audit log.
+`-ReadOnly` allows only inspection, listing, the connectivity test (option `T`), the SSH configuration option (`C`) and the file-copy options (`13`/`14`); it performs no mutation. The copy options still remain listed because a real copy is blocked deeper inside the transfer itself (reported as a failed item, not a generic read-only warning), not by the menu dispatch gate. It still writes a host audit log.
 
 ### Test connection (`T`)
 
-Prompts for the guest's Windows credentials (never stored), opens a PowerShell Direct session to the Running VM, and runs a trivial remote command to confirm round-trip execution. On success it reports the guest's OS version string; on failure (wrong credentials, VM not Running, etc.) it reports a clear message, never a raw stack trace. The session is always closed afterward. This does not transfer any files by itself; it only proves the connection used by later file-transfer operations is reachable.
+Adapter-aware: calls `Get-LabTransferAdapterKind` first, which returns `'SFTP'` only when this VM has saved SSH connection settings, otherwise `'PSDirect'`.
+
+For a `PSDirect` VM (the default, and unchanged from before this adapter check existed): prompts for the guest's Windows credentials (never stored), opens a PowerShell Direct session to the Running VM, and runs a trivial remote command to confirm round-trip execution. On success it reports the guest's OS version string; on failure (wrong credentials, VM not Running, etc.) it reports a clear message, never a raw stack trace. The session is always closed afterward.
+
+For an `SFTP` VM (one with SSH connection settings saved via option `C` or `-ConfigureSsh`): runs `Test-LabSshConnection` instead -- see "SSH connection test and known-host trust" below for what that checks.
+
+Either way, this does not transfer any files by itself; it only proves the connection used by later file-transfer operations is reachable.
+
+### Configure SSH connection (`C`)
+
+Interactively saves the SSH connection settings (hostname/address, port, username, optional identity-file path) this VM's file transfers and connectivity test will use. Lists this VM's current guest IP addresses (`Get-LabGuestAddressCandidates`) as suggestions only -- none is ever auto-selected, and a blank answer at the hostname/address prompt re-prompts rather than silently picking one for you. The port defaults to `22` on a blank answer; the username has no default. Leaving the identity-file path blank means password authentication (the real OpenSSH password/host-key prompts, at connection time); supplying one means key-based, non-interactive authentication. A preview of everything collected is shown, and a lightweight `[Y/n/cancel]` confirmation (not a typed confirmation phrase) is required before the settings are written -- this only writes a local, non-secret settings file (no secret material is ever saved), not a destination mutation, so it does not warrant the stronger confirmation used by file transfers or VM-changing operations. Saving settings for a VM is also what makes option `T` and file transfer (`13`/`14`, and parameter mode) use the SSH/SFTP adapter for that VM instead of PowerShell Direct; a VM with nothing saved here is unaffected and keeps using PowerShell Direct exactly as before. Available even under `-ReadOnly`, since it never mutates the VM itself.
 
 ### Copy file/directory to/from VM (`13` / `14`)
 
@@ -134,6 +145,25 @@ Parameters:
 The transfer-only parameters (`-VMName`, `-VMId`, `-SourcePath`, `-DestinationPath`, `-Recurse`, `-OnConflict`, `-DryRun`, `-NonInteractive`, `-VerifyHash`, `-PermissionProfile`, `-Credential`) require `-CopyToVM` or `-CopyFromVM`. Supplying any of them without a direction switch is an error (exit `1`) rather than silently opening the interactive menu, so an unattended `-NonInteractive` job can never hang at a menu prompt.
 
 Exit-code contract: the process exits `0` only when the transfer summary reports `Failed -eq 0` (including when `-DryRun` is set and nothing failed); any failed item, or a thrown validation/setup error, exits non-zero. The same host assertion, log initialization, and `session` `STARTED`/`ENDED` audit records that interactive mode writes are also written in parameter mode; only the menu loop itself is skipped. Parameter mode holds the same per-VM lock as the menu operations for the whole transfer, so it fails immediately ("Another copy of this script is operating on this VM...") rather than run alongside another operation on that VM.
+
+## Parameter mode: SSH connection configuration
+
+Pass `-ConfigureSsh` on the command line to save a VM's SSH connection settings non-interactively and exit, instead of launching the menu. This is the scriptable equivalent of the menu's `C` option (see "Configure SSH connection (`C`)" above) -- it never prompts, so every required value must be supplied as a parameter.
+
+```
+powershell.exe -NoProfile -File .\Lab-VM.ps1 -ConfigureSsh -VMName LAB-linux -SshHost 192.168.1.50 -SshUser dev -SshIdentityFile C:\keys\id_ed25519
+```
+
+Parameters:
+
+- `-ConfigureSsh` -- the switch that selects this mode. Mutually exclusive with `-CopyToVM`/`-CopyFromVM`; supplying `-ConfigureSsh` together with either exits `1` before anything else runs ("Supply only one of -ConfigureSsh, -CopyToVM, or -CopyFromVM; one action per invocation.").
+- `-VMName` / `-VMId` -- identify the target VM; pick exactly one, same resolution rules as file transfer.
+- `-SshHost` -- required hostname or IP address to save.
+- `-SshPort` -- optional; defaults to `22`.
+- `-SshUser` -- required username to save.
+- `-SshIdentityFile` -- optional identity-file path to save. Omit it to save password authentication.
+
+`-SshHost` and `-SshUser` are both required; a run missing either exits `1` with a message naming the missing one, and nothing is written. On success, the process writes the settings file and exits `0`; a subsequent `-CopyToVM`/`-CopyFromVM` (or menu option `T`/`13`/`14`) against that same VM then automatically uses the SSH/SFTP adapter, with no further action needed. The same host assertion and `session` `STARTED`/`ENDED`/`configure-ssh-cli` audit records that other parameter-mode runs write are written here too.
 
 ## First baseline
 
