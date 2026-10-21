@@ -351,7 +351,9 @@ Test-Case 'Set-LabVMBootProfile does not turn Secure Boot on for a Generation 1 
 # VMBootSource{ Device = DvdDrive/HardDiskDrive/VMNetworkAdapter }, exactly the shape the suffix match
 # in Get-LabBootEntryKind exists for. VMDvdDrive/VMHardDiskDrive are kept ONLY for the
 # backward-compatibility cases (a bare or VM-prefixed device), not as the primary shape.
-class DvdDrive {}
+# DvdDrive carries Path like the real device object does, so Set-LabVMUnattendedInstallMedia's
+# "is the Windows installer drive's own entry among the leading DVD entries" check can be exercised.
+class DvdDrive { [string]$Path }
 class HardDiskDrive {}
 class VMNetworkAdapter {}
 class VMDvdDrive {}
@@ -364,9 +366,9 @@ class VMBootSource {
     VMBootSource([string]$BootType, [object]$Device) { $this.BootType = $BootType; $this.Device = $Device }
 }
 function New-FakeBootEntry {
-    param([ValidateSet('Dvd', 'Disk', 'Nic')][string]$Kind)
+    param([ValidateSet('Dvd', 'Disk', 'Nic')][string]$Kind, [string]$Path = '')
     switch ($Kind) {
-        'Dvd' { return [VMBootSource]::new('Drive', [DvdDrive]::new()) }
+        'Dvd' { $dvd = [DvdDrive]::new(); $dvd.Path = $Path; return [VMBootSource]::new('Drive', $dvd) }
         'Disk' { return [VMBootSource]::new('Drive', [HardDiskDrive]::new()) }
         'Nic' { return [VMBootSource]::new('Network', [VMNetworkAdapter]::new()) }
     }
@@ -561,9 +563,11 @@ Test-Case 'Set-LabVMUnattendedInstallMedia attaches both drives in order and set
     $script:AddVMDvdDriveCalls = 0
     $script:SetVMDvdDriveCalls.Clear()
     $script:SetVMFirmwareBootOrderCalls.Clear()
-    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Dvd'))
     $windowsIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-win-' + [guid]::NewGuid().ToString('N') + '.iso')
     $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    # The entries the two new drives would get on a live VM: the seed drive's listed first, so the
+    # Windows-drive check must look past it rather than only at the very first entry.
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Dvd' $seedIso), (New-FakeBootEntry 'Dvd' $windowsIso))
     [IO.File]::WriteAllBytes($windowsIso, [byte[]]@(1, 2, 3))
     [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
     try {
@@ -576,6 +580,33 @@ Test-Case 'Set-LabVMUnattendedInstallMedia attaches both drives in order and set
         Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
         $applied = @($script:SetVMFirmwareBootOrderCalls[0])
         Assert-Equal (Get-LabBootEntryKind $applied[0]) 'Dvd'
+        Assert-Equal (Get-LabBootEntryKind $applied[1]) 'Dvd'
+        Assert-Equal (Get-LabBootEntryKind $applied[2]) 'Disk'
+    } finally {
+        [IO.File]::Delete($windowsIso)
+        [IO.File]::Delete($seedIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Set-LabVMUnattendedInstallMedia throws when only the SEED drive has a recognized boot entry, not the Windows installer drive' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    $windowsIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-win-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    # Only the seed drive's entry is recognizable: Set-LabVMBootOrder itself succeeds (some DVD
+    # entry exists and is moved first), so only the new Windows-drive check can catch this.
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Nic'), (New-FakeBootEntry 'Dvd' $seedIso))
+    [IO.File]::WriteAllBytes($windowsIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Assert-Throws { Set-LabVMUnattendedInstallMedia $script:FakeId $windowsIso $seedIso } "Windows installer drive's own boot entry"
+        # The reorder really did succeed first: this is the specific post-reorder check, not
+        # Set-LabVMBootOrder's own generic "no Dvd entry was recognized" refusal.
+        Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
+        Assert-Equal (Get-LabBootEntryKind @($script:SetVMFirmwareBootOrderCalls[0])[0]) 'Dvd'
+        Assert-Equal $script:FakeDvdDrives.Count 2
     } finally {
         [IO.File]::Delete($windowsIso)
         [IO.File]::Delete($seedIso)
@@ -756,6 +787,28 @@ Test-Case 'New-LabWindowsAnswerFileXml skips every OOBE prompt this plan depends
         if ($null -eq $node) { throw "Missing OOBE element: $elementName" }
     }
 }
+Test-Case 'New-LabWindowsAnswerFileXml answers Setup''s own language page via International-Core-WinPE in the windowsPE pass' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    # A non-default locale, so a hard-coded en-US in the WinPE component could not pass by accident.
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'fr-FR' 'W. Europe Standard Time' 1 'labadmin' $securePassword
+    $xml = [xml]$result
+    $component = $xml.SelectSingleNode("//*[local-name()='settings'][@pass='windowsPE']/*[local-name()='component'][@name='Microsoft-Windows-International-Core-WinPE']")
+    if ($null -eq $component) { throw 'Missing Microsoft-Windows-International-Core-WinPE component in the windowsPE pass.' }
+    Assert-Equal $component.GetAttribute('processorArchitecture') 'amd64'
+    Assert-Equal $component.GetAttribute('publicKeyToken') '31bf3856ad364e35'
+    Assert-Equal $component.GetAttribute('language') 'neutral'
+    Assert-Equal $component.GetAttribute('versionScope') 'nonSxS'
+    Assert-Equal ($component.SelectSingleNode("*[local-name()='SetupUILanguage']/*[local-name()='UILanguage']")).InnerText 'fr-FR'
+    foreach ($elementName in @('InputLocale', 'SystemLocale', 'UILanguage', 'UserLocale')) {
+        $node = $component.SelectSingleNode("*[local-name()='$elementName']")
+        if ($null -eq $node) { throw "Missing WinPE element: $elementName" }
+        Assert-Equal $node.InnerText 'fr-FR'
+    }
+    # Same pass as Microsoft-Windows-Setup, and still no product key anywhere.
+    $setup = $xml.SelectSingleNode("//*[local-name()='settings'][@pass='windowsPE']/*[local-name()='component'][@name='Microsoft-Windows-Setup']")
+    if ($null -eq $setup) { throw 'Microsoft-Windows-Setup is no longer in the windowsPE pass.' }
+    Assert-Equal ($result.Contains('ProductKey')) $false
+}
 
 Test-Case 'New VM name must start with LAB-' { Assert-Equal (Test-LabNewVMName 'OTHER-Test' @()) $false }
 Test-Case 'New VM name rejects case-insensitive duplicate' { Assert-Equal (Test-LabNewVMName 'lab-test' @('LAB-Test')) $false }
@@ -897,7 +950,8 @@ Test-Case 'Wait-LabPSDirectSession times out with a clear message once its own s
     $realWatch = [Diagnostics.Stopwatch]::StartNew()
     # 6>$null discards this fast-spinning fake's hundreds of per-attempt Write-Host progress lines;
     # production use (seconds between real attempts) never produces output anywhere near this volume.
-    Assert-Throws { Wait-LabPSDirectSession $script:FakeId $null 1 6>$null } 'Timed out'
+    # The final error must carry the last specific failure the loop saw, not just the elapsed time.
+    Assert-Throws { Wait-LabPSDirectSession $script:FakeId $null 1 6>$null } 'Timed out.*Last error: simulated: guest not ready to accept PowerShell Direct'
     $realElapsedSeconds = $realWatch.Elapsed.TotalSeconds
     # The function's own 1-second budget, not this fast-spinning fake's retry count, bounds how
     # long the real stopwatch runs; a generous ceiling keeps this robust on a loaded CI box.
@@ -3453,10 +3507,14 @@ function Invoke-LabProvisioningScenario {
             $script:ProvArgs['Wait-LabPSDirectSession'] = $TimeoutSeconds
             return [pscustomobject]@{ State = 'Opened' }
         }
-        function Write-LabProvisioningNote { param($Session, [string]$Content) Record 'Write-LabProvisioningNote' }
+        function Write-LabProvisioningNote { param($Session, [string]$Content) Record 'Write-LabProvisioningNote'; $script:ProvArgs['Write-LabProvisioningNote'] = $Content }
         function Remove-PSSession { [CmdletBinding()] param($Session) }
         function Request-LabVMGuestShutdown { param([guid]$VMId) Record 'Request-LabVMGuestShutdown' }
-        function Wait-LabVMState { param([guid]$VMId, [string]$State) Record "Wait-LabVMState:$State" }
+        function Wait-LabVMState {
+            param([guid]$VMId, [string]$State, [int]$TimeoutSeconds = 0)
+            Record "Wait-LabVMState:$State"
+            $script:ProvArgs["Wait-LabVMState:$State"] = $TimeoutSeconds
+        }
         function Complete-LabWindowsProvisioning {
             param([guid]$VMId, [string]$WindowsIsoPath, [string]$SeedIsoPath)
             Record 'Complete-LabWindowsProvisioning'
@@ -3479,6 +3537,8 @@ $script:ProvHappyOrder = @('Select-LabIsoPath', 'Get-LabWindowsInstallImages', '
     'Request-LabVMGuestShutdown', 'Wait-LabVMState:Off', 'Complete-LabWindowsProvisioning', 'Remove-LabProvisioningWorkspace',
     'Start-LabVM', 'Wait-LabPSDirectSession')
 $script:LabReadOnly = $false
+# Lab-VM.ps1's own script-level default for -TimeoutSeconds (the orchestrator reads it for the Off-wait floor).
+$script:LabTimeout = 180
 
 Test-Case 'Provision: happy path runs every phase once, in the documented order, and returns COMPLETED' {
     $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11' } -Answers @('')
@@ -3555,6 +3615,48 @@ Test-Case 'Provision: a failure partway reports completed steps, the kept worksp
     if (-not $r.Error.Contains($script:ProvWorkspace)) { throw "Error did not name the workspace path: $($r.Error)" }
     if ($r.Error -notmatch 'password') { throw "Error did not mention the password: $($r.Error)" }
     Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|FAILED_OR_UNCONFIRMED|*') $true
+}
+Test-Case 'Provision: a failure AFTER the seed ISO is built says the kept workspace contains the password in plain text' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' } -ThrowIn 'Set-LabVMUnattendedInstallMedia'
+    Assert-Equal $r.Status $null
+    Assert-Equal ($r.Calls -contains 'New-LabSeedIso') $true
+    Assert-Equal $r.Calls[-1] 'Set-LabVMUnattendedInstallMedia'
+    if ($r.Error -notmatch 'simulated Set-LabVMUnattendedInstallMedia failure') { throw "Error lost the cause: $($r.Error)" }
+    if (-not $r.Error.Contains("The provisioning workspace was KEPT, not deleted: $($script:ProvWorkspace) -- it contains the account password in plain text")) {
+        throw "Error did not name the workspace path and its plain-text password: $($r.Error)"
+    }
+    if ($r.Error -match 'no password had been written') { throw "Error used the pre-seed-ISO wording: $($r.Error)" }
+    Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|FAILED_OR_UNCONFIRMED|*') $true
+}
+Test-Case 'Provision: the wait for Off between the two boots uses at least a 600-second floor, never below the general timeout' {
+    $saved = $script:LabTimeout
+    try {
+        $script:LabTimeout = 180
+        $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' }
+        if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+        Assert-Equal $r.Args['Wait-LabVMState:Off'] 600
+        # The floor never shortens a general timeout that is already longer, and leaves it unchanged.
+        $script:LabTimeout = 900
+        $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' }
+        if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+        Assert-Equal $r.Args['Wait-LabVMState:Off'] 900
+        Assert-Equal $script:LabTimeout 900
+    } finally { $script:LabTimeout = $saved }
+}
+Test-Case 'Provision: the guest-desktop note names the VM, ISO, edition, boot profile and timing' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' }
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    $note = [string]$r.Args['Write-LabProvisioningNote']
+    foreach ($expected in @('LAB-Win11', "Windows ISO: $($script:ProvSourceIso)", 'no-prompt copy', 'Windows 11 Pro (image 3, build 26100)',
+            'Computer name: lab-agent-test', 'Local administrator account: dev',
+            'Boot profile: Windows11 (Secure Boot template changed: False; Secure Boot turned on: False; key protector added: True; vTPM enabled: True)')) {
+        if (-not $note.Contains($expected)) { throw "Note is missing '$expected': $note" }
+    }
+    if ($note -notmatch 'Time from VM creation to this first sign-in: \d+ min \d+ s \(\d+ seconds\)') { throw "Note is missing the elapsed time: $note" }
+    # Unpatched: the note says the ISO was booted as-is.
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' } -Patched $false
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    if (-not ([string]$r.Args['Write-LabProvisioningNote']).Contains("Windows ISO: $($script:ProvSourceIso) (booted as-is")) { throw "Unpatched note wording wrong: $($r.Args['Write-LabProvisioningNote'])" }
 }
 Test-Case 'Provision: -NonInteractive without -Credential is refused before any ISO is read or VM created' {
     $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; NonInteractive = $true; WindowsIsoPath = $PSCommandPath }

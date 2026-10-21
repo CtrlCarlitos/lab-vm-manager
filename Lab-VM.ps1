@@ -826,9 +826,12 @@ function Configure-LabSshConnectionInteractive {
 }
 
 function Wait-LabVMState {
-    param([guid]$VMId, [string]$State)
+    # -TimeoutSeconds overrides the general -TimeoutSeconds ($script:LabTimeout) for one wait only;
+    # omitted (0), the general value applies, as it always has for every other caller.
+    param([guid]$VMId, [string]$State, [int]$TimeoutSeconds = 0)
+    $limit = if ($TimeoutSeconds -gt 0) { $TimeoutSeconds } else { $script:LabTimeout }
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    while ($watch.Elapsed.TotalSeconds -lt $script:LabTimeout) {
+    while ($watch.Elapsed.TotalSeconds -lt $limit) {
         $vm = Get-LabVM $VMId
         if ([string]$vm.State -eq $State) { return $vm }
         Start-Sleep -Seconds 1
@@ -2153,6 +2156,24 @@ function Set-LabVMUnattendedInstallMedia {
     # Both new drives are DVD-kind; which one ends up first doesn't matter -- UEFI firmware skips a
     # non-bootable disc and falls through, so the seed drive being tried first costs nothing.
     Set-LabVMBootOrder $VMId 'Dvd'
+
+    # Set-LabVMBootOrder only guarantees that SOME DVD-kind entry was recognized and moved first. If
+    # only the seed drive's entry was, it still "succeeds", and the real failure (the installer never
+    # boots) would surface only as an opaque PowerShell Direct timeout much later. So re-read the
+    # applied order and confirm that one of its leading DVD entries is the Windows installer drive.
+    $appliedOrder = @((Get-VMFirmware -VM $vm -ErrorAction Stop).BootOrder)
+    $windowsEntryFound = $false
+    foreach ($entry in $appliedOrder) {
+        if ((Get-LabBootEntryKind $entry) -ne 'Dvd') { break }
+        $device = $entry
+        $deviceProperty = $entry.PSObject.Properties['Device']
+        if ($null -ne $deviceProperty -and $null -ne $deviceProperty.Value) { $device = $deviceProperty.Value }
+        $pathProperty = $device.PSObject.Properties['Path']
+        if ($null -ne $pathProperty -and [string]$pathProperty.Value -eq $WindowsIsoPath) { $windowsEntryFound = $true; break }
+    }
+    if (-not $windowsEntryFound) {
+        throw "'$($vm.Name)': the boot order was set DVD-first, but the Windows installer drive's own boot entry (for '$WindowsIsoPath') was not confirmed among the leading DVD entries, so the VM would likely never boot the installer. Both drives were left attached. Check Firmware > Boot order in Hyper-V Manager."
+    }
 }
 
 function Complete-LabWindowsProvisioning {
@@ -2178,6 +2199,8 @@ function New-LabWindowsAnswerFileXml {
     # New-LabSeedIso. Partition layout (EFI system partition + MSR + a single primary OS partition
     # filling the rest of the disk) is the standard whole-disk UEFI/GPT shape for a single-disk
     # Gen2 VM -- no separate Windows RE partition, since nothing here needs to recover this VM.
+    # The windowsPE pass carries International-Core-WinPE as well as the oobeSystem pass's
+    # International-Core, so Setup's own language/keyboard page is answered too, not just OOBE's.
     param(
         [string]$ComputerName,
         [string]$Locale,
@@ -2203,6 +2226,15 @@ function New-LabWindowsAnswerFileXml {
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
     <settings pass="windowsPE">
+        <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <SetupUILanguage>
+                <UILanguage>$escapedLocale</UILanguage>
+            </SetupUILanguage>
+            <InputLocale>$escapedLocale</InputLocale>
+            <SystemLocale>$escapedLocale</SystemLocale>
+            <UILanguage>$escapedLocale</UILanguage>
+            <UserLocale>$escapedLocale</UserLocale>
+        </component>
         <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
             <DiskConfiguration>
                 <Disk wcm:action="add">
@@ -2327,15 +2359,20 @@ function Wait-LabPSDirectSession {
     # failure. The caller owns the returned session and is responsible for Remove-PSSession.
     param([guid]$VMId, [PSCredential]$Credential, [int]$TimeoutSeconds)
     $watch = [Diagnostics.Stopwatch]::StartNew()
+    $lastError = $null
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
             return New-LabPSDirectSession $VMId $Credential
         } catch {
+            $lastError = $_
             Write-Host "Waiting for PowerShell Direct to come up ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $($_.Exception.Message)"
             Start-Sleep -Seconds 10
         }
     }
-    throw "Timed out after $([int]$watch.Elapsed.TotalSeconds) seconds waiting for a PowerShell Direct session to open. The guest may still be booting or applying the unattend answer file; retry once it has settled."
+    # The per-attempt lines above scroll away during a long wait; the last specific failure is the
+    # operator's only diagnostic clue, so it is carried into the final error itself.
+    $lastErrorText = if ($null -eq $lastError) { ' No connection attempt was made.' } else { " Last error: $($lastError.Exception.Message)" }
+    throw "Timed out after $([int]$watch.Elapsed.TotalSeconds) seconds waiting for a PowerShell Direct session to open. The guest may still be booting or applying the unattend answer file; retry once it has settled.$lastErrorText"
 }
 
 function Write-LabProvisioningNote {
@@ -2912,9 +2949,15 @@ function Start-LabWindowsVMProvisioning {
             Write-Host "Windows setup is running unattended. Waiting up to $timeoutSeconds seconds for the first PowerShell Direct sign-in..."
             $session = Wait-LabPSDirectSession -VMId $vmId -Credential $guestCredential -TimeoutSeconds $timeoutSeconds
             $done.Add('first PowerShell Direct sign-in succeeded (Windows installed)')
+            $installElapsed = $watch.Elapsed
             $note = (@(
                 "This VM ($name) was installed unattended by LAB VM Manager from $env:COMPUTERNAME on $(Get-Date -Format 'yyyy-MM-dd HH:mm').",
-                "Edition: $($edition.Name). Computer name: $computerName. Local administrator account: $accountName.",
+                "Windows ISO: $isoPath$(if ($patchResult.Patched) { ' (booted from a no-prompt copy of it)' } else { ' (booted as-is; its boot loader was not patched)' }).",
+                "Edition: $($edition.Name) (image $($edition.Index), build $($edition.BuildNumber)). Computer name: $computerName. Local administrator account: $accountName.",
+                ('Boot profile: Windows11 (Secure Boot template changed: {0}; Secure Boot turned on: {1}; key protector added: {2}; vTPM enabled: {3}).' -f
+                    $profileResult.SecureBootTemplateChanged, $profileResult.SecureBootEnabled, $profileResult.KeyProtectorAdded, $profileResult.TpmEnabled),
+                ('Time from VM creation to this first sign-in: {0} min {1} s ({2} seconds).' -f
+                    [int][math]::Floor($installElapsed.TotalMinutes), $installElapsed.Seconds, [int]$installElapsed.TotalSeconds),
                 'Right after this note was written, the host shut the VM down once, removed the installer and answer-file media,',
                 'deleted its host-side copy of the answer file, and started the VM again.'
             ) -join [Environment]::NewLine)
@@ -2923,7 +2966,10 @@ function Start-LabWindowsVMProvisioning {
             Remove-PSSession -Session $session -ErrorAction SilentlyContinue
             $session = $null
             Request-LabVMGuestShutdown $vmId 'LAB VM Manager: Windows unattended install finished; removing install media'
-            $null = Wait-LabVMState $vmId 'Off'
+            # A first shutdown right after OOBE can take far longer than the short general state-change
+            # wait (-TimeoutSeconds, default 180 s), and timing out here would strand a finished VM with
+            # its media still attached and its password-bearing workspace kept. So floor it at 10 minutes.
+            $null = Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 600))
             $done.Add('VM shut down')
             Complete-LabWindowsProvisioning -VMId $vmId -WindowsIsoPath $windowsIsoPath -SeedIsoPath $seedIsoPath
             $done.Add('seed drive removed, installer ISO ejected, disk first in boot order')

@@ -823,6 +823,11 @@ class SourceContract(unittest.TestCase):
     def test_answer_file_single_logon(self):
         body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('LogonCount', body)
+    def test_answer_file_has_winpe_international_core(self):
+        body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
+        winpe = body.split('<settings pass="windowsPE">', 1)[1].split('</settings>', 1)[0]
+        self.assertIn('name="Microsoft-Windows-International-Core-WinPE"', winpe)
+        self.assertIn('<SetupUILanguage>', winpe)
     def test_answer_file_password_scoped(self):
         body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('[Runtime.InteropServices.Marshal]', body)
@@ -835,6 +840,17 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Wait-LabPSDirectSession {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('Stopwatch', body)
         self.assertIn('throw', body)
+    def test_psdirect_wait_timeout_carries_last_error(self):
+        body = self.s.split('function Wait-LabPSDirectSession {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Last error:', body)
+    def test_unattended_media_confirms_windows_drive_boot_entry(self):
+        body = self.s.split('function Set-LabVMUnattendedInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertLess(body.index("Set-LabVMBootOrder $VMId 'Dvd'"), body.index('Get-VMFirmware -VM $vm -ErrorAction Stop'))
+        self.assertIn('Get-LabBootEntryKind', body)
+    def test_provisioning_off_wait_has_its_own_floor(self):
+        body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 600))", body)
+        self.assertIn('$script:LabTimeout = $TimeoutSeconds', self.s)
     def test_provisioning_note_reads_guest_desktop(self):
         body = self.s.split('function Write-LabProvisioningNote {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("GetFolderPath('Desktop')", body)
