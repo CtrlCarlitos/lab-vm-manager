@@ -3490,6 +3490,10 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     # Defaults: blank picker answer = Pro (index 3); dynamic memory 2/4/8 GB; 150 GB VHDX; Disconnected; 2 vCPUs.
     Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ImageIndex 3
     Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].UserName 'dev'
+    # Neither -ComputerName nor -TimeZone was supplied: both must be the literal project defaults,
+    # independent of -NewVMName and of the host's own time zone.
+    Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ComputerName 'lab-agent-test'
+    Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].TimeZone 'Central America Standard Time'
     $core = $r.Args['New-LabVMCore']
     Assert-Equal $core.Name 'LAB-Win11'
     Assert-Equal $core.VCpuCount 2
@@ -3506,7 +3510,7 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     Assert-Equal $r.Args['Complete-LabWindowsProvisioning'].SeedIsoPath $r.Args['Set-LabVMUnattendedInstallMedia'].SeedIsoPath
     Assert-Equal (@($r.Args['New-LabSeedIso'].Files.Keys) -join ',') 'Autounattend.xml'
     Assert-Equal ($r.Audit[0] -like 'provision-windows-vm|STARTED|*') $true
-    Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|COMPLETED|*Win11.iso*Windows 11 Pro*ComputerName=LAB-Win11*ElapsedSeconds=*') $true
+    Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|COMPLETED|*Win11.iso*Windows 11 Pro*ComputerName=lab-agent-test*ElapsedSeconds=*') $true
 }
 Test-Case 'Provision: an unpatched ISO falls back to the ORIGINAL source path for attach and cleanup' {
     $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' } -Patched $false

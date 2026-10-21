@@ -237,9 +237,9 @@ Parameters (all optional unless noted):
 - `-NewVMName` -- name of the VM to **create** (must start with `LAB-` and be unique). This is deliberately not `-VMName`, which always names an existing VM. `-VMName`, `-VMId` and the other transfer-only parameters are rejected with `-ProvisionWindowsVM`.
 - `-WindowsIsoPath` -- the Windows 11 ISO. Default: pick one under `-IsoRoot`.
 - `-OsEdition` -- edition name, full or short (`'Windows 11 Pro'` or `Pro`). Default: the picker, preselecting Pro. With `-NonInteractive`: Pro, or the ISO's only Windows 11 client edition; otherwise it fails listing the choices.
-- `-ComputerName` -- 1-15 letters, digits or hyphens. Default: the VM name with other characters removed, cut to 15 characters.
+- `-ComputerName` -- 1-15 letters, digits or hyphens. Default: `'lab-agent-test'`, independent of `-NewVMName`.
 - `-Locale` -- for example `en-US` (the default). It must be a language the ISO contains.
-- `-TimeZone` -- a Windows time zone ID such as `'Pacific Standard Time'` (`tzutil /l` lists them). Default: this host's time zone.
+- `-TimeZone` -- a Windows time zone ID such as `'Pacific Standard Time'` (`tzutil /l` lists them). Default: `'Central America Standard Time'`.
 - `-VCpuCount` -- default `2`, capped to this host's logical processor count; an explicit value above that count is refused, not reduced.
 - `-MemoryMinimumGB` / `-MemoryStartupGB` / `-MemoryMaximumGB` -- dynamic memory, defaults `2` / `4` / `8`; minimum <= startup <= maximum.
 - `-VhdxSizeGB` -- dynamic VHDX maximum size, default `150` (64-65536).
