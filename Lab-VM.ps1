@@ -1775,6 +1775,273 @@ function Get-LabLinuxIsoInfo {
     }
 }
 
+# Patches an Ubuntu Desktop installer ISO's grub.cfg in place, inserting the literal `autoinstall`
+# kernel boot parameter into its `linux` boot line, so Subiquity runs its NoCloud autoinstall
+# instead of the normal interactive installer, with zero interaction at GRUB's own menu either.
+# Never modifies $SourceIsoPath itself -- always writes a new file at $OutputPath, and only once
+# every check below holds. On any ambiguity it returns Patched=$false with a clear Reason and makes
+# no copy at all, so a multi-gigabyte ISO is never duplicated for nothing; the caller falls back to
+# the unpatched $SourceIsoPath in that case -- same fallback contract as New-LabPatchedBootableIso
+# below, whose house style (verify everything before writing, copy only once verified, refuse rather
+# than guess) this function follows directly.
+#
+# This is pure byte-array math over the ISO9660/Joliet structure (ECMA-119), parsed directly from
+# $SourceIsoPath ON DISK, never a mounted volume -- same discipline as New-LabPatchedBootableIso. A
+# Primary Volume Descriptor at sector 16 and a Supplementary (Joliet) Volume Descriptor at sector 17
+# (identified by its UCS-2 Level 3 escape sequence, bytes 0x25 0x2F 0x45 ("%/E") at byte offset 88)
+# each carry a 34-byte root directory record at byte offset 156 within the descriptor's own
+# 2048-byte sector (ECMA-119 8.4/8.5/9.1: a directory record whose own file identifier is a single
+# NUL byte is always exactly 34 bytes, so this offset is fixed, not walked). From there, grub.cfg is
+# found by walking root -> boot -> grub -> grub.cfg in BOTH trees independently -- the primary
+# tree's plain ASCII names, the Joliet tree's UCS-2BE-encoded names -- since the two trees are
+# parallel, separately-recorded namespaces, normally over the very same file data. Each directory
+# record (ECMA-119 9.1) is variable-length: byte 0 is the record's own length; bytes 2-9 and 10-17
+# are the extent location and data length, each in ISO9660's "both-byte-order" (LSB_MSB) 8-byte
+# encoding (a 4-byte little-endian copy, then a 4-byte big-endian copy, of the same 32-bit value);
+# byte 32 is the file identifier's own length, and the identifier itself starts at byte 33. A
+# record's own file identifier being a single 0x00 or single 0x01 byte is the "." / ".."
+# self/parent entry ECMA-119 requires at the start of every directory extent; this walk skips both.
+#
+# Once grub.cfg's own directory record is found in both trees, this verifies they agree with each
+# other (same extent, same data length) before touching anything -- a real ISO image normally keeps
+# ONE copy of a file's data, referenced by both namespaces' directory entries; if they disagree,
+# this ISO's layout isn't what this technique understands, and nothing is patched or copied. The
+# file's current content is then read from its extent and searched for a `linux` boot line (the
+# fixture's own test pattern: a line containing "/casper/vmlinuz"); if not found, this refuses
+# rather than ever patching blind. ` autoinstall` is inserted right before a trailing "---" marker
+# on that line if present (GRUB's own kernel/initrd-argument separator), otherwise appended to the
+# line's end. Since ISO9660 extents are sector-aligned but file content inside them is often
+# shorter than a whole number of sectors, the edit can only be written in place if the sector(s)
+# already backing the extent have enough slack for the longer content (rounded up to the next
+# 2048-byte boundary); if not, this refuses with a Reason naming the shortfall -- never grows a file
+# across a sector boundary this function doesn't also account for in both trees' directory records.
+#
+# Only once every check above holds: copy the whole source file, write the new content into the
+# existing extent (zero-padding the remainder of its sector(s), matching ISO9660 convention), and
+# patch BOTH trees' own grub.cfg directory-record data-length fields (each its own 4-byte
+# little-endian + 4-byte big-endian pair) to the new length -- the file's length genuinely changed
+# here, unlike New-LabPatchedBootableIso's equal-length byte swap, so both records naming that
+# length must be corrected, not just the content bytes themselves.
+function New-LabPatchedBootableLinuxIso {
+    param([string]$SourceIsoPath, [string]$OutputPath)
+    $sectorSize = 2048
+    $kernelLinePattern = '/casper/vmlinuz'
+    $autoinstallParam = 'autoinstall'
+    $pathComponents = @('boot', 'grub', 'grub.cfg')
+
+    # Reads exactly $Count bytes at $Offset from the real ISO file on disk, looping Read since a
+    # single call is not guaranteed to fill the buffer. Never loads the whole, possibly
+    # multi-gigabyte, file into memory. A scriptblock, not a nested function -- see
+    # New-LabPatchedBootableIso's own identical note on why (this function's own text is extracted
+    # and evaluated standalone by Test-LabVM.ps1's AST harness).
+    $readIsoBytes = {
+        param([string]$Path, [int64]$Offset, [int]$Count)
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            [void]$stream.Seek($Offset, [IO.SeekOrigin]::Begin)
+            $buffer = New-Object byte[] $Count
+            $readTotal = 0
+            while ($readTotal -lt $Count) {
+                $read = $stream.Read($buffer, $readTotal, $Count - $readTotal)
+                if ($read -le 0) {
+                    throw "Unexpected end of file reading $Count byte(s) at offset $Offset from '$Path'."
+                }
+                $readTotal += $read
+            }
+            return $buffer
+        } finally {
+            $stream.Dispose()
+        }
+    }
+
+    # Finds $Name's own directory record among the records packed into a directory's extent
+    # ($ExtentSector/$DataLength, as recorded by that directory's OWN parent). Walks the extent a
+    # sector at a time (ECMA-119: a directory record never spans a sector boundary; a zero length
+    # byte signals "no more records in THIS sector", not "no more records at all", for an extent
+    # spanning more than one sector) and skips the mandatory "." (0x00) / ".." (0x01) self/parent
+    # entries every directory extent starts with. Returns $null if not found.
+    $findChildRecord = {
+        param([string]$Path, [scriptblock]$ReadIsoBytes, [int64]$ExtentSector, [uint32]$DataLength, [string]$Name, [bool]$Joliet, [int]$SectorSize)
+        $bytesWalked = 0L
+        $sectorIndex = 0L
+        while ($bytesWalked -lt $DataLength) {
+            $chunkOffset = ($ExtentSector + $sectorIndex) * $SectorSize
+            $chunk = & $ReadIsoBytes $Path $chunkOffset $SectorSize
+            $pos = 0
+            while ($pos -lt $SectorSize) {
+                $lenDr = [int]$chunk[$pos]
+                if ($lenDr -eq 0) { break }
+                $lenFi = [int]$chunk[$pos + 32]
+                $fileIdBytes = $chunk[($pos + 33)..($pos + 33 + $lenFi - 1)]
+                $isDotEntry = ($lenFi -eq 1 -and ($fileIdBytes[0] -eq 0 -or $fileIdBytes[0] -eq 1))
+                if (-not $isDotEntry) {
+                    $fileName = if ($Joliet) { [Text.Encoding]::BigEndianUnicode.GetString($fileIdBytes) } else { [Text.Encoding]::ASCII.GetString($fileIdBytes) }
+                    if ($fileName -ceq $Name) {
+                        return [pscustomobject]@{
+                            ExtentSector = [int64][BitConverter]::ToUInt32($chunk, $pos + 2)
+                            DataLength = [uint32][BitConverter]::ToUInt32($chunk, $pos + 10)
+                            IsDirectory = (([int]$chunk[$pos + 25] -band 0x02) -ne 0)
+                            DataLengthFieldOffset = [int64]($chunkOffset + $pos + 10)
+                        }
+                    }
+                }
+                $pos += $lenDr
+            }
+            $bytesWalked += $SectorSize
+            $sectorIndex++
+        }
+        return $null
+    }
+
+    # Walks root -> boot -> grub -> grub.cfg in one tree (primary or Joliet), starting from that
+    # tree's own root directory record's extent/length. Returns the leaf (grub.cfg) record, or
+    # $null plus the path component that could not be found.
+    $walkToGrubCfg = {
+        param([string]$Path, [scriptblock]$ReadIsoBytes, [scriptblock]$FindChildRecord, [int64]$RootExtentSector, [uint32]$RootDataLength, [string[]]$PathComponents, [bool]$Joliet, [int]$SectorSize)
+        $extent = $RootExtentSector
+        $length = $RootDataLength
+        $record = $null
+        foreach ($component in $PathComponents) {
+            $record = & $FindChildRecord $Path $ReadIsoBytes $extent $length $component $Joliet $SectorSize
+            if ($null -eq $record) {
+                return [pscustomobject]@{ Record = $null; MissingComponent = $component }
+            }
+            $extent = $record.ExtentSector
+            $length = $record.DataLength
+        }
+        return [pscustomobject]@{ Record = $record; MissingComponent = $null }
+    }
+
+    $pvd = & $readIsoBytes $SourceIsoPath ([int64]16 * $sectorSize) $sectorSize
+    if ($pvd[0] -ne 1 -or [Text.Encoding]::ASCII.GetString($pvd, 1, 5) -ne 'CD001') {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath' has no Primary Volume Descriptor at sector 16 ('CD001' " +
+                "was not found there). This ISO's filesystem structure isn't one this technique " +
+                'understands.'
+            OutputPath = $null
+        }
+    }
+    $svd = & $readIsoBytes $SourceIsoPath ([int64]17 * $sectorSize) $sectorSize
+    $jolietEscape = $svd[88..90]
+    $isJolietEscape = ($svd[0] -eq 2 -and [Text.Encoding]::ASCII.GetString($svd, 1, 5) -eq 'CD001' -and
+        $jolietEscape[0] -eq 0x25 -and $jolietEscape[1] -eq 0x2F -and $jolietEscape[2] -eq 0x45)
+    if (-not $isJolietEscape) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath' has no Joliet (UCS-2 Level 3) Supplementary Volume " +
+                "Descriptor at sector 17 (the '%/E' escape sequence was not found there). This " +
+                "ISO's filesystem structure isn't one this technique understands."
+            OutputPath = $null
+        }
+    }
+
+    $primaryRootExtent = [int64][BitConverter]::ToUInt32($pvd, 156 + 2)
+    $primaryRootLength = [uint32][BitConverter]::ToUInt32($pvd, 156 + 10)
+    $jolietRootExtent = [int64][BitConverter]::ToUInt32($svd, 156 + 2)
+    $jolietRootLength = [uint32][BitConverter]::ToUInt32($svd, 156 + 10)
+
+    $primaryWalk = & $walkToGrubCfg $SourceIsoPath $readIsoBytes $findChildRecord $primaryRootExtent $primaryRootLength $pathComponents $false $sectorSize
+    if ($null -eq $primaryWalk.Record) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath': 'grub.cfg' was not found -- '$($primaryWalk.MissingComponent)' " +
+                "is missing while walking the primary ISO9660 tree's /$($pathComponents -join '/') " +
+                "path. This ISO's layout isn't one this technique understands."
+            OutputPath = $null
+        }
+    }
+    $jolietWalk = & $walkToGrubCfg $SourceIsoPath $readIsoBytes $findChildRecord $jolietRootExtent $jolietRootLength $pathComponents $true $sectorSize
+    if ($null -eq $jolietWalk.Record) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath': 'grub.cfg' was not found -- '$($jolietWalk.MissingComponent)' " +
+                "is missing while walking the Joliet tree's /$($pathComponents -join '/') path. " +
+                "This ISO's layout isn't one this technique understands."
+            OutputPath = $null
+        }
+    }
+
+    $primaryRecord = $primaryWalk.Record
+    $jolietRecord = $jolietWalk.Record
+    if ($primaryRecord.ExtentSector -ne $jolietRecord.ExtentSector -or $primaryRecord.DataLength -ne $jolietRecord.DataLength) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath': the primary and Joliet trees disagree about grub.cfg's " +
+                "own extent/length (primary: sector $($primaryRecord.ExtentSector), " +
+                "$($primaryRecord.DataLength) byte(s); Joliet: sector $($jolietRecord.ExtentSector), " +
+                "$($jolietRecord.DataLength) byte(s)). Refusing to patch blind."
+            OutputPath = $null
+        }
+    }
+
+    $dataLength = [int]$primaryRecord.DataLength
+    $sectorsUsed = [math]::Max(1, [int][math]::Ceiling($dataLength / [double]$sectorSize))
+    $maxBytesInExtent = $sectorsUsed * $sectorSize
+    $extentBytes = & $readIsoBytes $SourceIsoPath ([int64]$primaryRecord.ExtentSector * $sectorSize) $maxBytesInExtent
+    $contentText = [Text.Encoding]::ASCII.GetString($extentBytes, 0, $dataLength)
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.AddRange([string[]]($contentText -split "`n"))
+    $kernelLineIndex = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match [regex]::Escape($kernelLinePattern)) { $kernelLineIndex = $i; break }
+    }
+    if ($kernelLineIndex -lt 0) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath': grub.cfg has no recognizable Linux kernel boot line " +
+                "(expected a 'linux' line naming '$kernelLinePattern'). Refusing to patch blind."
+            OutputPath = $null
+        }
+    }
+    $trimmedLine = $lines[$kernelLineIndex].TrimEnd()
+    $newLine = if ($trimmedLine.EndsWith('---')) {
+        $head = $trimmedLine.Substring(0, $trimmedLine.Length - 3).TrimEnd()
+        "$head $autoinstallParam ---"
+    } else {
+        "$trimmedLine $autoinstallParam"
+    }
+    $lines[$kernelLineIndex] = $newLine
+    $newContentText = [string]::Join("`n", $lines)
+    $newContentBytes = [Text.Encoding]::ASCII.GetBytes($newContentText)
+
+    if ($newContentBytes.Length -gt $maxBytesInExtent) {
+        return [pscustomobject]@{
+            Patched = $false
+            Reason = "'$SourceIsoPath': grub.cfg's extent has no slack space left for this edit " +
+                "-- it has $maxBytesInExtent byte(s) available across $sectorsUsed sector(s), but " +
+                "the patched content needs $($newContentBytes.Length) byte(s) (a shortfall of " +
+                "$($newContentBytes.Length - $maxBytesInExtent) byte(s)). This in-place technique " +
+                'cannot grow a file across a sector boundary.'
+            OutputPath = $null
+        }
+    }
+
+    # Only once every check above holds: copy the whole source file, write the new content into
+    # the existing extent (zero-padding the rest of its sector(s)), then patch both trees' own
+    # grub.cfg directory-record data-length fields to the new length.
+    Copy-Item -LiteralPath $SourceIsoPath -Destination $OutputPath -Force -ErrorAction Stop
+    $outputStream = [IO.File]::Open($OutputPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $paddedContent = New-Object byte[] $maxBytesInExtent
+        [Array]::Copy($newContentBytes, 0, $paddedContent, 0, $newContentBytes.Length)
+        [void]$outputStream.Seek(([int64]$primaryRecord.ExtentSector * $sectorSize), [IO.SeekOrigin]::Begin)
+        $outputStream.Write($paddedContent, 0, $paddedContent.Length)
+
+        $newLengthLsb = [BitConverter]::GetBytes([uint32]$newContentBytes.Length)
+        $newLengthMsb = [BitConverter]::GetBytes([uint32]$newContentBytes.Length)
+        [Array]::Reverse($newLengthMsb)
+        foreach ($fieldOffset in @($primaryRecord.DataLengthFieldOffset, $jolietRecord.DataLengthFieldOffset)) {
+            [void]$outputStream.Seek($fieldOffset, [IO.SeekOrigin]::Begin)
+            $outputStream.Write($newLengthLsb, 0, 4)
+            $outputStream.Write($newLengthMsb, 0, 4)
+        }
+    } finally {
+        $outputStream.Dispose()
+    }
+    return [pscustomobject]@{ Patched = $true; Reason = $null; OutputPath = $OutputPath }
+}
+
 # Patches a Windows installer ISO's EFI boot-loader image (efi\microsoft\boot\efisys.bin) in place
 # with its own no-prompt variant (efisys_noprompt.bin), so Hyper-V Gen2's "Press any key to boot
 # from CD or DVD" prompt never appears. Never modifies $SourceIsoPath itself -- always writes a

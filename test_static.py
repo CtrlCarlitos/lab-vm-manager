@@ -798,6 +798,18 @@ class SourceContract(unittest.TestCase):
         self.assertIn('26.04', body)
         self.assertIn('Desktop', body)
 
+    # --- Linux unattended install, Task 2: autoinstall-parameter GRUB patch ---
+    def test_linux_boot_patch_function_exists(self):
+        self.assertIn('function New-LabPatchedBootableLinuxIso', self.s)
+    def test_linux_boot_patch_inserts_autoinstall(self):
+        body = self.s.split('function New-LabPatchedBootableLinuxIso {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('autoinstall', body)
+    def test_linux_boot_patch_updates_both_trees(self):
+        body = self.s.split('function New-LabPatchedBootableLinuxIso {', 1)[1].split('\nfunction ', 1)[0]
+        # Must locate and patch the directory-record length field in BOTH the plain ISO9660 tree and
+        # the Joliet tree, not just overwrite file content in place -- the file's length changes.
+        self.assertIn('Joliet', body)
+
     # --- Windows unattended install, Task 2: no-prompt boot-loader patch ---
     def test_boot_patch_function_exists(self):
         self.assertIn('function New-LabPatchedBootableIso', self.s)

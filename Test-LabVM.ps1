@@ -61,7 +61,8 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
     'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope',
     'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning',
-    'New-LabWindowsAnswerFileXml', 'Wait-LabPSDirectSession', 'Get-LabLinuxIsoInfo')
+    'New-LabWindowsAnswerFileXml', 'Wait-LabPSDirectSession', 'Get-LabLinuxIsoInfo',
+    'New-LabPatchedBootableLinuxIso')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -4126,6 +4127,318 @@ Test-Case 'Get-LabLinuxIsoInfo: Dismount-DiskImage still runs, in a finally, whe
     Assert-Throws { Get-LabLinuxIsoInfo 'C:\iso\bad.iso' } 'simulated .disk/info read failure'
     Assert-Equal $script:LinuxMountCalls 1
     Assert-Equal $script:LinuxDismountCalls 1
+}
+
+# --- Linux unattended install, Task 2: New-LabPatchedBootableLinuxIso ---
+# Pure byte-array math over a hand-built synthetic ISO9660+Joliet fixture -- no Mount-DiskImage, no
+# Hyper-V, matching this function's own "parse directly from the file on disk" discipline. Copy-Item
+# is the SAME global fake already defined above (around line 1073): a real local copy that
+# increments $script:CopyCalls, asserted against here exactly like the New-LabPatchedBootableIso
+# tests above do.
+
+# Builds one ISO9660 directory record (ECMA-119 9.1): LEN_DR (byte 0), extent location and data
+# length each in ISO9660's both-byte-order (LSB_MSB) 8-byte encoding, file flags (bit 0x02 =
+# directory), and a variable-length file identifier with a padding byte when its own length is
+# even (keeps the whole record an even number of bytes, per the standard).
+function New-LabIso9660DirRecordBytes {
+    param([uint32]$ExtentSector, [uint32]$DataLength, [byte]$FileFlags, [byte[]]$FileIdBytes)
+    $lenFi = $FileIdBytes.Length
+    $needsPad = (($lenFi % 2) -eq 0)
+    $lenDr = 33 + $lenFi + [int]$needsPad
+    $record = New-Object byte[] $lenDr
+    $record[0] = [byte]$lenDr
+    $record[1] = 0
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$ExtentSector), 0, $record, 2, 4)
+    $extentMsb = [BitConverter]::GetBytes([uint32]$ExtentSector); [Array]::Reverse($extentMsb)
+    [Array]::Copy($extentMsb, 0, $record, 6, 4)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$DataLength), 0, $record, 10, 4)
+    $lengthMsb = [BitConverter]::GetBytes([uint32]$DataLength); [Array]::Reverse($lengthMsb)
+    [Array]::Copy($lengthMsb, 0, $record, 14, 4)
+    $record[25] = $FileFlags
+    [Array]::Copy([BitConverter]::GetBytes([uint16]1), 0, $record, 28, 2)
+    $seqMsb = [BitConverter]::GetBytes([uint16]1); [Array]::Reverse($seqMsb)
+    [Array]::Copy($seqMsb, 0, $record, 30, 2)
+    $record[32] = [byte]$lenFi
+    [Array]::Copy($FileIdBytes, 0, $record, 33, $lenFi)
+    return $record
+}
+# Packs directory records back-to-back into a single 2048-byte sector -- the remaining bytes stay
+# zero, which IS the "no more records in this sector" signal this fixture's own records rely on.
+function New-LabIso9660DirectorySectorBytes {
+    param([object[]]$Records)
+    $sector = New-Object byte[] 2048
+    $pos = 0
+    foreach ($record in $Records) {
+        [Array]::Copy($record, 0, $sector, $pos, $record.Length)
+        $pos += $record.Length
+    }
+    return $sector
+}
+
+# Hand-builds a minimal, valid-shaped ISO9660+Joliet fixture file: a Primary Volume Descriptor
+# (sector 16) and a Joliet Supplementary Volume Descriptor (sector 17, identified by the UCS-2
+# Level 3 "%/E" escape sequence at byte offset 88), each with their own root directory record
+# (offset 156, 34 bytes -- fixed, since the root's own file identifier is a single NUL byte)
+# pointing at a parallel root -> boot -> grub -> grub.cfg chain of single-sector directory extents
+# (sectors 19/20 root, 21/22 boot, 23/24 grub; primary/Joliet respectively), with grub.cfg's own
+# content at sector 25 in BOTH trees -- a real ISO keeps ONE copy of a file's data referenced by
+# both namespaces, which is exactly what this fixture mirrors. $GrubCfgContent becomes grub.cfg's
+# exact recorded data length -- it is written at sector 25 verbatim, with the sector's remainder
+# left zero (real slack space to grow into, unless $GrubCfgContent itself is already a full 2048
+# bytes). $IncludeGrubCfgEntry=$false omits grub.cfg's own entry from the 'grub' directory extent
+# in both trees (simulating an ISO layout this technique's fixed root/boot/grub/grub.cfg path
+# doesn't find).
+function New-LabFakeLinuxIso9660 {
+    param([string]$Path, [string]$GrubCfgContent, [bool]$IncludeGrubCfgEntry = $true)
+    $sectorSize = 2048
+    $totalSectors = 30
+    $rootExtentPrimary = 19; $rootExtentJoliet = 20
+    $bootExtentPrimary = 21; $bootExtentJoliet = 22
+    $grubExtentPrimary = 23; $grubExtentJoliet = 24
+    $grubCfgExtent = 25
+
+    $bytes = New-Object byte[] ($totalSectors * $sectorSize)
+
+    $grubCfgBytes = [Text.Encoding]::ASCII.GetBytes($GrubCfgContent)
+    if ($grubCfgBytes.Length -gt $sectorSize) { throw "Fixture GrubCfgContent must fit in this fixture's single-sector extent." }
+    [Array]::Copy($grubCfgBytes, 0, $bytes, ($grubCfgExtent * $sectorSize), $grubCfgBytes.Length)
+
+    $dot = [byte[]]@(0)
+    $dotDot = [byte[]]@(1)
+
+    # 'grub' directory extents: '.', '..', and (unless suppressed) grub.cfg itself.
+    $grubRecordsPrimary = [Collections.Generic.List[object]]::new()
+    $grubRecordsPrimary.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot))
+    $grubRecordsPrimary.Add((New-LabIso9660DirRecordBytes -ExtentSector $bootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot))
+    $grubRecordsJoliet = [Collections.Generic.List[object]]::new()
+    $grubRecordsJoliet.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot))
+    $grubRecordsJoliet.Add((New-LabIso9660DirRecordBytes -ExtentSector $bootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot))
+    if ($IncludeGrubCfgEntry) {
+        $grubRecordsPrimary.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubCfgExtent -DataLength $grubCfgBytes.Length -FileFlags 0x00 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('grub.cfg'))))
+        $grubRecordsJoliet.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubCfgExtent -DataLength $grubCfgBytes.Length -FileFlags 0x00 -FileIdBytes ([Text.Encoding]::BigEndianUnicode.GetBytes('grub.cfg'))))
+    }
+    [Array]::Copy((New-LabIso9660DirectorySectorBytes $grubRecordsPrimary.ToArray()), 0, $bytes, ($grubExtentPrimary * $sectorSize), $sectorSize)
+    [Array]::Copy((New-LabIso9660DirectorySectorBytes $grubRecordsJoliet.ToArray()), 0, $bytes, ($grubExtentJoliet * $sectorSize), $sectorSize)
+
+    # 'boot' directory extents: '.', '..', and 'grub'.
+    $bootRecordsPrimary = @(
+        (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $grubExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('grub')))
+    )
+    $bootRecordsJoliet = @(
+        (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $grubExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::BigEndianUnicode.GetBytes('grub')))
+    )
+    [Array]::Copy((New-LabIso9660DirectorySectorBytes $bootRecordsPrimary), 0, $bytes, ($bootExtentPrimary * $sectorSize), $sectorSize)
+    [Array]::Copy((New-LabIso9660DirectorySectorBytes $bootRecordsJoliet), 0, $bytes, ($bootExtentJoliet * $sectorSize), $sectorSize)
+
+    # Root directory extents: '.', '..', and 'boot'.
+    $rootRecordsPrimary = @(
+        (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('boot')))
+    )
+    $rootRecordsJoliet = @(
+        (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot),
+        (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::BigEndianUnicode.GetBytes('boot')))
+    )
+    [Array]::Copy((New-LabIso9660DirectorySectorBytes $rootRecordsPrimary), 0, $bytes, ($rootExtentPrimary * $sectorSize), $sectorSize)
+    [Array]::Copy((New-LabIso9660DirectorySectorBytes $rootRecordsJoliet), 0, $bytes, ($rootExtentJoliet * $sectorSize), $sectorSize)
+
+    # Primary Volume Descriptor (sector 16): type 1, 'CD001', root directory record at offset 156.
+    $pvd = New-Object byte[] $sectorSize
+    $pvd[0] = 1
+    [Array]::Copy([Text.Encoding]::ASCII.GetBytes('CD001'), 0, $pvd, 1, 5)
+    $pvd[6] = 1
+    $rootRecordPvd = New-LabIso9660DirRecordBytes -ExtentSector $rootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot
+    [Array]::Copy($rootRecordPvd, 0, $pvd, 156, $rootRecordPvd.Length)
+    [Array]::Copy($pvd, 0, $bytes, (16 * $sectorSize), $sectorSize)
+
+    # Supplementary (Joliet) Volume Descriptor (sector 17): type 2, 'CD001', the UCS-2 Level 3
+    # escape sequence (0x25 0x2F 0x45, "%/E") at byte offset 88, root directory record at offset 156.
+    $svd = New-Object byte[] $sectorSize
+    $svd[0] = 2
+    [Array]::Copy([Text.Encoding]::ASCII.GetBytes('CD001'), 0, $svd, 1, 5)
+    $svd[6] = 1
+    $svd[88] = 0x25; $svd[89] = 0x2F; $svd[90] = 0x45
+    $rootRecordSvd = New-LabIso9660DirRecordBytes -ExtentSector $rootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot
+    [Array]::Copy($rootRecordSvd, 0, $svd, 156, $rootRecordSvd.Length)
+    [Array]::Copy($svd, 0, $bytes, (17 * $sectorSize), $sectorSize)
+
+    [IO.File]::WriteAllBytes($Path, $bytes)
+}
+
+# Independent re-derivation (NOT a call into New-LabPatchedBootableLinuxIso) of grub.cfg's own
+# directory record in one tree, by walking root -> boot -> grub -> grub.cfg from raw bytes per
+# ECMA-119 9.1, the same way the real function is expected to. Used to read back and verify the
+# patched output without just trusting the function's own internal offsets.
+function Find-LabFakeDirRecord {
+    param([byte[]]$Bytes, [int]$ExtentSector, [int]$DataLength, [string]$Name, [bool]$Joliet)
+    $sectorSize = 2048
+    $offset = $ExtentSector * $sectorSize
+    $pos = 0
+    while ($pos -lt $DataLength) {
+        $lenDr = [int]$Bytes[$offset + $pos]
+        if ($lenDr -eq 0) { break }
+        $lenFi = [int]$Bytes[$offset + $pos + 32]
+        $fileIdBytes = $Bytes[($offset + $pos + 33)..($offset + $pos + 33 + $lenFi - 1)]
+        $isDotEntry = ($lenFi -eq 1 -and ($fileIdBytes[0] -eq 0 -or $fileIdBytes[0] -eq 1))
+        if (-not $isDotEntry) {
+            $fileName = if ($Joliet) { [Text.Encoding]::BigEndianUnicode.GetString($fileIdBytes) } else { [Text.Encoding]::ASCII.GetString($fileIdBytes) }
+            if ($fileName -ceq $Name) {
+                return [pscustomobject]@{
+                    ExtentSector = [int][BitConverter]::ToUInt32($Bytes, $offset + $pos + 2)
+                    DataLength = [int][BitConverter]::ToUInt32($Bytes, $offset + $pos + 10)
+                    DataLengthFieldOffset = [int]($offset + $pos + 10)
+                }
+            }
+        }
+        $pos += $lenDr
+    }
+    return $null
+}
+function Get-LabFakeLinuxGrubCfgInfo {
+    param([string]$Path, [bool]$Joliet)
+    $sectorSize = 2048
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $vdOffset = $(if ($Joliet) { 17 } else { 16 }) * $sectorSize
+    $extent = [int][BitConverter]::ToUInt32($bytes, $vdOffset + 156 + 2)
+    $length = [int][BitConverter]::ToUInt32($bytes, $vdOffset + 156 + 10)
+    $record = $null
+    foreach ($name in @('boot', 'grub', 'grub.cfg')) {
+        $record = Find-LabFakeDirRecord -Bytes $bytes -ExtentSector $extent -DataLength $length -Name $name -Joliet $Joliet
+        if ($null -eq $record) { return $null }
+        $extent = $record.ExtentSector
+        $length = $record.DataLength
+    }
+    $contentStart = $record.ExtentSector * $sectorSize
+    $contentBytes = $bytes[$contentStart..($contentStart + $record.DataLength - 1)]
+    return [pscustomobject]@{
+        ExtentSector = $record.ExtentSector
+        DataLength = $record.DataLength
+        DataLengthFieldOffset = $record.DataLengthFieldOffset
+        Content = [Text.Encoding]::ASCII.GetString($contentBytes)
+    }
+}
+
+Test-Case 'New-LabPatchedBootableLinuxIso: happy path inserts autoinstall and updates both trees, everything else unchanged' {
+    $script:CopyCalls = 0; $script:CopyMode = 'Normal'
+    $kernelLine = "`tlinux`t/casper/vmlinuz quiet splash ---"
+    $grubCfgContent = "menuentry 'Try or Install Ubuntu' {`n$kernelLine`n`tinitrd`t/casper/initrd`n}`n"
+    $expectedPatchedLine = "`tlinux`t/casper/vmlinuz quiet splash autoinstall ---"
+    $expectedContent = "menuentry 'Try or Install Ubuntu' {`n$expectedPatchedLine`n`tinitrd`t/casper/initrd`n}`n"
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        New-LabFakeLinuxIso9660 -Path $isoPath -GrubCfgContent $grubCfgContent
+        $sourceBytes = [IO.File]::ReadAllBytes($isoPath)
+        $beforePrimary = Get-LabFakeLinuxGrubCfgInfo -Path $isoPath -Joliet $false
+        $beforeJoliet = Get-LabFakeLinuxGrubCfgInfo -Path $isoPath -Joliet $true
+        Assert-Equal $beforePrimary.Content $grubCfgContent
+        Assert-Equal $beforeJoliet.Content $grubCfgContent
+
+        $result = New-LabPatchedBootableLinuxIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $true
+        Assert-Equal $result.OutputPath $outputPath
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $true
+
+        $afterPrimary = Get-LabFakeLinuxGrubCfgInfo -Path $outputPath -Joliet $false
+        $afterJoliet = Get-LabFakeLinuxGrubCfgInfo -Path $outputPath -Joliet $true
+        Assert-Equal $afterPrimary.Content $expectedContent
+        Assert-Equal $afterJoliet.Content $expectedContent
+        Assert-Equal $afterPrimary.DataLength ([Text.Encoding]::ASCII.GetByteCount($expectedContent))
+        Assert-Equal $afterJoliet.DataLength $afterPrimary.DataLength
+        Assert-Equal $afterPrimary.ExtentSector $beforePrimary.ExtentSector
+        Assert-Equal $afterJoliet.ExtentSector $beforeJoliet.ExtentSector
+
+        # Everything outside the touched regions (grub.cfg's content sector, plus both trees' own
+        # 8-byte data-length fields) must be byte-identical to the original source ISO: rebuild
+        # those regions back to their original content and hash-compare the whole file.
+        $outputBytes = [IO.File]::ReadAllBytes($outputPath)
+        Assert-Equal $outputBytes.Length $sourceBytes.Length
+        $reconstructed = [byte[]]$outputBytes.Clone()
+        $sectorSize = 2048
+        $contentSectorStart = $beforePrimary.ExtentSector * $sectorSize
+        [Array]::Copy($sourceBytes, $contentSectorStart, $reconstructed, $contentSectorStart, $sectorSize)
+        [Array]::Copy($sourceBytes, $beforePrimary.DataLengthFieldOffset, $reconstructed, $beforePrimary.DataLengthFieldOffset, 8)
+        [Array]::Copy($sourceBytes, $beforeJoliet.DataLengthFieldOffset, $reconstructed, $beforeJoliet.DataLengthFieldOffset, 8)
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        $beforeHash = [Convert]::ToBase64String($sha256.ComputeHash($sourceBytes))
+        $afterHash = [Convert]::ToBase64String($sha256.ComputeHash($reconstructed))
+        Assert-Equal $afterHash $beforeHash
+
+        Assert-Equal $script:CopyCalls 1
+    } finally {
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableLinuxIso: insufficient slack space refuses, no output file created' {
+    $script:CopyCalls = 0; $script:CopyMode = 'Normal'
+    $kernelLine = "`tlinux`t/casper/vmlinuz quiet splash ---`n"
+    $padLength = 2048 - $kernelLine.Length
+    $grubCfgContent = $kernelLine + ('#' * $padLength)
+    if ($grubCfgContent.Length -ne 2048) { throw "Fixture content is $($grubCfgContent.Length) byte(s), expected exactly 2048 to leave no slack." }
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        New-LabFakeLinuxIso9660 -Path $isoPath -GrubCfgContent $grubCfgContent
+
+        $result = New-LabPatchedBootableLinuxIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $false
+        if ($result.Reason -notmatch 'slack|space') { throw "Reason did not mention space/slack: $($result.Reason)" }
+        Assert-Equal $result.OutputPath $null
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
+        Assert-Equal $script:CopyCalls 0
+    } finally {
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableLinuxIso: no recognizable linux/kernel line refuses, no output file created' {
+    $script:CopyCalls = 0; $script:CopyMode = 'Normal'
+    $grubCfgContent = "menuentry 'Nothing recognizable' {`n`techo nope`n}`n"
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        New-LabFakeLinuxIso9660 -Path $isoPath -GrubCfgContent $grubCfgContent
+
+        $result = New-LabPatchedBootableLinuxIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $false
+        if ($result.Reason -notmatch 'linux|kernel') { throw "Reason did not say no recognizable kernel line was found: $($result.Reason)" }
+        Assert-Equal $result.OutputPath $null
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
+        Assert-Equal $script:CopyCalls 0
+    } finally {
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
+Test-Case 'New-LabPatchedBootableLinuxIso: grub.cfg not found at the expected path refuses, no output file created' {
+    $script:CopyCalls = 0; $script:CopyMode = 'Normal'
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        New-LabFakeLinuxIso9660 -Path $isoPath -GrubCfgContent 'unused' -IncludeGrubCfgEntry $false
+
+        $result = New-LabPatchedBootableLinuxIso $isoPath $outputPath
+
+        Assert-Equal $result.Patched $false
+        if ($result.Reason -notmatch 'grub\.cfg') { throw "Reason did not name grub.cfg: $($result.Reason)" }
+        if ($result.Reason -notmatch 'not found') { throw "Reason did not say grub.cfg was not found: $($result.Reason)" }
+        Assert-Equal $result.OutputPath $null
+        Assert-Equal (Test-Path -LiteralPath $outputPath -PathType Leaf) $false
+        Assert-Equal $script:CopyCalls 0
+    } finally {
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."
