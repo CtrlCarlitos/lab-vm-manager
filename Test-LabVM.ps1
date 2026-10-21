@@ -3497,7 +3497,7 @@ function Invoke-LabSeedIsoWithFakeImage {
                     $script:SeedStaged[$file.Substring($prefix.Length)] = [IO.File]::ReadAllBytes($file)
                 }
             }
-            $image = [pscustomobject]@{ VolumeName = $null; Root = $root }
+            $image = [pscustomobject]@{ VolumeName = $null; FileSystemsToCreate = $null; Root = $root }
             $image | Add-Member -MemberType ScriptMethod -Name CreateResultImage -Value { [pscustomobject]@{ ImageStream = 'fake-stream' } }
             return $image
         }

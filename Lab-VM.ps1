@@ -1692,6 +1692,15 @@ function New-LabSeedIso {
     } catch {
         throw "IMAPI2FS.MsftFileSystemImage (Windows Image Mastering API) could not be instantiated: $($_.Exception.Message). This COM component ships with Windows; a stripped-down install may be missing it."
     }
+    # FsiFileSystemISO9660 (1) | FsiFileSystemJoliet (2): IMAPI2FS defaults to UDF-only
+    # (FsiFileSystemUDF = 4) when this is left unset, which a Windows unattend.xml reader (file-path
+    # based) never notices, but which cloud-init's NoCloud device-based "cidata" datasource detection
+    # does not recognize at all -- confirmed live (2026-10-21): a UDF-only seed disc left Subiquity
+    # with zero autoinstall config (every section fell back to interactive) even though cloud-init
+    # itself reported success, because it silently used an empty local seed instead of this disc.
+    # ISO9660 makes the volume the ISO9660 type cloud-init's datasource scan expects; Joliet is added
+    # so case/length aren't a concern for any future file name this function stages.
+    $image.FileSystemsToCreate = 3
     $image.VolumeName = $VolumeLabel
     $stagingDir = Join-Path ([IO.Path]::GetTempPath()) ('labseediso-' + [guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($stagingDir)
