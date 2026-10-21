@@ -547,9 +547,32 @@ function Set-LabSshConnectionSettings {
 
 function Get-LabGuestAddressCandidates {
     param([guid]$VMId)
-    $addresses = @(Get-VMNetworkAdapter -VM (Get-LabVM $VMId) -ErrorAction Stop |
-        Select-Object -ExpandProperty IPAddresses)
-    return @($addresses | Where-Object { $_ -notmatch '^169\.254\.' -and $_ -notmatch '^fe80:' })
+    $adapters = @(Get-VMNetworkAdapter -VM (Get-LabVM $VMId) -ErrorAction Stop)
+    $kvpAddresses = @($adapters | Select-Object -ExpandProperty IPAddresses)
+    # KVP/Data-Exchange reporting (above) needs a cooperating guest-side daemon (hv_kvp_daemon)
+    # that has successfully bound its VMBus device. Confirmed live (2026-10-21) against a real
+    # Ubuntu Desktop 26.04.1 guest on Default Switch: that daemon's own BindsTo device never came
+    # up (a documented, host-level Hyper-V/Linux integration-services limitation -- Key-Value Pair
+    # Exchange showed Enabled=True but status "No Contact" on several unrelated pre-existing Linux
+    # VMs on the same host too, so this is not something this script's autoinstall config can fix)
+    # even though the guest had a perfectly normal DHCP-assigned address the whole time. The host's
+    # own ARP/neighbor table is probed as a second source, matched by the adapter's own MAC address
+    # (known from VM configuration, not guest-reported): it only needs the guest to have exchanged
+    # ANY traffic over the switch, which obtaining that DHCP lease already does, with no daemon or
+    # cooperation inside the guest required at all.
+    $macAddresses = @($adapters | Select-Object -ExpandProperty MacAddress |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { ($_ -replace '[^0-9A-Fa-f]', '').ToLowerInvariant() })
+    $arpAddresses = @()
+    if ($macAddresses.Count -gt 0) {
+        $arpAddresses = @(Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.State -in @('Reachable', 'Stale', 'Permanent') -and
+                $macAddresses -contains (($_.LinkLayerAddress -replace '[^0-9A-Fa-f]', '').ToLowerInvariant())
+            } | Select-Object -ExpandProperty IPAddress)
+    }
+    $addresses = @($kvpAddresses) + @($arpAddresses)
+    return @($addresses | Where-Object { $_ -notmatch '^169\.254\.' -and $_ -notmatch '^fe80:' } | Select-Object -Unique)
 }
 
 function Resolve-LabWindowsCredential {
