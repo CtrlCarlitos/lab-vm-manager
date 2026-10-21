@@ -2540,6 +2540,91 @@ function Get-LabBootEntryKind {
     return 'Other'
 }
 
+function Set-LabVMUnattendedLinuxInstallMedia {
+    param([guid]$VMId, [string]$LinuxIsoPath, [string]$SeedIsoPath)
+    # Unlike Set-LabVMInstallMedia (manual-install flow, reuses/adds a single drive on a VM that may
+    # already have one), this is only ever called against a VM this plan just created itself: zero
+    # existing DVD drives, so there is no "choose among several drives" ambiguity to handle.
+    $vm = Assert-LabVMOff $VMId
+    if ([int]$vm.Generation -ne 2) {
+        throw "'$($vm.Name)' is Generation $($vm.Generation). Unattended Linux install requires Generation 2."
+    }
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    if ($drives.Count -gt 0) {
+        throw "'$($vm.Name)' already has $($drives.Count) DVD drive(s) attached; this function is for a freshly created VM with none yet."
+    }
+
+    # Re-validate the Linux ISO immediately before attaching it -- not once up front for both -- so
+    # a problem with the Linux ISO is caught before anything is touched at all.
+    if (-not (Test-Path -LiteralPath $LinuxIsoPath -PathType Leaf)) {
+        throw "ISO '$LinuxIsoPath' no longer exists."
+    }
+    try {
+        $stream = [IO.File]::OpenRead($LinuxIsoPath)
+        try { $length = $stream.Length } finally { $stream.Close() }
+    } catch {
+        throw "ISO '$LinuxIsoPath' could not be opened for reading ($($_.Exception.Message))."
+    }
+    if ($length -le 0) { throw "ISO '$LinuxIsoPath' is empty (0 bytes)." }
+    $linuxDrive = Add-VMDvdDrive -VM $vm -Confirm:$false -Passthru -ErrorAction Stop
+    Set-VMDvdDrive -VMDvdDrive $linuxDrive -Path $LinuxIsoPath -Confirm:$false -ErrorAction Stop
+
+    # Re-validate the seed ISO immediately before attaching it, too -- so a problem with the seed ISO
+    # is caught before the Linux drive above is touched, except that the Linux drive already was:
+    # a seed-ISO failure here is reported with that drive left attached, not rolled back.
+    if (-not (Test-Path -LiteralPath $SeedIsoPath -PathType Leaf)) {
+        throw "ISO '$SeedIsoPath' no longer exists."
+    }
+    try {
+        $stream = [IO.File]::OpenRead($SeedIsoPath)
+        try { $length = $stream.Length } finally { $stream.Close() }
+    } catch {
+        throw "ISO '$SeedIsoPath' could not be opened for reading ($($_.Exception.Message))."
+    }
+    if ($length -le 0) { throw "ISO '$SeedIsoPath' is empty (0 bytes)." }
+    $seedDrive = Add-VMDvdDrive -VM $vm -Confirm:$false -Passthru -ErrorAction Stop
+    Set-VMDvdDrive -VMDvdDrive $seedDrive -Path $SeedIsoPath -Confirm:$false -ErrorAction Stop
+
+    # Both new drives are DVD-kind; which one ends up first doesn't matter -- UEFI firmware skips a
+    # non-bootable disc and falls through, so the seed drive being tried first costs nothing.
+    Set-LabVMBootOrder $VMId 'Dvd'
+
+    # Set-LabVMBootOrder only guarantees that SOME DVD-kind entry was recognized and moved first. If
+    # only the seed drive's entry was, it still "succeeds", and the real failure (the installer never
+    # boots) would surface only as an opaque PowerShell Direct timeout much later. So re-read the
+    # applied order and confirm that one of its leading DVD entries is the Linux installer drive.
+    $appliedOrder = @((Get-VMFirmware -VM $vm -ErrorAction Stop).BootOrder)
+    $linuxEntryFound = $false
+    foreach ($entry in $appliedOrder) {
+        if ((Get-LabBootEntryKind $entry) -ne 'Dvd') { break }
+        $device = $entry
+        $deviceProperty = $entry.PSObject.Properties['Device']
+        if ($null -ne $deviceProperty -and $null -ne $deviceProperty.Value) { $device = $deviceProperty.Value }
+        $pathProperty = $device.PSObject.Properties['Path']
+        if ($null -ne $pathProperty -and [string]$pathProperty.Value -eq $LinuxIsoPath) { $linuxEntryFound = $true; break }
+    }
+    if (-not $linuxEntryFound) {
+        throw "'$($vm.Name)': the boot order was set DVD-first, but the Linux installer drive's own boot entry (for '$LinuxIsoPath') was not confirmed among the leading DVD entries, so the VM would likely never boot the installer. Both drives were left attached. Check Firmware > Boot order in Hyper-V Manager."
+    }
+}
+
+function Complete-LabLinuxProvisioning {
+    param([guid]$VMId, [string]$LinuxIsoPath, [string]$SeedIsoPath)
+    $vm = Assert-LabVMOff $VMId
+    $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
+    $seedDrive = @($drives | Where-Object { [string]$_.Path -eq $SeedIsoPath })
+    $linuxDrive = @($drives | Where-Object { [string]$_.Path -eq $LinuxIsoPath })
+    if ($seedDrive.Count -ne 1 -or $linuxDrive.Count -ne 1) {
+        throw "'$($vm.Name)': could not find exactly one DVD drive attached to each of the seed ISO and the Linux ISO (found $($seedDrive.Count) matching the seed path, $($linuxDrive.Count) matching the Linux ISO path). Check the drives manually in Hyper-V Manager."
+    }
+    # The seed drive (its job was only to deliver the NoCloud user-data/meta-data to the installer) is
+    # removed entirely. The installer drive is only ejected, keeping the drive itself in place --
+    # matching Remove-LabVMInstallMedia's own "the drive itself stays" behavior.
+    Remove-VMDvdDrive -VMDvdDrive $seedDrive[0] -Confirm:$false -ErrorAction Stop
+    Set-VMDvdDrive -VMDvdDrive $linuxDrive[0] -Path $null -Confirm:$false -ErrorAction Stop
+    Set-LabVMBootOrder $VMId 'Disk'
+}
+
 function Set-LabVMBootOrder {
     param([guid]$VMId, [ValidateSet('Dvd', 'Disk')][string]$Preference)
     # Deliberately generic: puts the chosen device class first without deleting any other existing

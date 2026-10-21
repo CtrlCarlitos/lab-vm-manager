@@ -63,7 +63,7 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning',
     'New-LabWindowsAnswerFileXml', 'Wait-LabPSDirectSession', 'Get-LabLinuxIsoInfo',
     'New-LabPatchedBootableLinuxIso', 'ConvertTo-LabPosixShellSingleQuoted', 'Test-LabLinuxUserName',
-    'New-LabLinuxAutoinstallUserData')
+    'New-LabLinuxAutoinstallUserData', 'Set-LabVMUnattendedLinuxInstallMedia', 'Complete-LabLinuxProvisioning')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -4589,6 +4589,160 @@ Test-Case 'New-LabLinuxAutoinstallUserData: a password containing a single quote
 
     Assert-Equal $recoveredUserName $userName
     Assert-Equal $recoveredPassword $plainPassword
+}
+
+# --- Two-drive unattended-install media attach and post-install cleanup, Linux (Task 4) ---
+# Mirrors the Windows Task 3 cases above, retargeted at the Linux functions.
+Test-Case 'Set-LabVMUnattendedLinuxInstallMedia attaches both drives in order and sets DVD boot order' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    $linuxIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-linux-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    # The entries the two new drives would get on a live VM: the seed drive's listed first, so the
+    # Linux-drive check must look past it rather than only at the very first entry.
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Dvd' $seedIso), (New-FakeBootEntry 'Dvd' $linuxIso))
+    [IO.File]::WriteAllBytes($linuxIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Set-LabVMUnattendedLinuxInstallMedia $script:FakeId $linuxIso $seedIso
+        Assert-Equal $script:AddVMDvdDriveCalls 2
+        Assert-Equal $script:FakeDvdDrives.Count 2
+        Assert-Equal $script:FakeDvdDrives[0].Path $linuxIso
+        Assert-Equal $script:FakeDvdDrives[1].Path $seedIso
+        Assert-Equal ($script:SetVMDvdDriveCalls -join '|') "$linuxIso|$seedIso"
+        Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
+        $applied = @($script:SetVMFirmwareBootOrderCalls[0])
+        Assert-Equal (Get-LabBootEntryKind $applied[0]) 'Dvd'
+        Assert-Equal (Get-LabBootEntryKind $applied[1]) 'Dvd'
+        Assert-Equal (Get-LabBootEntryKind $applied[2]) 'Disk'
+    } finally {
+        [IO.File]::Delete($linuxIso)
+        [IO.File]::Delete($seedIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Set-LabVMUnattendedLinuxInstallMedia throws when only the SEED drive has a recognized boot entry, not the Linux installer drive' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    $linuxIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-linux-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    # Only the seed drive's entry is recognizable: Set-LabVMBootOrder itself succeeds (some DVD
+    # entry exists and is moved first), so only the new Linux-drive check can catch this.
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Disk'), (New-FakeBootEntry 'Nic'), (New-FakeBootEntry 'Dvd' $seedIso))
+    [IO.File]::WriteAllBytes($linuxIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Assert-Throws { Set-LabVMUnattendedLinuxInstallMedia $script:FakeId $linuxIso $seedIso } "Linux installer drive's own boot entry"
+        # The reorder really did succeed first: this is the specific post-reorder check, not
+        # Set-LabVMBootOrder's own generic "no Dvd entry was recognized" refusal.
+        Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
+        Assert-Equal (Get-LabBootEntryKind @($script:SetVMFirmwareBootOrderCalls[0])[0]) 'Dvd'
+        Assert-Equal $script:FakeDvdDrives.Count 2
+    } finally {
+        [IO.File]::Delete($linuxIso)
+        [IO.File]::Delete($seedIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Set-LabVMUnattendedLinuxInstallMedia refuses a VM that already has a DVD drive, before any mutation' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = $null })
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $linuxIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-linux-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($linuxIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Assert-Throws { Set-LabVMUnattendedLinuxInstallMedia $script:FakeId $linuxIso $seedIso } 'DVD drive'
+        Assert-Equal $script:AddVMDvdDriveCalls 0
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+    } finally {
+        [IO.File]::Delete($linuxIso)
+        [IO.File]::Delete($seedIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Set-LabVMUnattendedLinuxInstallMedia refuses a Generation 1 VM, before any mutation' {
+    $script:FakeVM.Generation = 1
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $linuxIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-linux-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $seedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($linuxIso, [byte[]]@(1, 2, 3))
+    [IO.File]::WriteAllBytes($seedIso, [byte[]]@(4, 5, 6))
+    try {
+        Assert-Throws { Set-LabVMUnattendedLinuxInstallMedia $script:FakeId $linuxIso $seedIso } 'Generation'
+        Assert-Equal $script:AddVMDvdDriveCalls 0
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+    } finally {
+        $script:FakeVM.Generation = 2
+        [IO.File]::Delete($linuxIso)
+        [IO.File]::Delete($seedIso)
+    }
+}
+Test-Case 'Set-LabVMUnattendedLinuxInstallMedia leaves the Linux drive attached, unrolled back, when the seed ISO fails re-validation' {
+    $script:FakeDvdDrives.Clear()
+    $script:AddVMDvdDriveCalls = 0
+    $script:SetVMDvdDriveCalls.Clear()
+    $linuxIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-linux-' + [guid]::NewGuid().ToString('N') + '.iso')
+    [IO.File]::WriteAllBytes($linuxIso, [byte[]]@(1, 2, 3))
+    $missingSeedIso = Join-Path ([IO.Path]::GetTempPath()) ('labiso-seed-missing-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        Assert-Throws { Set-LabVMUnattendedLinuxInstallMedia $script:FakeId $linuxIso $missingSeedIso } 'no longer exists'
+        # Proves the ordering: the Linux drive (drive 1) was already added and attached before the
+        # seed ISO's re-validation ran and threw -- so no cleanup/rollback happens here.
+        Assert-Equal $script:AddVMDvdDriveCalls 1
+        Assert-Equal $script:FakeDvdDrives.Count 1
+        Assert-Equal $script:FakeDvdDrives[0].Path $linuxIso
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+        Assert-Equal $script:SetVMDvdDriveCalls[0] $linuxIso
+    } finally {
+        [IO.File]::Delete($linuxIso)
+        $script:FakeDvdDrives.Clear()
+    }
+}
+Test-Case 'Complete-LabLinuxProvisioning removes the seed drive and ejects (not removes) the installer drive' {
+    $linuxIso = 'D:\iso\linux.iso'
+    $seedIso = 'D:\iso\seed.iso'
+    $script:FakeDvdDrives.Clear()
+    $linuxDrive = [pscustomobject]@{ Path = $linuxIso }
+    $seedDrive = [pscustomobject]@{ Path = $seedIso }
+    $script:FakeDvdDrives.Add($linuxDrive)
+    $script:FakeDvdDrives.Add($seedDrive)
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:RemoveVMDvdDriveCalls.Clear()
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Dvd'), (New-FakeBootEntry 'Disk'))
+    Complete-LabLinuxProvisioning $script:FakeId $linuxIso $seedIso
+    Assert-Equal $script:RemoveVMDvdDriveCalls.Count 1
+    Assert-Equal ([object]::ReferenceEquals($script:RemoveVMDvdDriveCalls[0], $seedDrive)) $true
+    Assert-Equal $script:FakeDvdDrives.Count 1
+    Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+    Assert-Equal $script:SetVMDvdDriveCalls[0] ''
+    Assert-Equal $linuxDrive.Path ''
+    Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
+    $applied = @($script:SetVMFirmwareBootOrderCalls[0])
+    Assert-Equal (Get-LabBootEntryKind $applied[0]) 'Disk'
+}
+Test-Case 'Complete-LabLinuxProvisioning throws clearly when neither known ISO path matches an attached drive' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'D:\iso\other1.iso' })
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'D:\iso\other2.iso' })
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:RemoveVMDvdDriveCalls.Clear()
+    try {
+        Assert-Throws { Complete-LabLinuxProvisioning $script:FakeId 'D:\iso\linux.iso' 'D:\iso\seed.iso' } 'could not find'
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+        Assert-Equal $script:RemoveVMDvdDriveCalls.Count 0
+    } finally {
+        $script:FakeDvdDrives.Clear()
+    }
 }
 
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."

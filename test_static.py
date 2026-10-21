@@ -837,6 +837,22 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function New-LabPatchedBootableIso {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('.Length', body)
 
+    # --- Linux unattended install, Task 4: two-drive media attach and post-install cleanup ---
+    def test_linux_unattended_media_functions_exist(self):
+        for name in ['Set-LabVMUnattendedLinuxInstallMedia', 'Complete-LabLinuxProvisioning']:
+            self.assertIn('function ' + name + ' {', self.s)
+    def test_linux_unattended_media_refuses_existing_drives(self):
+        body = self.s.split('function Set-LabVMUnattendedLinuxInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Get-VMDvdDrive', body)
+        self.assertIn('throw', body)
+    def test_linux_unattended_media_revalidates_before_attach(self):
+        body = self.s.split('function Set-LabVMUnattendedLinuxInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertLess(body.index('OpenRead'), body.index('Add-VMDvdDrive'))
+    def test_linux_unattended_cleanup_keeps_installer_drive(self):
+        body = self.s.split('function Complete-LabLinuxProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('-Path $null', body)
+        self.assertIn('Remove-VMDvdDrive', body)
+
     # --- Windows unattended install, Task 3: two-drive media attach and post-install cleanup ---
     def test_unattended_media_functions_exist(self):
         for name in ['Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning']:
