@@ -844,6 +844,11 @@ class SourceContract(unittest.TestCase):
     def test_psdirect_wait_timeout_carries_last_error(self):
         body = self.s.split('function Wait-LabPSDirectSession {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('Last error:', body)
+    def test_psdirect_wait_explains_known_transient_errors(self):
+        body = self.s.split('function Wait-LabPSDirectSession {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'remote session might have ended'", body)
+        self.assertIn("'credential is invalid'", body)
+        self.assertIn('default { $rawMessage }', body)
     def test_unattended_media_confirms_windows_drive_boot_entry(self):
         body = self.s.split('function Set-LabVMUnattendedInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
         self.assertLess(body.index("Set-LabVMBootOrder $VMId 'Dvd'"), body.index('Get-VMFirmware -VM $vm -ErrorAction Stop'))
