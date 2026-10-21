@@ -3970,7 +3970,7 @@ function Invoke-LabProvisioningScenario {
             $script:ProvArgs['Complete-LabWindowsProvisioning'] = $PSBoundParameters
         }
         function Remove-LabProvisioningWorkspace { param([guid]$VMId) Record 'Remove-LabProvisioningWorkspace' }
-        foreach ($sb in (Import-LabRealFunction 'Start-LabWindowsVMProvisioning', 'Select-LabWindowsEdition', 'ConvertTo-LabLocalAccountName')) { . $sb }
+        foreach ($sb in (Import-LabRealFunction 'Start-LabWindowsVMProvisioning', 'Select-LabWindowsEdition', 'ConvertTo-LabLocalAccountName', 'Get-LabProvisioningVMHardware')) { . $sb }
         try { $result.Status = Start-LabWindowsVMProvisioning $Options 6>$null 3>$null }
         catch { $result.Error = $_.Exception.Message }
     }
@@ -4150,11 +4150,13 @@ function Invoke-LabSelectVMMenu {
     $script:SelectPrompts = [Collections.Generic.List[string]]::new()
     $script:SelectAnswers = [Collections.Generic.Queue[string]]::new([string[]]$Answers)
     $script:ProvisionMenuCalls = 0
+    $script:ProvisionLinuxMenuCalls = 0
     & {
         function Clear-Host { }
         function Read-LabText { param([string]$Prompt) $script:SelectPrompts.Add($Prompt); if ($script:SelectAnswers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }; return $script:SelectAnswers.Dequeue() }
         function New-LabVM { throw 'TRIPWIRE: N was dispatched.' }
         function Start-LabWindowsVMProvisioning { param([hashtable]$Options) $script:ProvisionMenuCalls++; return 'COMPLETED' }
+        function Start-LabLinuxVMProvisioning { param([hashtable]$Options) $script:ProvisionLinuxMenuCalls++; return 'COMPLETED' }
         foreach ($sb in (Import-LabRealFunction 'Select-LabVM')) { . $sb }
         $out = @(Select-LabVM 6>$null 3>$null)
         Assert-Equal $out.Count 1
@@ -4175,12 +4177,44 @@ Test-Case 'Menu: under -ReadOnly, W is neither offered nor dispatched' {
         Assert-Equal ($script:SelectPrompts[0] -match '\bW\b') $false
     } finally { $script:LabReadOnly = $false }
 }
-Test-Case 'Gate: provisioning-only parameters are reported, and menu/transfer parameters are not' {
-    foreach ($sb in (Import-LabRealFunction 'Get-LabProvisioningOnlyParameter')) { . $sb }
-    Assert-Equal @(Get-LabProvisioningOnlyParameter @('ReadOnly', 'LogRoot', 'IsoRoot', 'TimeoutSeconds', 'VMName', 'NonInteractive', 'Credential')).Count 0
-    foreach ($name in @('NewVMName', 'WindowsIsoPath', 'ComputerName', 'Locale', 'TimeZone', 'OsEdition', 'VhdxSizeGB', 'VCpuCount',
-            'MemoryMinimumGB', 'MemoryStartupGB', 'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot', 'VhdxStorageRoot', 'ProvisioningTimeoutSeconds', 'ProductKey')) {
-        Assert-Equal (@(Get-LabProvisioningOnlyParameter @('ReadOnly', $name)) -join ',') $name
+Test-Case 'Menu: L (provision Linux VM) is offered and dispatched when not read-only, and does not dispatch W' {
+    $script:LabReadOnly = $false
+    Invoke-LabSelectVMMenu @('L', '', 'Q')
+    Assert-Equal $script:ProvisionLinuxMenuCalls 1
+    Assert-Equal $script:ProvisionMenuCalls 0
+    Assert-Equal ($script:SelectPrompts[0] -match '\bL\b') $true
+}
+Test-Case 'Menu: under -ReadOnly, L is neither offered nor dispatched' {
+    $script:LabReadOnly = $true
+    try {
+        Invoke-LabSelectVMMenu @('L', 'Q')
+        Assert-Equal $script:ProvisionLinuxMenuCalls 0
+        Assert-Equal ($script:SelectPrompts[0] -match '\bL\b') $false
+    } finally { $script:LabReadOnly = $false }
+}
+Test-Case 'Gate: the three provisioning parameter tiers report exactly their own names, and menu/transfer parameters are in none' {
+    # Linux Task 6 split the original Windows-only list into a shared creation tier (VM hardware and
+    # generic settings either OS action uses), a Windows-only tier, and a Linux-only tier. Every name
+    # the original single list covered is still covered by exactly one tier.
+    foreach ($sb in (Import-LabRealFunction 'Get-LabProvisioningOnlyParameter', 'Get-LabCreationOnlyParameter', 'Get-LabLinuxProvisioningOnlyParameter')) { . $sb }
+    $unrelated = @('ReadOnly', 'LogRoot', 'IsoRoot', 'TimeoutSeconds', 'VMName', 'NonInteractive', 'Credential')
+    Assert-Equal @(Get-LabProvisioningOnlyParameter $unrelated).Count 0
+    Assert-Equal @(Get-LabCreationOnlyParameter $unrelated).Count 0
+    Assert-Equal @(Get-LabLinuxProvisioningOnlyParameter $unrelated).Count 0
+    $tiers = @{
+        Creation = @('NewVMName', 'ComputerName', 'Locale', 'VhdxSizeGB', 'VCpuCount', 'MemoryMinimumGB', 'MemoryStartupGB',
+            'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot', 'VhdxStorageRoot', 'ProvisioningTimeoutSeconds')
+        Windows = @('WindowsIsoPath', 'OsEdition', 'ProductKey', 'TimeZone')
+        Linux = @('LinuxIsoPath', 'LinuxTimeZone')
+    }
+    foreach ($tier in $tiers.Keys) {
+        foreach ($name in $tiers[$tier]) {
+            $expected = @{ Creation = ''; Windows = ''; Linux = '' }
+            $expected[$tier] = $name
+            Assert-Equal (@(Get-LabCreationOnlyParameter @('ReadOnly', $name)) -join ',') $expected['Creation']
+            Assert-Equal (@(Get-LabProvisioningOnlyParameter @('ReadOnly', $name)) -join ',') $expected['Windows']
+            Assert-Equal (@(Get-LabLinuxProvisioningOnlyParameter @('ReadOnly', $name)) -join ',') $expected['Linux']
+        }
     }
 }
 Test-Case 'Gate: the real script refuses a provisioning-only parameter without -ProvisionWindowsVM instead of opening the menu' {
@@ -4203,6 +4237,57 @@ Test-Case 'Gate: the real script refuses -VMName with -ProvisionWindowsVM, point
     $output = @(& $exe -NoProfile -NonInteractive -File $resolved -ProvisionWindowsVM -VMName 'LAB-x' 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
     Assert-Equal $LASTEXITCODE 1
     if (-not ($output -replace '\s', '').Contains('-VMNamedonotapplyto-ProvisionWindowsVM(namethenewVMwith-NewVMName)')) { throw "Unexpected output: $output" }
+}
+# Linux Task 6: the same child-process gate, for the Linux action and the three-tier parameter split.
+# Every invocation below either stops at the gate or, for the "accepted" cases, at the CLI wrapper's own
+# required-value check (-NonInteractive without -Credential), which runs before any host check, log or
+# Hyper-V call -- so nothing here can create a VM even on an elevated Hyper-V host.
+function Invoke-LabGateChild {
+    param([string[]]$Arguments)
+    $ErrorActionPreference = 'Continue'
+    $exe = Join-Path $PSHOME 'powershell.exe'
+    $output = @(& $exe -NoProfile -NonInteractive -File $resolved @Arguments 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Flat = ($output -replace '\s', ''); Output = $output }
+}
+Test-Case 'Gate: the real script refuses a Linux-only parameter without -ProvisionLinuxVM instead of opening the menu' {
+    $r = Invoke-LabGateChild @('-LinuxIsoPath', 'C:\nope.iso')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-LinuxIsoPathonlyapplyto-ProvisionLinuxVM')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses a Windows-only parameter with -ProvisionLinuxVM as foreign' {
+    $r = Invoke-LabGateChild @('-ProvisionLinuxVM', '-WindowsIsoPath', 'C:\nope.iso')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-WindowsIsoPathdonotapplyto-ProvisionLinuxVM')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses a Linux-only parameter with -ProvisionWindowsVM as foreign' {
+    $r = Invoke-LabGateChild @('-ProvisionWindowsVM', '-LinuxTimeZone', 'Europe/Paris')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-LinuxTimeZonedonotapplyto-ProvisionWindowsVM')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses -VMName with -ProvisionLinuxVM, pointing at -NewVMName' {
+    $r = Invoke-LabGateChild @('-ProvisionLinuxVM', '-VMName', 'LAB-x')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-VMNamedonotapplyto-ProvisionLinuxVM(namethenewVMwith-NewVMName)')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses -ProvisionLinuxVM combined with -ProvisionWindowsVM (four-way one-action check)' {
+    $r = Invoke-LabGateChild @('-ProvisionLinuxVM', '-ProvisionWindowsVM')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('oneactionperinvocation')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: shared creation parameters (-NewVMName, -VCpuCount) pass the gate with EITHER provisioning switch' {
+    # Regression guard for the shared-tier refactor: both runs get past every gate check and stop only
+    # at the CLI wrapper's own "Supply -Credential" requirement.
+    $r = Invoke-LabGateChild @('-ProvisionWindowsVM', '-NewVMName', 'LAB-x', '-VCpuCount', '2', '-WindowsIsoPath', 'C:\nope.iso', '-NonInteractive')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('Supply-Credentialwith-ProvisionWindowsVM-NonInteractive')) { throw "Windows run did not reach the CLI wrapper: $($r.Output)" }
+    $r = Invoke-LabGateChild @('-ProvisionLinuxVM', '-NewVMName', 'LAB-x', '-VCpuCount', '2', '-LinuxIsoPath', 'C:\nope.iso', '-NonInteractive')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('Supply-Credentialwith-ProvisionLinuxVM-NonInteractive')) { throw "Linux run did not reach the CLI wrapper: $($r.Output)" }
+}
+Test-Case 'Gate: a shared creation parameter alone names both provisioning switches' {
+    $r = Invoke-LabGateChild @('-VCpuCount', '2')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-VCpuCountonlyapplyto-ProvisionWindowsVMor-ProvisionLinuxVM')) { throw "Unexpected output: $($r.Output)" }
 }
 
 # --- Hyper-V shape drift guard (final-review fix) ---
@@ -4861,6 +4946,21 @@ Test-Case 'New-LabLinuxAutoinstallUserData returns a well-formed autoinstall doc
     Assert-Equal ($result.Contains('authorized-keys:')) $true
     Assert-Equal ($result.Contains("      - $sshKey")) $true
 }
+Test-Case 'New-LabLinuxAutoinstallUserData starts with the #cloud-config header NoCloud requires before autoinstall:' {
+    # cloud-init only treats a NoCloud user-data file as cloud-config when its first line is exactly
+    # '#cloud-config'; without it Subiquity never sees the autoinstall: key at all.
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' 'labagent' $securePassword 'ssh-ed25519 AAAA k'
+    $lines = @($result -split "`r?`n")
+    Assert-Equal $lines[0] '#cloud-config'
+    Assert-Equal $lines[1] 'autoinstall:'
+}
+Test-Case 'New-LabLinuxAutoinstallUserData ships a real SHA-512-crypt placeholder hash, not an invented string' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' 'labagent' $securePassword 'ssh-ed25519 AAAA k'
+    # The value generated by `openssl passwd -6` (see the function's own comment for the exact command).
+    Assert-Equal ($result.Contains('password: "$6$rXrbP3d6DiE8gBnS$')) $true
+}
 Test-Case 'New-LabLinuxAutoinstallUserData output varies with its inputs, with no hardcoded leftover from a first draft' {
     $securePasswordA = ConvertTo-SecureString 'SecretA1!' -AsPlainText -Force
     $securePasswordB = ConvertTo-SecureString 'SecretB2!' -AsPlainText -Force
@@ -5089,6 +5189,316 @@ Test-Case 'Complete-LabLinuxProvisioning throws clearly when neither known ISO p
     } finally {
         $script:FakeDvdDrives.Clear()
     }
+}
+
+# --- Linux unattended install, Task 6: "Provision Linux VM" orchestrator ---
+# Same shape as the Windows orchestrator's scenario harness above: the REAL Start-LabLinuxVMProvisioning
+# (plus the real shared Get-LabProvisioningVMHardware and pure validators) runs against FAKES of every
+# function it consumes, each recording its name, so the exact sequence and failure behavior are asserted.
+# Everything runs in a child scope, so no fake leaks into any other test.
+$script:LinuxProvWorkspace = Join-Path ([IO.Path]::GetTempPath()) 'labprov-linux-test-workspace'
+$script:LinuxProvSourceIso = 'C:\labprov-test\ubuntu-26.04.1-desktop-amd64.iso'
+$script:LinuxProvKeyPath = 'C:\labprov-test\SshConnections\00000000-0000-0000-0000-00000000c0de.key'
+$script:LinuxProvPassword = 'Sup3r-S3cret-Pa55'
+function Invoke-LabLinuxProvisioningScenario {
+    param(
+        [hashtable]$Options,
+        [bool]$InScope = $true,
+        [string]$ThrowIn = '',
+        [int]$ThrowOnWaitNumber = 0,
+        [bool]$Patched = $true
+    )
+    $script:LProvCalls = [Collections.Generic.List[string]]::new()
+    $script:LProvArgs = @{}
+    $script:LProvAudit = [Collections.Generic.List[string]]::new()
+    $script:LProvInScope = $InScope
+    $script:LProvThrowIn = $ThrowIn
+    $script:LProvThrowOnWait = $ThrowOnWaitNumber
+    $script:LProvWaitCount = 0
+    $script:LProvPatched = $Patched
+    $result = [pscustomobject]@{ Status = $null; Error = $null; Calls = $null; Args = $null; Audit = $null }
+    & {
+        function Record { param([string]$Name) $script:LProvCalls.Add($Name); if ($script:LProvThrowIn -eq $Name) { throw "simulated $Name failure" } }
+        function Read-LabText { param([string]$Prompt) throw "Unexpected prompt: $Prompt" }
+        function Read-LabYesNoCancel { param([string]$Prompt) Record 'Read-LabYesNoCancel'; return 'Y' }
+        function Write-LabAudit { param([string]$Action, [string]$Status, $VM = $null, [string]$Detail = '') $script:LProvAudit.Add("$Action|$Status|$Detail") }
+        function Select-LabIsoPath { param([string]$IsoRoot) Record 'Select-LabIsoPath'; return $script:LinuxProvSourceIso }
+        function Get-LabLinuxIsoInfo {
+            param([string]$IsoPath)
+            Record 'Get-LabLinuxIsoInfo'
+            if ($script:LProvInScope) { return [pscustomobject]@{ ReleaseText = 'Ubuntu 26.04.1 LTS "Resolute Raccoon" - Release amd64'; IsUbuntuDesktopInScope = $true } }
+            return [pscustomobject]@{ ReleaseText = 'Ubuntu-Server 26.04.1 LTS "Resolute Raccoon" - Release amd64'; IsUbuntuDesktopInScope = $false }
+        }
+        function Get-LabHostDefaults {
+            Record 'Get-LabHostDefaults'
+            $temp = [IO.Path]::GetTempPath()
+            [pscustomobject]@{ VirtualMachinePath = $temp; VirtualHardDiskPath = $temp; LogicalProcessorCount = 8; TotalPhysicalMemoryBytes = 32GB }
+        }
+        function Get-LabSwitchNames { return @('Default Switch') }
+        function New-LabVMCore {
+            param([string]$Name, [string]$VmStoragePath, [int]$VCpuCount, [long]$MinimumBytes, [long]$StartupBytes,
+                [long]$MaximumBytes, [bool]$IsDynamic, [string]$VhdxPath, [long]$VhdxMaximumBytes, [string]$SwitchName)
+            Record 'New-LabVMCore'
+            $script:LProvArgs['New-LabVMCore'] = $PSBoundParameters
+            return [pscustomobject]@{ Id = [guid]'00000000-0000-0000-0000-00000000c0de'; Name = $Name }
+        }
+        function Enable-VMIntegrationService { param($VM, [string[]]$Name) Record 'Enable-VMIntegrationService' }
+        function Set-VM { param($VM, $AutomaticStopAction) Record 'Set-VM' }
+        function Resolve-LabLinuxCredential {
+            param($Credential, [bool]$NonInteractive)
+            Record 'Resolve-LabLinuxCredential'
+            if ($null -ne $Credential) { return $Credential }
+            return [pscredential]::new('dev', (ConvertTo-SecureString $script:LinuxProvPassword -AsPlainText -Force))
+        }
+        function Get-LabProvisioningWorkspacePath { param([guid]$VMId) Record 'Get-LabProvisioningWorkspacePath'; return $script:LinuxProvWorkspace }
+        function New-LabPatchedBootableLinuxIso {
+            param([string]$SourceIsoPath, [string]$OutputPath)
+            Record 'New-LabPatchedBootableLinuxIso'
+            if ($script:LProvPatched) { return [pscustomobject]@{ Patched = $true; Reason = $null; OutputPath = $OutputPath } }
+            return [pscustomobject]@{ Patched = $false; Reason = 'simulated: not enough slack'; OutputPath = $null }
+        }
+        function New-LabEphemeralSshKeyPair {
+            param([guid]$VMId)
+            Record 'New-LabEphemeralSshKeyPair'
+            return [pscustomobject]@{ PrivateKeyPath = $script:LinuxProvKeyPath; PublicKeyContent = 'ssh-ed25519 AAAAfakekey lab' }
+        }
+        function New-LabLinuxAutoinstallUserData {
+            param([string]$ComputerName, [string]$Locale, [string]$TimeZone, [string]$UserName, [securestring]$Password, [string]$SshPublicKey)
+            Record 'New-LabLinuxAutoinstallUserData'
+            $script:LProvArgs['New-LabLinuxAutoinstallUserData'] = $PSBoundParameters
+            return "#cloud-config`nautoinstall:`n  version: 1`n"
+        }
+        function New-LabSeedIso {
+            param([hashtable]$Files, [string]$OutputPath, [string]$VolumeLabel = 'LAB_SEED')
+            Record 'New-LabSeedIso'
+            $script:LProvArgs['New-LabSeedIso'] = @{ Files = $Files; OutputPath = $OutputPath; VolumeLabel = $VolumeLabel }
+        }
+        function Set-LabVMUnattendedLinuxInstallMedia {
+            param([guid]$VMId, [string]$LinuxIsoPath, [string]$SeedIsoPath)
+            Record 'Set-LabVMUnattendedLinuxInstallMedia'
+            $script:LProvArgs['Set-LabVMUnattendedLinuxInstallMedia'] = $PSBoundParameters
+        }
+        function Set-LabVMBootProfile {
+            param([guid]$VMId, [string]$OsProfile)
+            Record 'Set-LabVMBootProfile'
+            $script:LProvArgs['Set-LabVMBootProfile'] = $OsProfile
+            return [pscustomobject]@{ SecureBootTemplateChanged = $true; SecureBootEnabled = $false; KeyProtectorAdded = $false; TpmEnabled = $false }
+        }
+        function Start-LabVM { param([guid]$VMId) Record 'Start-LabVM'; return 'COMPLETED' }
+        function Wait-LabSshSession {
+            param([guid]$VMId, [string]$UserName, [int]$TimeoutSeconds)
+            $script:LProvWaitCount++
+            Record 'Wait-LabSshSession'
+            $script:LProvArgs["Wait-LabSshSession:$($script:LProvWaitCount)"] = $PSBoundParameters
+            if ($script:LProvThrowOnWait -eq $script:LProvWaitCount) { throw "simulated Wait-LabSshSession #$($script:LProvWaitCount) failure" }
+            # A different address each time: the clean second boot may get a new DHCP lease.
+            return "172.20.0.$(10 + $script:LProvWaitCount)"
+        }
+        function Write-LabLinuxProvisioningNote {
+            param([string]$HostNameOrAddress, [string]$UserName, [string]$IdentityFilePath, [string]$Content)
+            Record 'Write-LabLinuxProvisioningNote'
+            $script:LProvArgs['Write-LabLinuxProvisioningNote'] = $PSBoundParameters
+        }
+        function Request-LabVMGuestShutdown { param([guid]$VMId, [string]$Reason) Record 'Request-LabVMGuestShutdown' }
+        function Wait-LabVMState {
+            param([guid]$VMId, [string]$State, [int]$TimeoutSeconds = 0)
+            Record "Wait-LabVMState:$State"
+            $script:LProvArgs["Wait-LabVMState:$State"] = $TimeoutSeconds
+        }
+        function Complete-LabLinuxProvisioning {
+            param([guid]$VMId, [string]$LinuxIsoPath, [string]$SeedIsoPath)
+            Record 'Complete-LabLinuxProvisioning'
+            $script:LProvArgs['Complete-LabLinuxProvisioning'] = $PSBoundParameters
+        }
+        function Remove-LabProvisioningWorkspace {
+            param([guid]$VMId)
+            Record 'Remove-LabProvisioningWorkspace'
+            $script:LProvArgs['Remove-LabProvisioningWorkspace'] = @($args) + @($PSBoundParameters.Values | ForEach-Object { [string]$_ })
+        }
+        function Set-LabSshConnectionSettings {
+            param([guid]$VMId, [string]$HostNameOrAddress, [int]$Port, [string]$UserName, [string]$IdentityFilePath)
+            Record 'Set-LabSshConnectionSettings'
+            $script:LProvArgs['Set-LabSshConnectionSettings'] = $PSBoundParameters
+        }
+        foreach ($sb in (Import-LabRealFunction 'Start-LabLinuxVMProvisioning', 'ConvertTo-LabLinuxAccountName', 'Get-LabProvisioningVMHardware')) { . $sb }
+        try { $result.Status = Start-LabLinuxVMProvisioning $Options 6>$null 3>$null }
+        catch { $result.Error = $_.Exception.Message }
+    }
+    $result.Calls = @($script:LProvCalls)
+    $result.Args = $script:LProvArgs
+    $result.Audit = @($script:LProvAudit)
+    return $result
+}
+$script:LinuxProvHappyOrder = @('Select-LabIsoPath', 'Get-LabLinuxIsoInfo', 'Get-LabHostDefaults', 'Read-LabYesNoCancel', 'New-LabVMCore',
+    'Enable-VMIntegrationService', 'Set-VM', 'Resolve-LabLinuxCredential', 'Get-LabProvisioningWorkspacePath', 'New-LabPatchedBootableLinuxIso',
+    'New-LabEphemeralSshKeyPair', 'New-LabLinuxAutoinstallUserData', 'New-LabSeedIso', 'Set-LabVMUnattendedLinuxInstallMedia',
+    'Set-LabVMBootProfile', 'Start-LabVM', 'Wait-LabSshSession', 'Write-LabLinuxProvisioningNote', 'Request-LabVMGuestShutdown',
+    'Wait-LabVMState:Off', 'Complete-LabLinuxProvisioning', 'Remove-LabProvisioningWorkspace', 'Start-LabVM', 'Wait-LabSshSession',
+    'Set-LabSshConnectionSettings')
+$script:LabReadOnly = $false
+$script:LabTimeout = 180
+
+Test-Case 'Provision Linux: happy path runs every phase once, in the documented order, and returns COMPLETED' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' }
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Status 'COMPLETED'
+    Assert-Equal ($r.Calls -join ' > ') ($script:LinuxProvHappyOrder -join ' > ')
+    Assert-Equal @($r.Calls | Where-Object { $_ -eq 'Wait-LabSshSession' }).Count 2
+    Assert-Equal @($r.Calls | Where-Object { $_ -eq 'Set-LabSshConnectionSettings' }).Count 1
+    # Saved exactly once, after the SECOND wait, with the SECOND wait's address and this VM's own key.
+    Assert-Equal ([array]::LastIndexOf([string[]]$r.Calls, 'Wait-LabSshSession') -lt [array]::IndexOf([string[]]$r.Calls, 'Set-LabSshConnectionSettings')) $true
+    $saved = $r.Args['Set-LabSshConnectionSettings']
+    Assert-Equal $saved.HostNameOrAddress '172.20.0.12'
+    Assert-Equal $saved.Port 22
+    Assert-Equal $saved.UserName 'dev'
+    Assert-Equal $saved.IdentityFilePath $script:LinuxProvKeyPath
+    Assert-Equal $saved.VMId ([guid]'00000000-0000-0000-0000-00000000c0de')
+    # The note goes to the FIRST wait's address, authenticated with the same key.
+    Assert-Equal $r.Args['Write-LabLinuxProvisioningNote'].HostNameOrAddress '172.20.0.11'
+    Assert-Equal $r.Args['Write-LabLinuxProvisioningNote'].IdentityFilePath $script:LinuxProvKeyPath
+    Assert-Equal $r.Args['Wait-LabSshSession:1'].UserName 'dev'
+    Assert-Equal $r.Args['Wait-LabSshSession:1'].TimeoutSeconds 1800
+    # The ephemeral key is minted before the workspace is removed, and its path never reaches that removal.
+    Assert-Equal ([array]::IndexOf([string[]]$r.Calls, 'New-LabEphemeralSshKeyPair') -lt [array]::IndexOf([string[]]$r.Calls, 'Remove-LabProvisioningWorkspace')) $true
+    Assert-Equal (@($r.Args['Remove-LabProvisioningWorkspace']) -contains $script:LinuxProvKeyPath) $false
+    # Defaults: Linux locale/time zone defaults, the shared computer name default, the generated public key.
+    $userData = $r.Args['New-LabLinuxAutoinstallUserData']
+    Assert-Equal $userData.ComputerName 'lab-agent-test'
+    Assert-Equal $userData.Locale 'en_US.UTF-8'
+    Assert-Equal $userData.TimeZone 'America/Guatemala'
+    Assert-Equal $userData.UserName 'dev'
+    Assert-Equal $userData.SshPublicKey 'ssh-ed25519 AAAAfakekey lab'
+    # The NoCloud seed: cidata label, user-data and meta-data at its root.
+    $seed = $r.Args['New-LabSeedIso']
+    Assert-Equal $seed.VolumeLabel 'cidata'
+    Assert-Equal ((@($seed.Files.Keys) | Sort-Object) -join ',') 'meta-data,user-data'
+    if ([string]$seed.Files['meta-data'] -notmatch 'instance-id: ' -or [string]$seed.Files['meta-data'] -notmatch 'local-hostname: lab-agent-test') {
+        throw "Unexpected meta-data: $($seed.Files['meta-data'])"
+    }
+    # Shared VM hardware defaults, identical to the Windows action's.
+    $core = $r.Args['New-LabVMCore']
+    Assert-Equal $core.Name 'LAB-Ubuntu'
+    Assert-Equal $core.VCpuCount 2
+    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]4GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.VhdxMaximumBytes ([long]150GB)
+    Assert-Equal $core.SwitchName 'Default Switch'
+    Assert-Equal $r.Args['Set-LabVMBootProfile'] 'UbuntuDesktop'
+    # The patched copy is what gets attached AND what cleanup later ejects; same seed path both times.
+    $patchedPath = Join-Path $script:LinuxProvWorkspace 'ubuntu-autoinstall.iso'
+    Assert-Equal $r.Args['Set-LabVMUnattendedLinuxInstallMedia'].LinuxIsoPath $patchedPath
+    Assert-Equal $r.Args['Complete-LabLinuxProvisioning'].LinuxIsoPath $patchedPath
+    Assert-Equal $r.Args['Complete-LabLinuxProvisioning'].SeedIsoPath $r.Args['Set-LabVMUnattendedLinuxInstallMedia'].SeedIsoPath
+    Assert-Equal $r.Args['Wait-LabVMState:Off'] 1800
+    Assert-Equal ($r.Audit[0] -like 'provision-linux-vm|STARTED|*') $true
+    Assert-Equal ($r.Audit[-1] -like 'provision-linux-vm|COMPLETED|*ubuntu-26.04.1-desktop-amd64.iso*ComputerName=lab-agent-test*ElapsedSeconds=*') $true
+}
+Test-Case 'Provision Linux: the guest-desktop note names the VM, ISO, release, computer name and account, and NEVER the password' {
+    $cred = [pscredential]::new('labagent', (ConvertTo-SecureString $script:LinuxProvPassword -AsPlainText -Force))
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; Credential = $cred }
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    $note = [string]$r.Args['Write-LabLinuxProvisioningNote'].Content
+    foreach ($expected in @('LAB-Ubuntu', "Ubuntu ISO: $($script:LinuxProvSourceIso)", 'Ubuntu 26.04.1 LTS', 'Computer name: lab-agent-test', 'Account: labagent')) {
+        if (-not $note.Contains($expected)) { throw "Note is missing '$expected': $note" }
+    }
+    if ($note -notmatch 'Time from VM creation to this first SSH login: \d+ min \d+ s \(\d+ seconds\)') { throw "Note is missing the elapsed time: $note" }
+    if ($note.Contains($script:LinuxProvPassword)) { throw 'The note contains the account password.' }
+    foreach ($line in $r.Audit) { if ($line.Contains($script:LinuxProvPassword)) { throw "An audit record contains the account password: $line" } }
+    Assert-Equal $r.Args['Write-LabLinuxProvisioningNote'].UserName 'labagent'
+}
+Test-Case 'Provision Linux: an out-of-scope ISO is refused, naming what was found, before any VM is created' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' } -InScope $false
+    Assert-Equal $r.Status $null
+    if ($r.Error -notmatch 'Ubuntu Desktop 26\.04' -or $r.Error -notmatch 'Ubuntu-Server 26\.04\.1' -or $r.Error -notmatch 'No VM was created') { throw "Unclear refusal: $($r.Error)" }
+    Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    Assert-Equal ($r.Calls -contains 'Get-LabHostDefaults') $false
+    Assert-Equal $r.Audit.Count 0
+}
+Test-Case 'Provision Linux: a failure partway reports completed steps, the kept workspace and its password, and runs nothing after' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' } -ThrowIn 'New-LabPatchedBootableLinuxIso'
+    Assert-Equal $r.Status $null
+    Assert-Equal ($r.Calls -contains 'New-LabVMCore') $true
+    Assert-Equal $r.Calls[-1] 'New-LabPatchedBootableLinuxIso'
+    foreach ($later in @('New-LabEphemeralSshKeyPair', 'New-LabLinuxAutoinstallUserData', 'New-LabSeedIso', 'Set-LabVMUnattendedLinuxInstallMedia',
+            'Set-LabVMBootProfile', 'Start-LabVM', 'Wait-LabSshSession', 'Remove-LabProvisioningWorkspace', 'Set-LabSshConnectionSettings')) {
+        if ($r.Calls -contains $later) { throw "$later ran after the failing step." }
+    }
+    if ($r.Error -notmatch 'simulated New-LabPatchedBootableLinuxIso failure') { throw "Error lost the cause: $($r.Error)" }
+    if ($r.Error -notmatch 'Steps already applied: .*created.*credential.*workspace') { throw "Error did not name the completed steps: $($r.Error)" }
+    if (-not $r.Error.Contains($script:LinuxProvWorkspace)) { throw "Error did not name the workspace path: $($r.Error)" }
+    if ($r.Error -notmatch 'password') { throw "Error did not mention the password: $($r.Error)" }
+    if ($r.Error -notmatch 'No SSH connection settings were saved') { throw "Error did not say no settings were saved: $($r.Error)" }
+    Assert-Equal ($r.Audit[-1] -like 'provision-linux-vm|FAILED_OR_UNCONFIRMED|*') $true
+}
+Test-Case 'Provision Linux: a failure AFTER the seed ISO is built says the kept workspace holds the password, and names the kept key' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' } -ThrowIn 'Set-LabVMUnattendedLinuxInstallMedia'
+    Assert-Equal $r.Status $null
+    Assert-Equal $r.Calls[-1] 'Set-LabVMUnattendedLinuxInstallMedia'
+    if (-not $r.Error.Contains("The provisioning workspace was KEPT, not deleted: $($script:LinuxProvWorkspace) -- it contains the account password in plain text")) {
+        throw "Error did not name the workspace path and its plain-text password: $($r.Error)"
+    }
+    if (-not $r.Error.Contains($script:LinuxProvKeyPath)) { throw "Error did not name the kept SSH key: $($r.Error)" }
+    Assert-Equal ($r.Calls -contains 'Set-LabSshConnectionSettings') $false
+}
+Test-Case 'Provision Linux: a failure after the FIRST SSH wait but at the SECOND never saves SSH connection settings' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' } -ThrowOnWaitNumber 2
+    Assert-Equal $r.Status $null
+    Assert-Equal @($r.Calls | Where-Object { $_ -eq 'Wait-LabSshSession' }).Count 2
+    Assert-Equal ($r.Calls -contains 'Remove-LabProvisioningWorkspace') $true
+    Assert-Equal ($r.Calls -contains 'Set-LabSshConnectionSettings') $false
+    if ($r.Error -notmatch 'simulated Wait-LabSshSession #2 failure') { throw "Error lost the cause: $($r.Error)" }
+    if ($r.Error -notmatch 'already deleted') { throw "Error did not say the workspace was already deleted: $($r.Error)" }
+    if ($r.Error -notmatch 'No SSH connection settings were saved') { throw "Error did not say no settings were saved: $($r.Error)" }
+    Assert-Equal ($r.Audit[-1] -like 'provision-linux-vm|FAILED_OR_UNCONFIRMED|*') $true
+}
+Test-Case 'Provision Linux: a failure at the FIRST SSH wait runs no note, cleanup or settings save' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' } -ThrowOnWaitNumber 1
+    Assert-Equal $r.Status $null
+    Assert-Equal $r.Calls[-1] 'Wait-LabSshSession'
+    foreach ($later in @('Write-LabLinuxProvisioningNote', 'Remove-LabProvisioningWorkspace', 'Set-LabSshConnectionSettings')) {
+        if ($r.Calls -contains $later) { throw "$later ran after the failing step." }
+    }
+}
+Test-Case 'Provision Linux: an unpatched ISO falls back to the ORIGINAL source path for attach and cleanup' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' } -Patched $false
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Args['Set-LabVMUnattendedLinuxInstallMedia'].LinuxIsoPath $script:LinuxProvSourceIso
+    Assert-Equal $r.Args['Complete-LabLinuxProvisioning'].LinuxIsoPath $script:LinuxProvSourceIso
+}
+Test-Case 'Provision Linux: an invalid -ComputerName, -LinuxTimeZone or -Locale is rejected before any VM is created' {
+    foreach ($case in @(
+            @{ Options = @{ NewVMName = 'LAB-Ubuntu'; ComputerName = 'lab-agent-test-linux' }; Pattern = 'Computer name' },
+            @{ Options = @{ NewVMName = 'LAB-Ubuntu'; ComputerName = '12345' }; Pattern = 'Computer name' },
+            @{ Options = @{ NewVMName = 'LAB-Ubuntu'; LinuxTimeZone = 'Central America Standard Time' }; Pattern = 'LinuxTimeZone' },
+            @{ Options = @{ NewVMName = 'LAB-Ubuntu'; LinuxTimeZone = 'UTC; reboot' }; Pattern = 'LinuxTimeZone' },
+            @{ Options = @{ NewVMName = 'LAB-Ubuntu'; Locale = 'en_US: x' }; Pattern = 'Locale' })) {
+        $r = Invoke-LabLinuxProvisioningScenario $case.Options
+        Assert-Equal $r.Status $null
+        if ($r.Error -notmatch $case.Pattern) { throw "Error did not name $($case.Pattern): $($r.Error)" }
+        Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    }
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; LinuxTimeZone = 'America/Argentina/Buenos_Aires'; Locale = 'es_GT.UTF-8' }
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Args['New-LabLinuxAutoinstallUserData'].TimeZone 'America/Argentina/Buenos_Aires'
+    Assert-Equal $r.Args['New-LabLinuxAutoinstallUserData'].Locale 'es_GT.UTF-8'
+}
+Test-Case 'Provision Linux: a supplied credential with a non-Linux username or empty password is refused before any ISO is read' {
+    $bad = [pscredential]::new('Dev', (ConvertTo-SecureString 'x' -AsPlainText -Force))
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; Credential = $bad }
+    if ($r.Error -notmatch 'Dev') { throw "Unexpected error: $($r.Error)" }
+    Assert-Equal $r.Calls.Count 0
+}
+Test-Case 'Provision Linux: -NonInteractive without -Credential is refused before any ISO is read or VM created' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; NonInteractive = $true; LinuxIsoPath = $PSCommandPath }
+    if ($r.Error -notmatch '-Credential') { throw "Unexpected error: $($r.Error)" }
+    Assert-Equal $r.Calls.Count 0
+}
+Test-Case 'Provision Linux: read-only mode refuses without prompting or creating anything' {
+    $script:LabReadOnly = $true
+    try {
+        $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' }
+        Assert-Equal $r.Status 'CANCELLED'
+        Assert-Equal $r.Calls.Count 0
+    } finally { $script:LabReadOnly = $false }
 }
 
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."

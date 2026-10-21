@@ -1039,5 +1039,56 @@ class SourceContract(unittest.TestCase):
         self.assertIn('$patchResult.Patched', body)
         self.assertIn('$patchResult.OutputPath', body)
 
+    # --- Linux unattended install, Task 6: "Provision Linux VM" orchestrator, wiring, parameter tiers ---
+    def _linux_orchestrator_body(self):
+        return self.s.split('function Start-LabLinuxVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+    def test_linux_provisioning_orchestrator_exists(self):
+        self.assertIn('function Start-LabLinuxVMProvisioning {', self.s)
+    def test_linux_provisioning_scope_check_before_vm_creation(self):
+        body = self._linux_orchestrator_body()
+        self.assertLess(body.index('IsUbuntuDesktopInScope'), body.index('New-LabVMCore -Name'))
+    def test_linux_provisioning_settings_saved_only_at_the_end(self):
+        body = self._linux_orchestrator_body()
+        self.assertEqual(body.count('Set-LabSshConnectionSettings'), 1)
+    def test_linux_provisioning_key_outside_workspace(self):
+        body = self._linux_orchestrator_body()
+        self.assertLess(body.index('New-LabEphemeralSshKeyPair'), body.index('Remove-LabProvisioningWorkspace'))
+    def test_linux_vm_name_param_shared_with_windows(self):
+        # NewVMName must not be declared twice; it is the same top-level parameter either mode uses.
+        self.assertEqual(self.s.count('[string]$NewVMName'), 1)
+    def test_linux_provision_switch_wired_in_dispatcher(self):
+        self.assertIn('[switch]$ProvisionLinuxVM', self.s)
+        dispatcher = self.s.split("if ($MyInvocation.InvocationName -ne '.') {", 1)[1]
+        self.assertIn('Start-LabLinuxVMProvisioningCli', dispatcher)
+        self.assertIn('Get-LabLinuxProvisioningOnlyParameter', dispatcher)
+        self.assertIn('Get-LabCreationOnlyParameter', dispatcher)
+    def test_creation_only_parameter_function_exists(self):
+        self.assertIn('function Get-LabCreationOnlyParameter {', self.s)
+        self.assertIn('function Get-LabLinuxProvisioningOnlyParameter {', self.s)
+    def test_windows_only_parameter_list_narrowed(self):
+        body = self.s.split('function Get-LabProvisioningOnlyParameter {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn("'NewVMName'", body)
+        self.assertIn("'WindowsIsoPath'", body)
+    def test_l_menu_entry_wired(self):
+        body = self.s.split('function Select-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("-ieq 'L'", body)
+    def test_four_way_mutual_exclusivity(self):
+        self.assertIn('[bool]$ProvisionLinuxVM', self.s)
+        dispatcher = self.s.split("if ($MyInvocation.InvocationName -ne '.') {", 1)[1]
+        first_check = dispatcher.split('exit 1', 1)[0]
+        self.assertIn('[bool]$ProvisionLinuxVM', first_check)
+    def test_linux_provisioning_validates_computer_name_like_windows(self):
+        body = self._linux_orchestrator_body()
+        self.assertIn("$computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\\d+$'", body)
+    def test_linux_provisioning_seed_is_cidata(self):
+        body = self._linux_orchestrator_body()
+        self.assertIn("-VolumeLabel 'cidata'", body)
+        self.assertIn("'UbuntuDesktop'", body)
+    def test_linux_timezone_param_default(self):
+        self.assertIn("[string]$LinuxTimeZone = 'America/Guatemala'", self.s)
+    def test_linux_user_data_has_cloud_config_header(self):
+        body = self.s.split('function New-LabLinuxAutoinstallUserData {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('#cloud-config\nautoinstall:', body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
