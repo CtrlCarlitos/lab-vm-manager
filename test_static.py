@@ -854,7 +854,11 @@ class SourceContract(unittest.TestCase):
         self.assertIn('$script:LabTimeout = $TimeoutSeconds', self.s)
     def test_provisioning_switch_defaults_to_default_switch(self):
         body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
-        self.assertIn("& $getOption 'SwitchName' 'Default Switch'", body)
+        # SwitchName is resolved directly against $Options, bypassing the generic $getOption helper:
+        # $getOption treats a bound-but-empty string as "not supplied," which would defeat the documented
+        # -SwitchName '' escape hatch for a Disconnected adapter if used here.
+        self.assertIn("$switchName = if ($Options.ContainsKey('SwitchName')) { [string]$Options['SwitchName'] } else { 'Default Switch' }", body)
+        self.assertNotIn("$switchName = [string](& $getOption 'SwitchName'", body)
     def test_provisioning_enables_guest_services_and_graceful_stop(self):
         body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("Enable-VMIntegrationService -VM $vm -Name 'Guest Service Interface'", body)
