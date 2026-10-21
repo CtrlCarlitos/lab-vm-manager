@@ -817,9 +817,10 @@ class SourceContract(unittest.TestCase):
     # --- Windows unattended install, Task 4: Autounattend.xml content builder ---
     def test_answer_file_builder_exists(self):
         self.assertIn('function New-LabWindowsAnswerFileXml', self.s)
-    def test_answer_file_no_product_key(self):
+    def test_answer_file_product_key_defaults_to_none(self):
         body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
-        self.assertNotIn('ProductKey', body)
+        param_block = body.split('param(', 1)[1].split(')', 1)[0]
+        self.assertIn("[string]$ProductKey = ''", param_block)
     def test_answer_file_single_logon(self):
         body = self.s.split('function New-LabWindowsAnswerFileXml {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('LogonCount', body)

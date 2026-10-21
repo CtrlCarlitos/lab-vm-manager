@@ -115,6 +115,11 @@
 .PARAMETER OsEdition
     Windows 11 edition on the ISO, by full image name ('Windows 11 Pro') or short name ('Pro').
     Default: a picker preselecting Pro; with -NonInteractive, Pro (or the ISO's only edition).
+.PARAMETER ProductKey
+    Windows product key, as five groups of five letters/digits separated by dashes (e.g.
+    'AAAAA-BBBBB-CCCCC-DDDDD-EEEEE'). Default: '' (no product key, no activation). Optional; supply a
+    real key, or the well-known dummy all-zero key '00000-00000-00000-00000-00000' to suppress a
+    product-key prompt on some multi-edition ISOs without activating anything.
 .PARAMETER VhdxSizeGB
     New dynamic VHDX maximum size in GB (default 150; 64-65536).
 .PARAMETER VCpuCount
@@ -188,6 +193,7 @@ param(
     [string]$Locale,
     [string]$TimeZone = 'Central America Standard Time',
     [string]$OsEdition,
+    [string]$ProductKey = '',
     [ValidateRange(64, 65536)]
     [int]$VhdxSizeGB = 150,
     [ValidateRange(1, 1024)]
@@ -2207,7 +2213,8 @@ function New-LabWindowsAnswerFileXml {
         [string]$TimeZone,
         [int]$ImageIndex,
         [string]$UserName,
-        [securestring]$Password
+        [securestring]$Password,
+        [string]$ProductKey = ''
     )
     # The SecureString is decrypted to plaintext only in this narrow scope, for exactly as long as
     # it takes to interpolate it into the XML below, then the unmanaged memory holding it is
@@ -2222,6 +2229,21 @@ function New-LabWindowsAnswerFileXml {
         $escapedTimeZone = [Security.SecurityElement]::Escape($TimeZone)
         $escapedUserName = [Security.SecurityElement]::Escape($UserName)
         $escapedPassword = [Security.SecurityElement]::Escape($plainPassword)
+        $escapedProductKey = [Security.SecurityElement]::Escape($ProductKey)
+        # Default (empty): no <ProductKey> element at all, no activation -- the exact pre-existing
+        # behavior for every caller that does not opt in. Non-empty: adds a ProductKey block with
+        # WillShowUI=OnError, which also suppresses a possible Setup product-key prompt on some
+        # multi-edition ISOs without activating anything (see MANUAL-TESTS.md).
+        $productKeyElement = if ($ProductKey -ne '') {
+            @"
+
+                <ProductKey>
+                    <Key>$escapedProductKey</Key>
+                    <WillShowUI>OnError</WillShowUI>
+                </ProductKey>
+"@
+        } else { '' }
+        if ($productKeyElement -ne '') { $productKeyElement = $productKeyElement.TrimEnd("`r", "`n") }
         return @"
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -2279,7 +2301,7 @@ function New-LabWindowsAnswerFileXml {
                 </Disk>
             </DiskConfiguration>
             <UserData>
-                <AcceptEula>true</AcceptEula>
+                <AcceptEula>true</AcceptEula>$productKeyElement
             </UserData>
             <ImageInstall>
                 <OSImage>
@@ -2814,6 +2836,10 @@ function Start-LabWindowsVMProvisioning {
     $timeZone = [string](& $getOption 'TimeZone' 'Central America Standard Time')
     try { $null = [TimeZoneInfo]::FindSystemTimeZoneById($timeZone) }
     catch { throw "Time zone '$timeZone' is not a Windows time zone ID such as 'Pacific Standard Time' (list them with tzutil /l)." }
+    $productKey = [string](& $getOption 'ProductKey' '')
+    if ($productKey -ne '' -and $productKey -notmatch '^[A-Za-z0-9]{5}-[A-Za-z0-9]{5}-[A-Za-z0-9]{5}-[A-Za-z0-9]{5}-[A-Za-z0-9]{5}$') {
+        throw "-ProductKey '$productKey' is not a Windows product key: expected five groups of five letters/digits separated by dashes, e.g. 'AAAAA-BBBBB-CCCCC-DDDDD-EEEEE'. Omit it for no product key/no activation."
+    }
     $timeoutSeconds = [int](& $getOption 'ProvisioningTimeoutSeconds' 1800)
     if ($timeoutSeconds -lt 300 -or $timeoutSeconds -gt 7200) { throw "-ProvisioningTimeoutSeconds $timeoutSeconds is outside 300-7200." }
     $workspaceHint = Join-Path $env:LOCALAPPDATA 'LabVmManager\Provisioning\<new VM id>'
@@ -2835,6 +2861,7 @@ function Start-LabWindowsVMProvisioning {
         ComputerName = $computerName
         Locale = $locale
         TimeZone = $timeZone
+        ProductKey = $(if ($productKey -eq '') { 'none (no activation)' } else { 'supplied (not shown here)' })
         GuestAccount = $(if ($null -ne $suppliedCredential) { "$(ConvertTo-LabLocalAccountName $suppliedCredential) (local administrator)" } else { 'prompted for after the VM is created (local administrator)' })
         BootProfile = 'Windows11: Secure Boot (MicrosoftWindows template), new local key protector + vTPM'
         WaitPerSignIn = "$timeoutSeconds seconds"
@@ -2926,7 +2953,8 @@ function Start-LabWindowsVMProvisioning {
             }
             # Splatted: the SecureString goes straight through; it is never turned into plaintext here.
             $answerFileArguments = @{ ComputerName = $computerName; Locale = $locale; TimeZone = $timeZone
-                ImageIndex = $edition.Index; UserName = $accountName; Password = $guestCredential.Password }
+                ImageIndex = $edition.Index; UserName = $accountName; Password = $guestCredential.Password
+                ProductKey = $productKey }
             $answerFileXml = New-LabWindowsAnswerFileXml @answerFileArguments
             $seedIsoPath = Join-Path $workspace 'seed.iso'
             # From here on the workspace holds the password, so mark that before the write, not after.
@@ -4890,8 +4918,8 @@ function Get-LabTransferOnlyParameter {
 function Get-LabProvisioningOnlyParameter {
     param([AllowEmptyCollection()][string[]]$BoundParameterNames)
     # -NonInteractive and -Credential are shared with file transfer, so they stay in the transfer list only.
-    $provisioningOnly = @('NewVMName', 'WindowsIsoPath', 'ComputerName', 'Locale', 'TimeZone', 'OsEdition', 'VhdxSizeGB',
-        'VCpuCount', 'MemoryMinimumGB', 'MemoryStartupGB', 'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot',
+    $provisioningOnly = @('NewVMName', 'WindowsIsoPath', 'ComputerName', 'Locale', 'TimeZone', 'OsEdition', 'ProductKey',
+        'VhdxSizeGB', 'VCpuCount', 'MemoryMinimumGB', 'MemoryStartupGB', 'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot',
         'VhdxStorageRoot', 'ProvisioningTimeoutSeconds')
     return @($provisioningOnly | Where-Object { $BoundParameterNames -contains $_ })
 }
