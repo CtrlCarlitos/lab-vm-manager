@@ -810,6 +810,21 @@ class SourceContract(unittest.TestCase):
         # the Joliet tree, not just overwrite file content in place -- the file's length changes.
         self.assertIn('Joliet', body)
 
+    # --- Linux unattended install, Task 3: NoCloud user-data content builder ---
+    def test_posix_shell_quote_function_exists(self):
+        self.assertIn('function ConvertTo-LabPosixShellSingleQuoted', self.s)
+    def test_linux_user_data_builder_exists(self):
+        self.assertIn('function New-LabLinuxAutoinstallUserData', self.s)
+    def test_linux_user_data_requires_autoinstall_server(self):
+        body = self.s.split('function New-LabLinuxAutoinstallUserData {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('install-server', body)
+    def test_linux_user_data_password_scoped(self):
+        body = self.s.split('function New-LabLinuxAutoinstallUserData {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('[Runtime.InteropServices.Marshal]', body)
+    def test_linux_user_data_uses_posix_quote_helper(self):
+        body = self.s.split('function New-LabLinuxAutoinstallUserData {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('ConvertTo-LabPosixShellSingleQuoted', body)
+
     # --- Windows unattended install, Task 2: no-prompt boot-loader patch ---
     def test_boot_patch_function_exists(self):
         self.assertIn('function New-LabPatchedBootableIso', self.s)

@@ -62,7 +62,8 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope',
     'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning',
     'New-LabWindowsAnswerFileXml', 'Wait-LabPSDirectSession', 'Get-LabLinuxIsoInfo',
-    'New-LabPatchedBootableLinuxIso')
+    'New-LabPatchedBootableLinuxIso', 'ConvertTo-LabPosixShellSingleQuoted', 'Test-LabLinuxUserName',
+    'New-LabLinuxAutoinstallUserData')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -4475,6 +4476,119 @@ Test-Case 'New-LabPatchedBootableLinuxIso: grub.cfg not found at the expected pa
         Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
     }
+}
+
+# --- Linux unattended install, Task 3: NoCloud user-data content builder ---
+# All three functions are pure -- no fakes needed, call them directly.
+Test-Case 'ConvertTo-LabPosixShellSingleQuoted escapes an embedded single quote via close-escape-reopen' {
+    Assert-Equal (ConvertTo-LabPosixShellSingleQuoted "it's") "'it'\''s'"
+}
+Test-Case 'ConvertTo-LabPosixShellSingleQuoted wraps a value with no special characters unchanged' {
+    Assert-Equal (ConvertTo-LabPosixShellSingleQuoted 'value') "'value'"
+}
+Test-Case 'ConvertTo-LabPosixShellSingleQuoted on the empty string returns an empty quoted literal' {
+    Assert-Equal (ConvertTo-LabPosixShellSingleQuoted '') "''"
+}
+
+Test-Case 'Test-LabLinuxUserName accepts adduser-compatible names' {
+    Assert-Equal (Test-LabLinuxUserName 'dev') $true
+    Assert-Equal (Test-LabLinuxUserName 'lab_agent') $true
+}
+Test-Case 'Test-LabLinuxUserName rejects uppercase, a leading digit, empty, and over-length names' {
+    Assert-Equal (Test-LabLinuxUserName 'Dev') $false
+    Assert-Equal (Test-LabLinuxUserName '1dev') $false
+    Assert-Equal (Test-LabLinuxUserName '') $false
+    Assert-Equal (Test-LabLinuxUserName ('a' * 33)) $false
+}
+
+Test-Case 'New-LabLinuxAutoinstallUserData returns a well-formed autoinstall document carrying the given identity and ssh values' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $sshKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGZ6K3K2exampleKey labagent'
+    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' 'labagent' $securePassword $sshKey
+    Assert-Equal ($result.Contains('autoinstall:')) $true
+    Assert-Equal ($result.Contains('identity:')) $true
+    Assert-Equal ($result.Contains('hostname: lab-agent-test')) $true
+    Assert-Equal ($result.Contains('username: labagent')) $true
+    Assert-Equal ($result.Contains('locale: en_US.UTF-8')) $true
+    Assert-Equal ($result.Contains('ssh:')) $true
+    Assert-Equal ($result.Contains('install-server: true')) $true
+    Assert-Equal ($result.Contains('authorized-keys:')) $true
+    Assert-Equal ($result.Contains("      - $sshKey")) $true
+}
+Test-Case 'New-LabLinuxAutoinstallUserData output varies with its inputs, with no hardcoded leftover from a first draft' {
+    $securePasswordA = ConvertTo-SecureString 'SecretA1!' -AsPlainText -Force
+    $securePasswordB = ConvertTo-SecureString 'SecretB2!' -AsPlainText -Force
+    $resultA = New-LabLinuxAutoinstallUserData 'lab-one' 'en_US.UTF-8' 'America/Belize' 'alice' $securePasswordA 'ssh-ed25519 AAAA-key-one alice'
+    $resultB = New-LabLinuxAutoinstallUserData 'lab-two' 'fr_FR.UTF-8' 'Europe/Paris' 'bob' $securePasswordB 'ssh-ed25519 AAAA-key-two bob'
+    Assert-Equal ($resultA -eq $resultB) $false
+    Assert-Equal ($resultA.Contains('hostname: lab-one')) $true
+    Assert-Equal ($resultB.Contains('hostname: lab-two')) $true
+    Assert-Equal ($resultA.Contains('username: alice')) $true
+    Assert-Equal ($resultB.Contains('username: bob')) $true
+    Assert-Equal ($resultA.Contains('locale: en_US.UTF-8')) $true
+    Assert-Equal ($resultB.Contains('locale: fr_FR.UTF-8')) $true
+    Assert-Equal ($resultA.Contains('timezone: America/Belize')) $true
+    Assert-Equal ($resultB.Contains('timezone: Europe/Paris')) $true
+    Assert-Equal ($resultA.Contains('ssh-ed25519 AAAA-key-one alice')) $true
+    Assert-Equal ($resultB.Contains('ssh-ed25519 AAAA-key-two bob')) $true
+}
+Test-Case 'New-LabLinuxAutoinstallUserData: identity.password is a $6$ hash shape, and the real password appears nowhere except inside late-commands' {
+    $plainPassword = 'Secret123!'
+    $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' 'labagent' $securePassword 'ssh-ed25519 AAAAexampleKey labagent'
+    $lines = $result -split "`r?`n"
+    $identityPasswordLine = @($lines | Where-Object { $_ -match '^\s*password:' })
+    if ($identityPasswordLine.Count -ne 1) { throw "Expected exactly one identity.password line, found $($identityPasswordLine.Count)." }
+    if ($identityPasswordLine[0] -notmatch '\$6\$[^"]+\$[^"]+') { throw "identity.password is not a `$6`$ hash shape: $($identityPasswordLine[0])" }
+    Assert-Equal ($identityPasswordLine[0].Contains($plainPassword)) $false
+    $curtinLines = @($lines | Where-Object { $_ -match 'curtin' })
+    if ($curtinLines.Count -ne 1) { throw "Expected exactly one late-commands curtin line, found $($curtinLines.Count)." }
+    Assert-Equal ($curtinLines[0].Contains($plainPassword)) $true
+    foreach ($line in $lines) {
+        if ($line -eq $curtinLines[0]) { continue }
+        if ($line.Contains($plainPassword)) { throw "Plaintext password leaked outside late-commands: $line" }
+    }
+}
+Test-Case 'New-LabLinuxAutoinstallUserData: a password containing a single quote, double quote, backslash and dollar sign reaches chpasswd unchanged (Review Focus #4)' {
+    # P@ss'"\$word -- built as a single-quoted PowerShell literal so none of ' " \ $ are PowerShell-special here.
+    $plainPassword = 'P@ss''"\$word'
+    $userName = 'labagent'
+    $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' $userName $securePassword 'ssh-ed25519 AAAAexampleKey labagent'
+
+    $curtinLine = @(($result -split "`r?`n") | Where-Object { $_ -match 'curtin' })
+    if ($curtinLine.Count -ne 1) { throw "Expected exactly one late-commands curtin line, found $($curtinLine.Count)." }
+    $curtinLine = $curtinLine[0]
+
+    # Pull out the sole double-quoted YAML scalar on that line -- the escaped shell command.
+    $firstQuote = $curtinLine.IndexOf('"')
+    $lastQuote = $curtinLine.LastIndexOf('"')
+    if ($firstQuote -lt 0 -or $lastQuote -le $firstQuote) { throw "Could not find the double-quoted shell-command scalar in: $curtinLine" }
+    $yamlScalar = $curtinLine.Substring($firstQuote, $lastQuote - $firstQuote + 1)
+
+    # Layer 1 reversal: a YAML double-quoted scalar is unescaped the same way a JSON string literal
+    # is -- ConvertFrom-Json on the exact text ConvertTo-Json -Compress produced in the implementation.
+    $shellCommand = $yamlScalar | ConvertFrom-Json
+
+    # Layer 2 reversal: simulate what a POSIX shell does with a '...'-quoted argument -- strip the
+    # surrounding 'echo '/' | chpasswd', then mechanically undo the single-quote escape (close-quote,
+    # escaped literal quote, reopen-quote -- '\'' -- becomes one literal ').
+    $prefix = 'echo '
+    $suffix = ' | chpasswd'
+    if (-not $shellCommand.StartsWith($prefix)) { throw "Unexpected shell command prefix: $shellCommand" }
+    if (-not $shellCommand.EndsWith($suffix)) { throw "Unexpected shell command suffix: $shellCommand" }
+    $quotedLiteral = $shellCommand.Substring($prefix.Length, $shellCommand.Length - $prefix.Length - $suffix.Length)
+    if (-not ($quotedLiteral.StartsWith("'") -and $quotedLiteral.EndsWith("'"))) { throw "Not a single-quoted literal: $quotedLiteral" }
+    $inner = $quotedLiteral.Substring(1, $quotedLiteral.Length - 2)
+    $unescaped = $inner.Replace("'\''", "'")
+
+    $colonIndex = $unescaped.IndexOf(':')
+    if ($colonIndex -lt 0) { throw "No ':' separator found in recovered 'user:password': $unescaped" }
+    $recoveredUserName = $unescaped.Substring(0, $colonIndex)
+    $recoveredPassword = $unescaped.Substring($colonIndex + 1)
+
+    Assert-Equal $recoveredUserName $userName
+    Assert-Equal $recoveredPassword $plainPassword
 }
 
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."

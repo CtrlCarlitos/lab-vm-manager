@@ -2099,6 +2099,90 @@ function New-LabPatchedBootableLinuxIso {
     return [pscustomobject]@{ Patched = $true; Reason = $null; OutputPath = $OutputPath }
 }
 
+# The standard, mechanical POSIX-shell single-quoted-literal escape: a value wrapped in '...' is a
+# shell literal with NO escape character at all, so it is inherently immune to $, `, \, and " inside
+# it -- the only character that needs any handling is an embedded single quote itself, which closes
+# the literal, inserts an escaped literal quote ('\''), then reopens the literal. A small,
+# independently-testable primitive, not folded into New-LabLinuxAutoinstallUserData below.
+function ConvertTo-LabPosixShellSingleQuoted {
+    param([string]$Value)
+    return "'" + $Value.Replace("'", "'\''") + "'"
+}
+
+# Linux `adduser`-compatible username rule: lowercase letters, digits, underscore and hyphen only,
+# must start with a lowercase letter or underscore, 1-32 characters total.
+function Test-LabLinuxUserName {
+    param([string]$Value)
+    return [bool]($Value -cmatch '^[a-z_][a-z0-9_-]{0,31}$')
+}
+
+# Pure string builder: no I/O, no COM, no Hyper-V. Its only job is to hand back a well-formed Ubuntu
+# autoinstall user-data YAML document for Task 6's orchestrator to write into the NoCloud seed ISO
+# via New-LabSeedIso. identity.password below is never the real password -- Subiquity's schema wants
+# a crypt(3) hash there, which .NET cannot produce, so it carries a fixed placeholder hash (nobody
+# holds this plaintext) and late-commands overwrites the account's real password via chpasswd once
+# curtin has a target to run commands in -- see the design doc's "Already proven" section.
+#
+# The real password crosses two separate syntax layers on its way into that late-commands entry, and
+# each is escaped with its own purpose-built, mechanical routine -- never ad hoc character
+# replacement. First, ConvertTo-LabPosixShellSingleQuoted wraps "username:password" as a POSIX shell
+# single-quoted literal, giving the exact argument `sh -c` will see after curtin's shell parses it.
+# Then that whole shell command string is embedded in the YAML document as a double-quoted scalar,
+# built via ConvertTo-Json -Compress: a JSON double-quoted string literal is also a valid YAML
+# double-quoted scalar (both escape \ and " the same way, and both accept \uXXXX for anything else),
+# so this reuses .NET's own tested JSON escaper instead of writing a second, separate escaper for a
+# mechanically identical job. Each layer only has to defend against the characters that are special
+# to IT -- the shell layer makes the password's literal bytes opaque to the shell, and the YAML layer
+# then only has to carry that already-opaque literal safely as a string scalar -- so the two layers
+# compose safely without either one needing to know about the other's special characters.
+function New-LabLinuxAutoinstallUserData {
+    param(
+        [string]$ComputerName,
+        [string]$Locale,
+        [string]$TimeZone,
+        [string]$UserName,
+        [securestring]$Password,
+        [string]$SshPublicKey
+    )
+    # Same discipline as New-LabWindowsAnswerFileXml: the SecureString is decrypted to plaintext only
+    # in this narrow scope, for exactly as long as it takes to build the escaped late-commands shell
+    # command below, then the unmanaged memory holding it is explicitly zeroed and freed in the
+    # finally -- never logged, never written anywhere by this function itself.
+    $passwordPtr = [IntPtr]::Zero
+    try {
+        $passwordPtr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Password)
+        $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($passwordPtr)
+        $shellCommand = 'echo ' + (ConvertTo-LabPosixShellSingleQuoted "${UserName}:${plainPassword}") + ' | chpasswd'
+        $yamlEscapedShellCommand = $shellCommand | ConvertTo-Json -Compress
+    } finally {
+        if ($passwordPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($passwordPtr) }
+    }
+    # Fixed placeholder hash, constructed to be syntactically plausible ($6$<salt>$<hash> SHA-512-crypt
+    # shape, correct character set and length) -- nobody holds this plaintext, and late-commands above
+    # replaces the account's real password before first login, so this value is never actually used to
+    # authenticate anything; see this function's own header comment.
+    $placeholderPasswordHash = '$6$sC.928AhS010gxvH$9LC/yT6v693W6axhWTNu07.eGwkJ47zI7PG1gCGbu3pX3KWHaHv3lgzfvw3wJssZXDLprDBykUMgBIWHdt78mP'
+    return @"
+autoinstall:
+  version: 1
+  identity:
+    hostname: $ComputerName
+    username: $UserName
+    password: "$placeholderPasswordHash"
+  locale: $Locale
+  timezone: $TimeZone
+  ssh:
+    install-server: true
+    authorized-keys:
+      - $SshPublicKey
+  late-commands:
+    - [curtin, in-target, --, sh, -c, $yamlEscapedShellCommand]
+  storage:
+    layout:
+      name: direct
+"@
+}
+
 # Patches a Windows installer ISO's EFI boot-loader image (efi\microsoft\boot\efisys.bin) in place
 # with its own no-prompt variant (efisys_noprompt.bin), so Hyper-V Gen2's "Press any key to boot
 # from CD or DVD" prompt never appears. Never modifies $SourceIsoPath itself -- always writes a
