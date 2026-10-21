@@ -5436,6 +5436,40 @@ Test-Case 'Complete-LabLinuxProvisioning removes the seed drive and ejects (not 
     $applied = @($script:SetVMFirmwareBootOrderCalls[0])
     Assert-Equal (Get-LabBootEntryKind $applied[0]) 'Disk'
 }
+Test-Case 'Complete-LabLinuxProvisioning finds the Linux drive by elimination when the installer already self-ejected it' {
+    $linuxIso = 'D:\iso\linux.iso'
+    $seedIso = 'D:\iso\seed.iso'
+    $script:FakeDvdDrives.Clear()
+    $linuxDrive = [pscustomobject]@{ Path = '' }
+    $seedDrive = [pscustomobject]@{ Path = $seedIso }
+    $script:FakeDvdDrives.Add($linuxDrive)
+    $script:FakeDvdDrives.Add($seedDrive)
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:RemoveVMDvdDriveCalls.Clear()
+    $script:SetVMFirmwareBootOrderCalls.Clear()
+    $script:FakeFirmware.BootOrder = @((New-FakeBootEntry 'Dvd'), (New-FakeBootEntry 'Disk'))
+    Complete-LabLinuxProvisioning $script:FakeId $linuxIso $seedIso
+    Assert-Equal $script:RemoveVMDvdDriveCalls.Count 1
+    Assert-Equal ([object]::ReferenceEquals($script:RemoveVMDvdDriveCalls[0], $seedDrive)) $true
+    Assert-Equal $script:FakeDvdDrives.Count 1
+    Assert-Equal $script:SetVMDvdDriveCalls.Count 1
+    Assert-Equal $linuxDrive.Path ''
+    Assert-Equal $script:SetVMFirmwareBootOrderCalls.Count 1
+}
+Test-Case 'Complete-LabLinuxProvisioning throws when the non-seed drive has an unexpected path' {
+    $script:FakeDvdDrives.Clear()
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'D:\iso\unexpected.iso' })
+    $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'D:\iso\seed.iso' })
+    $script:SetVMDvdDriveCalls.Clear()
+    $script:RemoveVMDvdDriveCalls.Clear()
+    try {
+        Assert-Throws { Complete-LabLinuxProvisioning $script:FakeId 'D:\iso\linux.iso' 'D:\iso\seed.iso' } 'unexpected path'
+        Assert-Equal $script:SetVMDvdDriveCalls.Count 0
+        Assert-Equal $script:RemoveVMDvdDriveCalls.Count 0
+    } finally {
+        $script:FakeDvdDrives.Clear()
+    }
+}
 Test-Case 'Complete-LabLinuxProvisioning throws clearly when neither known ISO path matches an attached drive' {
     $script:FakeDvdDrives.Clear()
     $script:FakeDvdDrives.Add([pscustomobject]@{ Path = 'D:\iso\other1.iso' })

@@ -2717,13 +2717,22 @@ function Complete-LabLinuxProvisioning {
     $vm = Assert-LabVMOff $VMId
     $drives = @(Get-VMDvdDrive -VM $vm -ErrorAction Stop)
     $seedDrive = @($drives | Where-Object { [string]$_.Path -eq $SeedIsoPath })
-    $linuxDrive = @($drives | Where-Object { [string]$_.Path -eq $LinuxIsoPath })
-    if ($seedDrive.Count -ne 1 -or $linuxDrive.Count -ne 1) {
-        throw "'$($vm.Name)': could not find exactly one DVD drive attached to each of the seed ISO and the Linux ISO (found $($seedDrive.Count) matching the seed path, $($linuxDrive.Count) matching the Linux ISO path). Check the drives manually in Hyper-V Manager."
+    # The Linux drive is identified by elimination, not by matching $LinuxIsoPath: confirmed live
+    # (2026-10-21), the installer ejects its own media as part of its own completion, so by the time
+    # this runs its Path is normally already empty, not $LinuxIsoPath. A drive that is neither the
+    # seed drive nor already empty/still the Linux ISO is treated as unexpected rather than guessed at.
+    $otherDrives = @($drives | Where-Object { [string]$_.Path -ne $SeedIsoPath })
+    if ($seedDrive.Count -ne 1 -or $otherDrives.Count -ne 1) {
+        throw "'$($vm.Name)': could not find exactly one DVD drive for the seed ISO and exactly one other DVD drive for the Linux installer (found $($seedDrive.Count) matching the seed path, $($otherDrives.Count) other drive(s) of $($drives.Count) total). Check the drives manually in Hyper-V Manager."
+    }
+    $linuxDrive = $otherDrives
+    if (-not [string]::IsNullOrEmpty($linuxDrive[0].Path) -and [string]$linuxDrive[0].Path -ne $LinuxIsoPath) {
+        throw "'$($vm.Name)': the drive that should hold the Linux installer ISO has an unexpected path ('$($linuxDrive[0].Path)', neither empty nor '$LinuxIsoPath'). Check the drives manually in Hyper-V Manager."
     }
     # The seed drive (its job was only to deliver the NoCloud user-data/meta-data to the installer) is
     # removed entirely. The installer drive is only ejected, keeping the drive itself in place --
-    # matching Remove-LabVMInstallMedia's own "the drive itself stays" behavior.
+    # matching Remove-LabVMInstallMedia's own "the drive itself stays" behavior. It may already be
+    # empty (the installer's own self-eject); setting an already-$null path is a harmless no-op.
     Remove-VMDvdDrive -VMDvdDrive $seedDrive[0] -Confirm:$false -ErrorAction Stop
     Set-VMDvdDrive -VMDvdDrive $linuxDrive[0] -Path $null -Confirm:$false -ErrorAction Stop
     Set-LabVMBootOrder $VMId 'Disk'
