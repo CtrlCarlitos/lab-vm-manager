@@ -987,7 +987,7 @@ class SourceContract(unittest.TestCase):
         self.assertIn('default { $rawMessage }', body)
     def test_unattended_media_confirms_windows_drive_boot_entry(self):
         body = self.s.split('function Set-LabVMUnattendedInstallMedia {', 1)[1].split('\nfunction ', 1)[0]
-        self.assertLess(body.index("Set-LabVMBootOrder $VMId 'Dvd'"), body.index('Get-VMFirmware -VM $vm -ErrorAction Stop'))
+        self.assertLess(body.index("Set-LabVMBootOrder $VMId @('Dvd', 'Disk')"), body.index('Get-VMFirmware -VM $vm -ErrorAction Stop'))
         self.assertIn('Get-LabBootEntryKind', body)
     def test_provisioning_off_wait_has_its_own_floor(self):
         body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]

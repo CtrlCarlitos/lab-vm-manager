@@ -2655,13 +2655,16 @@ function Set-LabVMUnattendedLinuxInstallMedia {
     Set-VMDvdDrive -VMDvdDrive $seedDrive -Path $SeedIsoPath -Confirm:$false -ErrorAction Stop
 
     # Both new drives are DVD-kind; which one ends up first doesn't matter -- UEFI firmware skips a
-    # non-bootable disc and falls through, so the seed drive being tried first costs nothing.
-    Set-LabVMBootOrder $VMId 'Dvd'
+    # non-bootable disc and falls through, so the seed drive being tried first costs nothing. Disk
+    # is ordered right after the DVDs (ahead of the network adapter) in the SAME call, not a later
+    # one: see Set-LabVMBootOrder's own header comment for why the installer's self-eject makes
+    # that matter on this VM's very next boot, before Complete-LabLinuxProvisioning ever runs.
+    Set-LabVMBootOrder $VMId @('Dvd', 'Disk')
 
     # Set-LabVMBootOrder only guarantees that SOME DVD-kind entry was recognized and moved first. If
     # only the seed drive's entry was, it still "succeeds", and the real failure (the installer never
-    # boots) would surface only as an opaque PowerShell Direct timeout much later. So re-read the
-    # applied order and confirm that one of its leading DVD entries is the Linux installer drive.
+    # boots) would surface only as an opaque SSH-login timeout much later. So re-read the applied
+    # order and confirm that one of its leading DVD entries is the Linux installer drive.
     $appliedOrder = @((Get-VMFirmware -VM $vm -ErrorAction Stop).BootOrder)
     $linuxEntryFound = $false
     foreach ($entry in $appliedOrder) {
@@ -3001,20 +3004,38 @@ function Write-LabLinuxProvisioningNote {
 }
 
 function Set-LabVMBootOrder {
-    param([guid]$VMId, [ValidateSet('Dvd', 'Disk')][string]$Preference)
-    # Deliberately generic: puts the chosen device class first without deleting any other existing
-    # boot-order entry, so the Windows/Linux unattended-install plans can reuse this for "swap back to
-    # disk-first after the installer's first reboot", not just this plan's "DVD first" need.
+    param([guid]$VMId, [ValidateSet('Dvd', 'Disk')][string[]]$Preference)
+    # Deliberately generic: puts the chosen device classes first, in the given order, without
+    # deleting any other existing boot-order entry, so the Windows/Linux unattended-install plans
+    # can reuse this for "swap back to disk-first after the installer's first reboot", not just
+    # this plan's "DVD first" need.
+    #
+    # A single class is not enough during the DVD-first install boot, though: confirmed live
+    # (2026-10-21), the Ubuntu Desktop installer ejects its own DVD before its OWN internal reboot
+    # into the just-installed system (so it never boots back into itself) -- unlike Windows Setup,
+    # which keeps its DVD attached and chainloads across its own reboots. That means this exact
+    # reboot needs the firmware to fall through PAST the now-empty/non-bootable DVD entries straight
+    # to the disk -- and a fresh Generation 2 VM's default boot order lists the network adapter
+    # BEFORE the disk, so without this, that fall-through hits the network adapter first and can
+    # hang indefinitely on a PXE boot nobody wants (a blank, totally unresponsive console -- no
+    # OS has loaded yet, so no keypress does anything). Passing @('Dvd', 'Disk') orders the disk
+    # ahead of the network adapter too, at the same time the DVD is put first for the install boot
+    # itself, so no later "disk-first" call is needed before that self-triggered reboot can occur.
     $vm = Assert-LabVMOff $VMId
     $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
     $currentOrder = @($firmware.BootOrder)
-    $preferred = @($currentOrder | Where-Object { (Get-LabBootEntryKind $_) -eq $Preference })
-    $rest = @($currentOrder | Where-Object { (Get-LabBootEntryKind $_) -ne $Preference })
-    if ($preferred.Count -eq 0) {
-        # Fail loudly rather than "succeed" with an unchanged order the operator would assume was set.
-        throw "'$($vm.Name)': no $Preference entry was recognized in the firmware boot order, so it was left unchanged. Check Firmware > Boot order in Hyper-V Manager and set it manually."
+    $placed = [Collections.Generic.List[object]]::new()
+    $placedSet = [Collections.Generic.List[object]]::new()
+    foreach ($kind in $Preference) {
+        $matches = @($currentOrder | Where-Object { (Get-LabBootEntryKind $_) -eq $kind -and -not $placedSet.Contains($_) })
+        if ($matches.Count -eq 0) {
+            # Fail loudly rather than "succeed" with an unchanged order the operator would assume was set.
+            throw "'$($vm.Name)': no $kind entry was recognized in the firmware boot order, so it was left unchanged. Check Firmware > Boot order in Hyper-V Manager and set it manually."
+        }
+        foreach ($entry in $matches) { $placed.Add($entry); $placedSet.Add($entry) }
     }
-    $newOrder = @($preferred + $rest)
+    $rest = @($currentOrder | Where-Object { -not $placedSet.Contains($_) })
+    $newOrder = @($placed + $rest)
     Set-VMFirmware -VM $vm -BootOrder $newOrder -Confirm:$false -ErrorAction Stop
 }
 
@@ -3064,8 +3085,12 @@ function Set-LabVMUnattendedInstallMedia {
     Set-VMDvdDrive -VMDvdDrive $seedDrive -Path $SeedIsoPath -Confirm:$false -ErrorAction Stop
 
     # Both new drives are DVD-kind; which one ends up first doesn't matter -- UEFI firmware skips a
-    # non-bootable disc and falls through, so the seed drive being tried first costs nothing.
-    Set-LabVMBootOrder $VMId 'Dvd'
+    # non-bootable disc and falls through, so the seed drive being tried first costs nothing. Disk
+    # is ordered right after, ahead of the network adapter, in the same call as a defensive measure:
+    # Windows Setup's own reboots chainload from the still-attached DVD rather than needing this
+    # fall-through today, but there is no reason to leave this VM one disc-eject away from the same
+    # network-adapter-ahead-of-disk hang Set-LabVMBootOrder's header comment describes for Linux.
+    Set-LabVMBootOrder $VMId @('Dvd', 'Disk')
 
     # Set-LabVMBootOrder only guarantees that SOME DVD-kind entry was recognized and moved first. If
     # only the seed drive's entry was, it still "succeeds", and the real failure (the installer never
