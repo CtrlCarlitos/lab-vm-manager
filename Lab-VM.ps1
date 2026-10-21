@@ -1743,6 +1743,38 @@ function Test-LabWindowsIsoInScope {
     return @($Images | Where-Object IsWindows11Client).Count -gt 0
 }
 
+# Read-only: mounts $IsoPath to read Ubuntu's own .disk/info (one plain-text file at the volume
+# root) and reports whether it names an in-scope release, Ubuntu 26.04.x Desktop. Ubuntu names
+# Desktop releases plainly ("Ubuntu 26.04.1 LTS ...") and Server releases "Ubuntu-Server ...", so
+# the Server exclusion is a second check on top of the release pattern. Always dismounts in a
+# finally, even when a step throws. Mount-DiskImage/Get-Volume/Dismount-DiskImage pairing and the
+# $mounted dismount guard are identical to Get-LabWindowsInstallImages above.
+function Get-LabLinuxIsoInfo {
+    param([string]$IsoPath)
+    $mounted = $false
+    try {
+        $mountResult = Mount-DiskImage -ImagePath $IsoPath -PassThru -ErrorAction Stop
+        $mounted = $true
+        $volume = Get-Volume -DiskImage $mountResult -ErrorAction Stop
+        # Plain string concatenation, not Join-Path, for the same drive-letter reason as above.
+        $infoFile = "$($volume.DriveLetter):\.disk\info"
+        if (-not (Test-Path -LiteralPath $infoFile -PathType Leaf)) {
+            return [pscustomobject]@{ ReleaseText = ''; IsUbuntuDesktopInScope = $false }
+        }
+        $releaseText = [string](Get-Content -LiteralPath $infoFile -Raw -ErrorAction Stop)
+        # In scope = Ubuntu 26.04.x Desktop: a 26.04 release line that is not a Server release.
+        return [pscustomobject]@{
+            ReleaseText = $releaseText
+            IsUbuntuDesktopInScope = ($releaseText -match 'Ubuntu 26\.04(\.\d+)? LTS' -and $releaseText -notmatch 'Server')
+        }
+    } finally {
+        # Only dismount if Mount-DiskImage itself actually succeeded, for the same reason as above.
+        if ($mounted) {
+            [void](Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop)
+        }
+    }
+}
+
 # Patches a Windows installer ISO's EFI boot-loader image (efi\microsoft\boot\efisys.bin) in place
 # with its own no-prompt variant (efisys_noprompt.bin), so Hyper-V Gen2's "Press any key to boot
 # from CD or DVD" prompt never appears. Never modifies $SourceIsoPath itself -- always writes a

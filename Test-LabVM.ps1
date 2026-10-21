@@ -61,7 +61,7 @@ $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointNa
     'Get-LabBootEntryKind', 'Format-LabBootEntry', 'Show-LabVMInstallMediaConfiguration',
     'Get-LabVMInstallationMediaPreview', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope',
     'New-LabPatchedBootableIso', 'Set-LabVMUnattendedInstallMedia', 'Complete-LabWindowsProvisioning',
-    'New-LabWindowsAnswerFileXml', 'Wait-LabPSDirectSession')
+    'New-LabWindowsAnswerFileXml', 'Wait-LabPSDirectSession', 'Get-LabLinuxIsoInfo')
 $definitions = $ast.FindAll({ param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $true)
@@ -4035,6 +4035,97 @@ Test-HyperVDriftCase 'Drift guard: every Hyper-V cmdlet call in Lab-VM.ps1 uses 
         }
     }
     if ($checked -lt 20) { throw "Expected to check many Hyper-V calls in Lab-VM.ps1; checked $checked." }
+}
+
+# --- Linux unattended install, Task 1: Get-LabLinuxIsoInfo ---
+# Fakes for Mount-DiskImage, Get-Volume, Dismount-DiskImage, Test-Path and Get-Content, standing in
+# for the cmdlets Get-LabLinuxIsoInfo calls. Same Mount-DiskImage -PassThru | Get-Volume pairing as
+# Get-LabWindowsInstallImages. Defined last in this file so nothing after this section sees them.
+$script:LinuxMountCalls = 0
+$script:LinuxDismountCalls = 0
+$script:FakeLinuxDriveLetter = 'Y'
+$script:FakeLinuxInfoExists = $true
+$script:FakeLinuxInfoText = ''
+$script:FakeLinuxInfoReadThrows = $null
+
+function Mount-DiskImage {
+    [CmdletBinding()]
+    param([string]$ImagePath, [switch]$PassThru)
+    $script:LinuxMountCalls++
+    if ($PassThru) { return [pscustomobject]@{ ImagePath = $ImagePath } }
+}
+function Get-Volume {
+    [CmdletBinding()]
+    param($DiskImage)
+    return [pscustomobject]@{ DriveLetter = $script:FakeLinuxDriveLetter }
+}
+function Dismount-DiskImage {
+    [CmdletBinding()]
+    param([string]$ImagePath)
+    $script:LinuxDismountCalls++
+    return [pscustomobject]@{ ImagePath = $ImagePath; Attached = $false }
+}
+function Test-Path {
+    [CmdletBinding()]
+    param([string]$LiteralPath, [string]$Path, [string]$PathType, [switch]$IsValid)
+    $target = if ($PSBoundParameters.ContainsKey('LiteralPath')) { $LiteralPath } elseif ($PSBoundParameters.ContainsKey('Path')) { $Path } else { $null }
+    if ($target -eq "$($script:FakeLinuxDriveLetter):\.disk\info") { return $script:FakeLinuxInfoExists }
+    return Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+}
+function Get-Content {
+    [CmdletBinding()]
+    param([string]$LiteralPath, [switch]$Raw)
+    if ($LiteralPath -eq "$($script:FakeLinuxDriveLetter):\.disk\info") {
+        if ($null -ne $script:FakeLinuxInfoReadThrows) { throw $script:FakeLinuxInfoReadThrows }
+        return $script:FakeLinuxInfoText
+    }
+    return Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
+}
+function Reset-LabLinuxIsoFakes {
+    $script:LinuxMountCalls = 0
+    $script:LinuxDismountCalls = 0
+    $script:FakeLinuxInfoExists = $true
+    $script:FakeLinuxInfoText = ''
+    $script:FakeLinuxInfoReadThrows = $null
+}
+
+Test-Case 'Get-LabLinuxIsoInfo: an Ubuntu 26.04 Desktop release is in scope and ReleaseText is the exact .disk/info text' {
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoText = 'Ubuntu 26.04.1 LTS "Example" - Release amd64'
+    $info = Get-LabLinuxIsoInfo 'C:\iso\ubuntu.iso'
+    Assert-Equal $info.ReleaseText 'Ubuntu 26.04.1 LTS "Example" - Release amd64'
+    Assert-Equal $info.IsUbuntuDesktopInScope $true
+    Assert-Equal $script:LinuxMountCalls 1
+    Assert-Equal $script:LinuxDismountCalls 1
+}
+Test-Case 'Get-LabLinuxIsoInfo: an Ubuntu Server 26.04 release is out of scope' {
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoText = 'Ubuntu-Server 26.04.1 LTS "Example" - Release amd64'
+    $info = Get-LabLinuxIsoInfo 'C:\iso\server.iso'
+    Assert-Equal $info.IsUbuntuDesktopInScope $false
+    Assert-Equal $script:LinuxDismountCalls 1
+}
+Test-Case 'Get-LabLinuxIsoInfo: an Ubuntu 24.04 Desktop release is out of scope' {
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoText = 'Ubuntu 24.04.1 LTS "Example" - Release amd64'
+    $info = Get-LabLinuxIsoInfo 'C:\iso\ubuntu2404.iso'
+    Assert-Equal $info.ReleaseText 'Ubuntu 24.04.1 LTS "Example" - Release amd64'
+    Assert-Equal $info.IsUbuntuDesktopInScope $false
+}
+Test-Case 'Get-LabLinuxIsoInfo: a mounted ISO with no .disk/info returns empty ReleaseText and no error' {
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoExists = $false
+    $info = Get-LabLinuxIsoInfo 'C:\iso\not-ubuntu.iso'
+    Assert-Equal $info.ReleaseText ''
+    Assert-Equal $info.IsUbuntuDesktopInScope $false
+    Assert-Equal $script:LinuxDismountCalls 1
+}
+Test-Case 'Get-LabLinuxIsoInfo: Dismount-DiskImage still runs, in a finally, when reading .disk/info throws' {
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoReadThrows = 'simulated .disk/info read failure'
+    Assert-Throws { Get-LabLinuxIsoInfo 'C:\iso\bad.iso' } 'simulated .disk/info read failure'
+    Assert-Equal $script:LinuxMountCalls 1
+    Assert-Equal $script:LinuxDismountCalls 1
 }
 
 Write-Host "`nHelper tests: $script:Passed passed; $script:Failed failed."

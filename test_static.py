@@ -786,6 +786,18 @@ class SourceContract(unittest.TestCase):
         self.assertIn("-eq 'Client'", body)
         self.assertIn('22000', body)
 
+    # --- Linux unattended install, Task 1: Ubuntu release/scope check ---
+    def test_linux_iso_info_function_exists(self):
+        self.assertIn('function Get-LabLinuxIsoInfo', self.s)
+    def test_linux_iso_info_always_dismounts(self):
+        body = self.s.split('function Get-LabLinuxIsoInfo {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('finally', body)
+        self.assertIn('Dismount-DiskImage', body)
+    def test_linux_iso_info_scope_rule(self):
+        body = self.s.split('function Get-LabLinuxIsoInfo {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('26.04', body)
+        self.assertIn('Desktop', body)
+
     # --- Windows unattended install, Task 2: no-prompt boot-loader patch ---
     def test_boot_patch_function_exists(self):
         self.assertIn('function New-LabPatchedBootableIso', self.s)
