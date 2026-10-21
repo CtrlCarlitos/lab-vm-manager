@@ -118,8 +118,11 @@
 .PARAMETER ProductKey
     Windows product key, as five groups of five letters/digits separated by dashes (e.g.
     'AAAAA-BBBBB-CCCCC-DDDDD-EEEEE'). Default: '' (no product key, no activation). Optional; supply a
-    real key, or the well-known dummy all-zero key '00000-00000-00000-00000-00000' to suppress a
-    product-key prompt on some multi-edition ISOs without activating anything.
+    real key, or Microsoft's own "generic" edition-matching key (e.g. 'YTMG3-N6DKC-DKB77-7M9GH-8HVX7'
+    for Home, 'VK7JG-NPHTM-C97JM-9MPGT-3V66T' for Pro; must match -OsEdition) to suppress a
+    product-key prompt on some multi-edition ISOs without activating anything. An all-zero placeholder
+    does NOT work: real Windows keys never contain the digit 0, so Setup's own key field refuses it
+    outright -- confirmed live.
 .PARAMETER VhdxSizeGB
     New dynamic VHDX maximum size in GB (default 150; 64-65536).
 .PARAMETER VCpuCount
