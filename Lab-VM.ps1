@@ -1786,16 +1786,29 @@ function Get-LabLinuxIsoInfo {
 # than guess) this function follows directly.
 #
 # This is pure byte-array math over the ISO9660/Joliet structure (ECMA-119), parsed directly from
-# $SourceIsoPath ON DISK, never a mounted volume -- same discipline as New-LabPatchedBootableIso. A
-# Primary Volume Descriptor at sector 16 and a Supplementary (Joliet) Volume Descriptor at sector 17
-# (identified by its UCS-2 Level 3 escape sequence, bytes 0x25 0x2F 0x45 ("%/E") at byte offset 88)
-# each carry a 34-byte root directory record at byte offset 156 within the descriptor's own
-# 2048-byte sector (ECMA-119 8.4/8.5/9.1: a directory record whose own file identifier is a single
-# NUL byte is always exactly 34 bytes, so this offset is fixed, not walked). From there, grub.cfg is
-# found by walking root -> boot -> grub -> grub.cfg in BOTH trees independently -- the primary
-# tree's plain ASCII names, the Joliet tree's UCS-2BE-encoded names -- since the two trees are
-# parallel, separately-recorded namespaces, normally over the very same file data. Each directory
-# record (ECMA-119 9.1) is variable-length: byte 0 is the record's own length; bytes 2-9 and 10-17
+# $SourceIsoPath ON DISK, never a mounted volume -- same discipline as New-LabPatchedBootableIso.
+# The Primary Volume Descriptor is always at sector 16, but the Joliet Supplementary Volume
+# Descriptor is NOT reliably at a fixed sector: any El-Torito-bootable ISO (e.g. Hyper-V Gen2/UEFI
+# booting this very ISO) also carries a type-0 Boot Record Volume Descriptor -- typically at
+# sector 17, same as New-LabPatchedBootableIso's own El Torito BRVD read below -- which pushes a
+# real Ubuntu ISO's Joliet SVD to sector 18 or later, never 17. So the volume descriptor set
+# starting at sector 16 is scanned one 2048-byte descriptor at a time until a type-255 terminator
+# descriptor is hit, taking the first Primary Volume Descriptor (type 1) and the first
+# Supplementary Volume Descriptor
+# (type 2) whose escape-sequence bytes (offset 88, 32 bytes) name a Joliet Level 1/2/3 sequence
+# ("%/@", "%/C", or "%/E"). Both descriptors carry a 34-byte root directory record at byte offset
+# 156 within the descriptor's own 2048-byte sector (ECMA-119 8.4/8.5/9.1: a directory record whose
+# own file identifier is a single NUL byte is always exactly 34 bytes, so this offset is fixed, not
+# walked). From there, grub.cfg is found by walking root -> boot -> grub -> grub.cfg in BOTH trees
+# independently -- the primary tree's plain ASCII names, the Joliet tree's UCS-2BE-encoded names --
+# since the two trees are parallel, separately-recorded namespaces, normally over the very same
+# file data. Real ISO9660-authoring tools (xorriso/libisofs) emit primary-tree names as
+# uppercase-only d-characters with a trailing ";<version>" on file names (e.g. "GRUB.CFG;1"), and
+# the Joliet tree's leaf is typically "grub.cfg;1" too, not bare "grub.cfg" -- so each path
+# component's identifier is normalized before comparing (the ";<version>" suffix stripped in both
+# trees), and the primary tree's normalized names are compared case-insensitively (Joliet supports
+# mixed case natively, so real tools preserve the original case there -- it stays case-sensitive).
+# Each directory record (ECMA-119 9.1) is variable-length: byte 0 is the record's own length; bytes 2-9 and 10-17
 # are the extent location and data length, each in ISO9660's "both-byte-order" (LSB_MSB) 8-byte
 # encoding (a 4-byte little-endian copy, then a 4-byte big-endian copy, of the same 32-bit value);
 # byte 32 is the file identifier's own length, and the identifier itself starts at byte 33. A
@@ -1876,7 +1889,14 @@ function New-LabPatchedBootableLinuxIso {
                 $isDotEntry = ($lenFi -eq 1 -and ($fileIdBytes[0] -eq 0 -or $fileIdBytes[0] -eq 1))
                 if (-not $isDotEntry) {
                     $fileName = if ($Joliet) { [Text.Encoding]::BigEndianUnicode.GetString($fileIdBytes) } else { [Text.Encoding]::ASCII.GetString($fileIdBytes) }
-                    if ($fileName -ceq $Name) {
+                    # Real authoring tools append ";<version>" to file identifiers in BOTH trees
+                    # (e.g. "GRUB.CFG;1" primary, "grub.cfg;1" Joliet) -- strip it before comparing.
+                    # The primary tree's d-characters are uppercase-only by the ISO9660 Level 1/2
+                    # charset, so its normalized name is compared case-insensitively; Joliet natively
+                    # supports mixed case and real tools preserve it there, so it stays case-sensitive.
+                    $normalizedFileName = $fileName -replace ';\d+$', ''
+                    $isNameMatch = if ($Joliet) { $normalizedFileName -ceq $Name } else { $normalizedFileName -ieq $Name }
+                    if ($isNameMatch) {
                         return [pscustomobject]@{
                             ExtentSector = [int64][BitConverter]::ToUInt32($chunk, $pos + 2)
                             DataLength = [uint32][BitConverter]::ToUInt32($chunk, $pos + 10)
@@ -1912,26 +1932,63 @@ function New-LabPatchedBootableLinuxIso {
         return [pscustomobject]@{ Record = $record; MissingComponent = $null }
     }
 
-    $pvd = & $readIsoBytes $SourceIsoPath ([int64]16 * $sectorSize) $sectorSize
-    if ($pvd[0] -ne 1 -or [Text.Encoding]::ASCII.GetString($pvd, 1, 5) -ne 'CD001') {
+    # Scan the volume descriptor set starting at sector 16, one 2048-byte descriptor at a time,
+    # until a type-255 terminator descriptor is hit. The Joliet SVD cannot be assumed to be at a
+    # fixed sector: an El-Torito-bootable ISO (type-0 Boot Record Volume Descriptor, typically at
+    # sector 17) pushes it to sector 18+. Take the first type-1 descriptor as the PVD, and the
+    # first type-2 descriptor whose escape-sequence bytes (offset 88) name a Joliet Level 1/2/3
+    # sequence as the Joliet SVD; other descriptor types (0 = Boot Record, 2 without a Joliet
+    # escape, etc.) are simply walked past.
+    $jolietEscapeSequences = @(
+        [byte[]]@(0x25, 0x2F, 0x40),  # Level 1: '%/@'
+        [byte[]]@(0x25, 0x2F, 0x43),  # Level 2: '%/C'
+        [byte[]]@(0x25, 0x2F, 0x45)   # Level 3: '%/E'
+    )
+    $pvd = $null
+    $svd = $null
+    $descriptorSector = [int64]16
+    while ($true) {
+        $descriptor = & $readIsoBytes $SourceIsoPath ($descriptorSector * $sectorSize) $sectorSize
+        if ([Text.Encoding]::ASCII.GetString($descriptor, 1, 5) -ne 'CD001') {
+            return [pscustomobject]@{
+                Patched = $false
+                Reason = "'$SourceIsoPath' has no valid ISO9660 volume descriptor at sector " +
+                    "$descriptorSector ('CD001' was not found there). This ISO's filesystem " +
+                    "structure isn't one this technique understands."
+                OutputPath = $null
+            }
+        }
+        $descriptorType = [int]$descriptor[0]
+        if ($descriptorType -eq 255) {
+            break
+        } elseif ($descriptorType -eq 1 -and $null -eq $pvd) {
+            $pvd = $descriptor
+        } elseif ($descriptorType -eq 2 -and $null -eq $svd) {
+            $escapeBytes = $descriptor[88..90]
+            foreach ($pattern in $jolietEscapeSequences) {
+                if ($escapeBytes[0] -eq $pattern[0] -and $escapeBytes[1] -eq $pattern[1] -and $escapeBytes[2] -eq $pattern[2]) {
+                    $svd = $descriptor
+                    break
+                }
+            }
+        }
+        $descriptorSector++
+    }
+    if ($null -eq $pvd) {
         return [pscustomobject]@{
             Patched = $false
-            Reason = "'$SourceIsoPath' has no Primary Volume Descriptor at sector 16 ('CD001' " +
-                "was not found there). This ISO's filesystem structure isn't one this technique " +
-                'understands.'
+            Reason = "'$SourceIsoPath' has no Primary Volume Descriptor in its volume descriptor " +
+                "set. This ISO's filesystem structure isn't one this technique understands."
             OutputPath = $null
         }
     }
-    $svd = & $readIsoBytes $SourceIsoPath ([int64]17 * $sectorSize) $sectorSize
-    $jolietEscape = $svd[88..90]
-    $isJolietEscape = ($svd[0] -eq 2 -and [Text.Encoding]::ASCII.GetString($svd, 1, 5) -eq 'CD001' -and
-        $jolietEscape[0] -eq 0x25 -and $jolietEscape[1] -eq 0x2F -and $jolietEscape[2] -eq 0x45)
-    if (-not $isJolietEscape) {
+    if ($null -eq $svd) {
         return [pscustomobject]@{
             Patched = $false
-            Reason = "'$SourceIsoPath' has no Joliet (UCS-2 Level 3) Supplementary Volume " +
-                "Descriptor at sector 17 (the '%/E' escape sequence was not found there). This " +
-                "ISO's filesystem structure isn't one this technique understands."
+            Reason = "'$SourceIsoPath' has no Joliet (UCS-2 Level 1/2/3) Supplementary Volume " +
+                "Descriptor in its volume descriptor set (no '%/@', '%/C', or '%/E' escape " +
+                "sequence was found on any Supplementary Volume Descriptor). This ISO's filesystem " +
+                "structure isn't one this technique understands."
             OutputPath = $null
         }
     }

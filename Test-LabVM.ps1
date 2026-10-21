@@ -4176,26 +4176,35 @@ function New-LabIso9660DirectorySectorBytes {
 }
 
 # Hand-builds a minimal, valid-shaped ISO9660+Joliet fixture file: a Primary Volume Descriptor
-# (sector 16) and a Joliet Supplementary Volume Descriptor (sector 17, identified by the UCS-2
-# Level 3 "%/E" escape sequence at byte offset 88), each with their own root directory record
-# (offset 156, 34 bytes -- fixed, since the root's own file identifier is a single NUL byte)
-# pointing at a parallel root -> boot -> grub -> grub.cfg chain of single-sector directory extents
-# (sectors 19/20 root, 21/22 boot, 23/24 grub; primary/Joliet respectively), with grub.cfg's own
-# content at sector 25 in BOTH trees -- a real ISO keeps ONE copy of a file's data referenced by
-# both namespaces, which is exactly what this fixture mirrors. $GrubCfgContent becomes grub.cfg's
-# exact recorded data length -- it is written at sector 25 verbatim, with the sector's remainder
-# left zero (real slack space to grow into, unless $GrubCfgContent itself is already a full 2048
-# bytes). $IncludeGrubCfgEntry=$false omits grub.cfg's own entry from the 'grub' directory extent
-# in both trees (simulating an ISO layout this technique's fixed root/boot/grub/grub.cfg path
-# doesn't find).
+# (sector 16), a Boot Record Volume Descriptor (sector 17, type 0 -- El Torito's own sector, just
+# present with type byte 0 so the real function's volume-descriptor-set scan has to walk past a
+# non-SVD descriptor, exactly like a real Hyper-V-bootable Ubuntu ISO), a Joliet Supplementary
+# Volume Descriptor (sector 18, identified by the UCS-2 Level 3 "%/E" escape sequence at byte
+# offset 88 -- deliberately NOT at the brief's originally-assumed fixed sector 17, which is where
+# the BRVD lives instead), and a Volume Descriptor Set Terminator (sector 19, type 255) so the scan
+# has a real stopping condition to prove against. The PVD and Joliet SVD each carry their own root
+# directory record (offset 156, 34 bytes -- fixed, since the root's own file identifier is a single
+# NUL byte) pointing at a parallel root -> boot -> grub -> grub.cfg chain of single-sector directory
+# extents (sectors 20/21 root, 22/23 boot, 24/25 grub; primary/Joliet respectively), with grub.cfg's
+# own content at sector 26 in BOTH trees -- a real ISO keeps ONE copy of a file's data referenced by
+# both namespaces, which is exactly what this fixture mirrors. The primary tree's directory names
+# are uppercase-only with a trailing ";<version>" on the file name ('BOOT', 'GRUB', 'GRUB.CFG;1'),
+# matching real xorriso/libisofs output; the Joliet tree keeps the "nice" lowercase names but still
+# versions its leaf ('boot', 'grub', 'grub.cfg;1'), so the patch function's identifier normalization
+# is genuinely exercised by this fixture, not assumed away. $GrubCfgContent becomes grub.cfg's exact
+# recorded data length -- it is written at sector 26 verbatim, with the sector's remainder left zero
+# (real slack space to grow into, unless $GrubCfgContent itself is already a full 2048 bytes).
+# $IncludeGrubCfgEntry=$false omits grub.cfg's own entry from the 'GRUB'/'grub' directory extent in
+# both trees (simulating an ISO layout this technique's fixed root/boot/grub/grub.cfg path doesn't
+# find).
 function New-LabFakeLinuxIso9660 {
     param([string]$Path, [string]$GrubCfgContent, [bool]$IncludeGrubCfgEntry = $true)
     $sectorSize = 2048
     $totalSectors = 30
-    $rootExtentPrimary = 19; $rootExtentJoliet = 20
-    $bootExtentPrimary = 21; $bootExtentJoliet = 22
-    $grubExtentPrimary = 23; $grubExtentJoliet = 24
-    $grubCfgExtent = 25
+    $rootExtentPrimary = 20; $rootExtentJoliet = 21
+    $bootExtentPrimary = 22; $bootExtentJoliet = 23
+    $grubExtentPrimary = 24; $grubExtentJoliet = 25
+    $grubCfgExtent = 26
 
     $bytes = New-Object byte[] ($totalSectors * $sectorSize)
 
@@ -4206,7 +4215,9 @@ function New-LabFakeLinuxIso9660 {
     $dot = [byte[]]@(0)
     $dotDot = [byte[]]@(1)
 
-    # 'grub' directory extents: '.', '..', and (unless suppressed) grub.cfg itself.
+    # 'grub'/'GRUB' directory extents: '.', '..', and (unless suppressed) grub.cfg itself. Primary
+    # tree: uppercase, versioned leaf ('GRUB.CFG;1'). Joliet tree: lowercase, versioned leaf
+    # ('grub.cfg;1') -- real tools version Joliet file leaves too, just not the directory names.
     $grubRecordsPrimary = [Collections.Generic.List[object]]::new()
     $grubRecordsPrimary.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot))
     $grubRecordsPrimary.Add((New-LabIso9660DirRecordBytes -ExtentSector $bootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot))
@@ -4214,17 +4225,18 @@ function New-LabFakeLinuxIso9660 {
     $grubRecordsJoliet.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot))
     $grubRecordsJoliet.Add((New-LabIso9660DirRecordBytes -ExtentSector $bootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot))
     if ($IncludeGrubCfgEntry) {
-        $grubRecordsPrimary.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubCfgExtent -DataLength $grubCfgBytes.Length -FileFlags 0x00 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('grub.cfg'))))
-        $grubRecordsJoliet.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubCfgExtent -DataLength $grubCfgBytes.Length -FileFlags 0x00 -FileIdBytes ([Text.Encoding]::BigEndianUnicode.GetBytes('grub.cfg'))))
+        $grubRecordsPrimary.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubCfgExtent -DataLength $grubCfgBytes.Length -FileFlags 0x00 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('GRUB.CFG;1'))))
+        $grubRecordsJoliet.Add((New-LabIso9660DirRecordBytes -ExtentSector $grubCfgExtent -DataLength $grubCfgBytes.Length -FileFlags 0x00 -FileIdBytes ([Text.Encoding]::BigEndianUnicode.GetBytes('grub.cfg;1'))))
     }
     [Array]::Copy((New-LabIso9660DirectorySectorBytes $grubRecordsPrimary.ToArray()), 0, $bytes, ($grubExtentPrimary * $sectorSize), $sectorSize)
     [Array]::Copy((New-LabIso9660DirectorySectorBytes $grubRecordsJoliet.ToArray()), 0, $bytes, ($grubExtentJoliet * $sectorSize), $sectorSize)
 
-    # 'boot' directory extents: '.', '..', and 'grub'.
+    # 'boot'/'BOOT' directory extents: '.', '..', and 'grub'/'GRUB'. Primary tree names are
+    # uppercase, unversioned (directories don't carry a ";<version>" suffix).
     $bootRecordsPrimary = @(
         (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
         (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot),
-        (New-LabIso9660DirRecordBytes -ExtentSector $grubExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('grub')))
+        (New-LabIso9660DirRecordBytes -ExtentSector $grubExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('GRUB')))
     )
     $bootRecordsJoliet = @(
         (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
@@ -4234,11 +4246,11 @@ function New-LabFakeLinuxIso9660 {
     [Array]::Copy((New-LabIso9660DirectorySectorBytes $bootRecordsPrimary), 0, $bytes, ($bootExtentPrimary * $sectorSize), $sectorSize)
     [Array]::Copy((New-LabIso9660DirectorySectorBytes $bootRecordsJoliet), 0, $bytes, ($bootExtentJoliet * $sectorSize), $sectorSize)
 
-    # Root directory extents: '.', '..', and 'boot'.
+    # Root directory extents: '.', '..', and 'boot'/'BOOT'.
     $rootRecordsPrimary = @(
         (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
         (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dotDot),
-        (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('boot')))
+        (New-LabIso9660DirRecordBytes -ExtentSector $bootExtentPrimary -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes ([Text.Encoding]::ASCII.GetBytes('BOOT')))
     )
     $rootRecordsJoliet = @(
         (New-LabIso9660DirRecordBytes -ExtentSector $rootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot),
@@ -4257,8 +4269,18 @@ function New-LabFakeLinuxIso9660 {
     [Array]::Copy($rootRecordPvd, 0, $pvd, 156, $rootRecordPvd.Length)
     [Array]::Copy($pvd, 0, $bytes, (16 * $sectorSize), $sectorSize)
 
-    # Supplementary (Joliet) Volume Descriptor (sector 17): type 2, 'CD001', the UCS-2 Level 3
-    # escape sequence (0x25 0x2F 0x45, "%/E") at byte offset 88, root directory record at offset 156.
+    # Boot Record Volume Descriptor (sector 17): type 0, 'CD001'. Doesn't need to be a fully
+    # valid/bootable El Torito BRVD -- just present with type byte 0, so the real function's
+    # volume-descriptor-set scan has to walk past a non-SVD, non-terminator descriptor to reach the
+    # Joliet SVD one sector later, exactly as a real El-Torito-bootable ISO forces it to.
+    $brvd = New-Object byte[] $sectorSize
+    $brvd[0] = 0
+    [Array]::Copy([Text.Encoding]::ASCII.GetBytes('CD001'), 0, $brvd, 1, 5)
+    [Array]::Copy($brvd, 0, $bytes, (17 * $sectorSize), $sectorSize)
+
+    # Supplementary (Joliet) Volume Descriptor (sector 18, NOT 17 -- that's the BRVD above): type 2,
+    # 'CD001', the UCS-2 Level 3 escape sequence (0x25 0x2F 0x45, "%/E") at byte offset 88, root
+    # directory record at offset 156.
     $svd = New-Object byte[] $sectorSize
     $svd[0] = 2
     [Array]::Copy([Text.Encoding]::ASCII.GetBytes('CD001'), 0, $svd, 1, 5)
@@ -4266,7 +4288,14 @@ function New-LabFakeLinuxIso9660 {
     $svd[88] = 0x25; $svd[89] = 0x2F; $svd[90] = 0x45
     $rootRecordSvd = New-LabIso9660DirRecordBytes -ExtentSector $rootExtentJoliet -DataLength $sectorSize -FileFlags 0x02 -FileIdBytes $dot
     [Array]::Copy($rootRecordSvd, 0, $svd, 156, $rootRecordSvd.Length)
-    [Array]::Copy($svd, 0, $bytes, (17 * $sectorSize), $sectorSize)
+    [Array]::Copy($svd, 0, $bytes, (18 * $sectorSize), $sectorSize)
+
+    # Volume Descriptor Set Terminator (sector 19): type 255, 'CD001' -- the scan's real stopping
+    # condition.
+    $terminator = New-Object byte[] $sectorSize
+    $terminator[0] = 255
+    [Array]::Copy([Text.Encoding]::ASCII.GetBytes('CD001'), 0, $terminator, 1, 5)
+    [Array]::Copy($terminator, 0, $bytes, (19 * $sectorSize), $sectorSize)
 
     [IO.File]::WriteAllBytes($Path, $bytes)
 }
@@ -4288,7 +4317,12 @@ function Find-LabFakeDirRecord {
         $isDotEntry = ($lenFi -eq 1 -and ($fileIdBytes[0] -eq 0 -or $fileIdBytes[0] -eq 1))
         if (-not $isDotEntry) {
             $fileName = if ($Joliet) { [Text.Encoding]::BigEndianUnicode.GetString($fileIdBytes) } else { [Text.Encoding]::ASCII.GetString($fileIdBytes) }
-            if ($fileName -ceq $Name) {
+            # Mirrors the real function's own normalization: strip a trailing ";<version>" suffix in
+            # either tree, then compare the primary tree case-insensitively (real uppercase d-chars)
+            # and the Joliet tree case-sensitively (real tools preserve Joliet's original case).
+            $normalizedFileName = $fileName -replace ';\d+$', ''
+            $isNameMatch = if ($Joliet) { $normalizedFileName -ceq $Name } else { $normalizedFileName -ieq $Name }
+            if ($isNameMatch) {
                 return [pscustomobject]@{
                     ExtentSector = [int][BitConverter]::ToUInt32($Bytes, $offset + $pos + 2)
                     DataLength = [int][BitConverter]::ToUInt32($Bytes, $offset + $pos + 10)
@@ -4304,7 +4338,9 @@ function Get-LabFakeLinuxGrubCfgInfo {
     param([string]$Path, [bool]$Joliet)
     $sectorSize = 2048
     $bytes = [IO.File]::ReadAllBytes($Path)
-    $vdOffset = $(if ($Joliet) { 17 } else { 16 }) * $sectorSize
+    # Sector 18, not 17 -- sector 17 in this fixture is the Boot Record Volume Descriptor (El
+    # Torito), exactly like a real El-Torito-bootable ISO; see New-LabFakeLinuxIso9660.
+    $vdOffset = $(if ($Joliet) { 18 } else { 16 }) * $sectorSize
     $extent = [int][BitConverter]::ToUInt32($bytes, $vdOffset + 156 + 2)
     $length = [int][BitConverter]::ToUInt32($bytes, $vdOffset + 156 + 10)
     $record = $null
