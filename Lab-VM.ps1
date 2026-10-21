@@ -2666,43 +2666,152 @@ function New-LabEphemeralSshKeyPair {
     }
 }
 
+function Get-LabSshUserKnownHostsPath {
+    # The operator's own per-user known_hosts file: where OpenSSH's default UserKnownHostsFile
+    # (~/.ssh/known_hosts) points, and therefore the file the strict SSH functions above check.
+    # Win32-OpenSSH resolves '~' to the user's profile folder, the folder GetFolderPath('UserProfile')
+    # returns.
+    return Join-Path ([Environment]::GetFolderPath('UserProfile')) '.ssh\known_hosts'
+}
+
+function ConvertTo-LabSshOptionPath {
+    # Turns a local path into a value for ssh's own '-o UserKnownHostsFile=' option. OpenSSH splits that
+    # value on whitespace (it is a list of files), and Windows PowerShell 5.1 cannot pass an embedded
+    # double quote to a native command, so a path containing whitespace or a quote cannot be passed
+    # safely. A path under the user's profile folder (where a space in the user name is common) is
+    # rewritten as '~/...', which OpenSSH expands itself; backslashes become forward slashes, which
+    # Win32-OpenSSH accepts. Anything that still contains whitespace, a quote or a control character is
+    # refused, never passed on.
+    param([string]$Path)
+    $profilePath = [Environment]::GetFolderPath('UserProfile').TrimEnd('\')
+    $value = $Path
+    if (-not [string]::IsNullOrEmpty($profilePath) -and
+        $value.StartsWith($profilePath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        $value = '~/' + $value.Substring($profilePath.Length + 1)
+    }
+    $value = $value.Replace('\', '/')
+    if ([string]::IsNullOrEmpty($value) -or $value -match '[\s"''\x00-\x1F\x7F]') {
+        throw "The path '$Path' cannot be passed to ssh.exe as a known_hosts file: it contains whitespace, a quote or a control character outside the user profile folder."
+    }
+    return $value
+}
+
 function Wait-LabSshSession {
     # Trust-on-first-connect (StrictHostKeyChecking=accept-new) applies ONLY to this function's own
     # probe, and only against the single VM this same plan just created and whose ephemeral key
     # New-LabEphemeralSshKeyPair just minted for it: there is no human at a console yet to approve a
-    # brand-new guest's host key fingerprint, and -- being brand new -- no earlier connection exists
-    # whose trust could be silently overridden. Every other SSH connection this script ever makes --
+    # brand-new guest's host key fingerprint. Every other SSH connection this script ever makes --
     # Invoke-LabSshCommand, Invoke-LabSftpCommand, Test-LabSshConnection, Add-LabSshKnownHost -- keeps
     # requiring a strict, already-known host key (or Add-LabSshKnownHost's own deliberately interactive
-    # confirmation); none of those four functions are touched by this one. Once this probe succeeds,
-    # OpenSSH itself has written the now-trusted key to known_hosts, so every later call through those
-    # other functions, against this same guest, succeeds under their own unmodified, stricter policy
-    # without anything further needed here. This function is also never called against any other VM.
-    param([guid]$VMId, [string]$UserName, [string]$IdentityFilePath, [int]$TimeoutSeconds)
+    # confirmation); none of those four functions are touched by this one.
+    #
+    # How the exception stays scoped to "this VM, proven by its own key":
+    # - The identity file is never a parameter. It is derived from $VMId: the exact stable path
+    #   New-LabEphemeralSshKeyPair wrote this VM's ephemeral key to. -F none drops the operator's ssh
+    #   config (so no IdentityFile, HashKnownHosts or other setting of theirs applies) and
+    #   IdentitiesOnly=yes keeps the operator's agent keys out, so the ONLY key ever offered is this
+    #   VM's own ephemeral key, and no other host the operator can already log in to can pass the probe.
+    # - Two-phase trust commit. Phase 1 (probe): accept-new writes a new host key only to the FIRST
+    #   UserKnownHostsFile, which is a fresh scratch file per attempt; the operator's real known_hosts is
+    #   listed second, read-only, so a key already trusted there still matches and a CHANGED key there is
+    #   still refused. A host that merely answers on port 22 but does not accept our ephemeral key only
+    #   ever reaches the scratch file, which is deleted. Phase 2 (commit): only after the probe exits 0
+    #   -- this VM's own ephemeral key authenticated against that exact host -- is the single line OpenSSH
+    #   itself wrote into the scratch file appended to the real known_hosts. This script relocates a line
+    #   OpenSSH authored; it never composes a host key entry itself.
+    # - Candidate addresses must parse as IP addresses, the username is validated like every other SSH
+    #   value, and the VM must still be Running on every iteration.
+    param([guid]$VMId, [string]$UserName, [int]$TimeoutSeconds)
+    if (-not (Test-LabSshUserName $UserName)) {
+        throw "Invalid SSH username '$UserName': it must not be empty, start with '-', or contain whitespace or control characters."
+    }
     $tooling = Get-LabSshToolingInfo
     if (-not $tooling.Available) {
         throw 'ssh.exe/sftp.exe (Windows OpenSSH Client) were not found. Install the OpenSSH Client optional feature on this host.'
     }
+    $identityFilePath = Join-Path $env:LOCALAPPDATA "LabVmManager\SshConnections\$VMId.key"
+    if (-not [IO.File]::Exists($identityFilePath)) {
+        throw "No ephemeral SSH key exists for VM $VMId at '$identityFilePath'. New-LabEphemeralSshKeyPair must create it before the VM's first boot."
+    }
+    $knownHostsPath = Get-LabSshUserKnownHostsPath
+    $knownHostsOption = ConvertTo-LabSshOptionPath $knownHostsPath
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $lastError = $null
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        $addresses = @(Get-LabGuestAddressCandidates $VMId)
+        # Fails fast with a clear "not Running" error if the VM stopped or crashed mid-wait, the same
+        # check Wait-LabPSDirectSession gets through New-LabPSDirectSession.
+        $null = Assert-LabVMRunning $VMId
+        $candidates = @(Get-LabGuestAddressCandidates $VMId)
+        # Guest-reported values reach ssh.exe's command line, so only real IP addresses are used; any
+        # other value is skipped (not echoed, not thrown on), like an address that does not answer yet.
+        $addresses = @($candidates | Where-Object { $null -ne $_ -and [Net.IPAddress]::TryParse([string]$_, [ref]$null) } |
+            ForEach-Object { [string]$_ })
         if ($addresses.Count -eq 0) {
-            $lastError = 'the guest has not reported a network address yet'
+            $lastError = if ($candidates.Count -eq 0) { 'the guest has not reported a network address yet' }
+                else { "the guest has not reported a usable IP address yet ($($candidates.Count) non-IP value(s) skipped)" }
             Write-Host "Waiting for SSH ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $lastError"
         }
         foreach ($address in $addresses) {
+            $scratchPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-ssh-probe-' + [guid]::NewGuid().ToString('N') + '.known_hosts')
             try {
+                [IO.File]::WriteAllText($scratchPath, '')
+                $scratchOption = ConvertTo-LabSshOptionPath $scratchPath
                 # -n: redirect ssh's stdin from /dev/null, same reasoning as Invoke-LabSshCommand's own
                 # KeyAgent branch -- a BatchMode=yes call must never read from this process's own stdin.
-                $ErrorActionPreference = 'Continue'
-                $raw = & ssh.exe -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $IdentityFilePath "$UserName@$address" exit 2>&1
-                $exitCode = $LASTEXITCODE
-                if ($exitCode -eq 0) { return [string]$address }
-                $lastError = (@($raw | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join ' ')
-                if ([string]::IsNullOrEmpty($lastError)) { $lastError = "ssh exited with code $exitCode" }
-            } catch {
-                $lastError = $_.Exception.Message
+                # ConnectTimeout bounds each attempt, so one unresponsive address cannot stall the wait
+                # past its timeout. UpdateHostKeys=no: only the one key this connection verified is ever
+                # recorded.
+                $arguments = @('-n', '-F', 'none',
+                    '-o', 'BatchMode=yes',
+                    '-o', 'StrictHostKeyChecking=accept-new',
+                    '-o', "UserKnownHostsFile=$scratchOption $knownHostsOption",
+                    '-o', 'UpdateHostKeys=no',
+                    '-o', 'IdentitiesOnly=yes',
+                    '-o', 'ConnectTimeout=10',
+                    '-i', $identityFilePath,
+                    "$UserName@$address", 'exit')
+                $exitCode = $null
+                $probeOutput = ''
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    $raw = & ssh.exe @arguments 2>&1
+                    $exitCode = $LASTEXITCODE
+                    $probeOutput = (@($raw | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join ' ')
+                } catch {
+                    $probeOutput = $_.Exception.Message
+                }
+                if ($exitCode -eq 0) {
+                    # Phase 2: this VM's own key authenticated against this exact host. An empty scratch
+                    # file means the real known_hosts already trusted this key, so nothing is added.
+                    $verified = @([IO.File]::ReadAllLines($scratchPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                    if ($verified.Count -gt 1) {
+                        throw "The SSH probe of $address recorded $($verified.Count) host key lines where one was expected; known_hosts was not changed."
+                    }
+                    if ($verified.Count -eq 1) {
+                        $line = $verified[0].Trim()
+                        $fields = @($line -split ' ')
+                        $names = @(if ($fields.Count -ge 3) { $fields[0].Split(',') })
+                        if ($names.Count -eq 0 -or @($names | Where-Object { $_ -ne $address }).Count -gt 0) {
+                            throw "The SSH probe of $address recorded a host key line for a different host; known_hosts was not changed."
+                        }
+                        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $knownHostsPath))
+                        $separator = ''
+                        if ([IO.File]::Exists($knownHostsPath)) {
+                            $existing = [IO.File]::ReadAllText($knownHostsPath)
+                            if ($existing.Length -gt 0 -and -not $existing.EndsWith("`n")) { $separator = "`n" }
+                        }
+                        [IO.File]::AppendAllText($knownHostsPath, $separator + $line + "`n")
+                    }
+                    return [string]$address
+                }
+                # A key already saved for this address that no longer matches is refused by OpenSSH
+                # (accept-new never replaces a changed key). Retrying cannot fix that, so stop now.
+                if ($probeOutput -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED') {
+                    throw "SSH refused the host key at $address for VM ${VMId}: known_hosts already holds a DIFFERENT key for that address (for example from an earlier VM that used the same address). Clear the old entry with option U, then retry. OpenSSH said: $probeOutput"
+                }
+                $lastError = if ([string]::IsNullOrEmpty($probeOutput)) { "ssh exited with code $exitCode" } else { $probeOutput }
+            } finally {
+                if ([IO.File]::Exists($scratchPath)) { [IO.File]::Delete($scratchPath) }
             }
             Write-Host "Waiting for SSH at $UserName@$address ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $lastError"
         }
@@ -2715,16 +2824,21 @@ function Wait-LabSshSession {
 function Write-LabLinuxProvisioningNote {
     # The Linux counterpart of the already-shipped Write-LabProvisioningNote (which delivers its note
     # over PowerShell Direct's Invoke-Command, Windows-only): this guest has no PowerShell Direct
-    # endpoint, so the note travels over SFTP instead. By this point Wait-LabSshSession's own probe has
-    # already connected once and let OpenSSH record the guest's host key in known_hosts, so
-    # Invoke-LabSftpCommand's own unmodified, always-strict host key check succeeds here without any
+    # endpoint, so the note travels over SFTP instead. By this point Wait-LabSshSession has already
+    # authenticated with this VM's own key and committed the guest's verified host key to known_hosts,
+    # so Invoke-LabSftpCommand's own unmodified, always-strict host key check succeeds here without any
     # relaxed setting of its own.
     param([string]$HostNameOrAddress, [string]$UserName, [string]$IdentityFilePath, [string]$Content)
     $localPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-linux-note-' + [guid]::NewGuid().ToString('N') + '.txt')
     $batchPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-linux-note-' + [guid]::NewGuid().ToString('N') + '.batch')
     try {
         [IO.File]::WriteAllText($localPath, $Content)
-        [IO.File]::WriteAllText($batchPath, "put `"$localPath`" `"~/Desktop/lab-vm-manager-provisioning-note.txt`"`n")
+        # sftp's batch parser treats '\' as an escape character, so the local path uses forward slashes
+        # (the same convention as the transfer code). The remote path is relative: sftp starts in the
+        # user's home directory, and an older client may send '~' literally instead of expanding it.
+        # '-mkdir': the leading '-' lets the batch continue when Desktop already exists.
+        $batch = "-mkdir Desktop`nput `"$($localPath.Replace('\', '/'))`" `"Desktop/lab-vm-manager-provisioning-note.txt`"`n"
+        [IO.File]::WriteAllText($batchPath, $batch)
         $result = Invoke-LabSftpCommand $HostNameOrAddress 22 $UserName $IdentityFilePath $batchPath 'KeyAgent'
         if ($result.ExitCode -ne 0) {
             $reason = @($result.Output | Where-Object { $_ -and $_ -notmatch '^sftp>' } | Select-Object -Last 3) -join ' '

@@ -879,6 +879,43 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Wait-LabSshSession {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('Stopwatch', body)
         self.assertIn('throw', body)
+        self.assertIn("'ConnectTimeout=10'", body)
+    def test_ssh_wait_derives_identity_from_vm_id_only(self):
+        # The identity file is never a caller parameter: it is this VM's own ephemeral key path.
+        body = self.s.split('function Wait-LabSshSession {', 1)[1].split('\nfunction ', 1)[0]
+        params = re.search(r'param\(([^)]*)\)', body).group(1)
+        self.assertEqual(params, '[guid]$VMId, [string]$UserName, [int]$TimeoutSeconds')
+        self.assertIn('Join-Path $env:LOCALAPPDATA "LabVmManager\\SshConnections\\$VMId.key"', body)
+        self.assertIn("'-i', $identityFilePath", body)
+        self.assertIn("'IdentitiesOnly=yes'", body)
+        self.assertIn("'-F', 'none'", body)
+    def test_ssh_wait_two_phase_trust_commit(self):
+        # Phase 1 writes new host keys only to a scratch file (listed first); the real known_hosts is
+        # listed second (read-only). Phase 2 appends to the real file only after an exit-0 probe.
+        code = self._code(self._body('Wait-LabSshSession'))
+        self.assertIn('"UserKnownHostsFile=$scratchOption $knownHostsOption"', code)
+        self.assertIn("'UpdateHostKeys=no'", code)
+        idx_exit0 = code.index('if ($exitCode -eq 0) {')
+        idx_append = code.index('AppendAllText($knownHostsPath')
+        self.assertLess(idx_exit0, idx_append)
+        self.assertEqual(code.count('AppendAllText'), 1)
+        self.assertIn('[IO.File]::Delete($scratchPath)', code.split('finally {', 1)[1])
+    def test_ssh_wait_validates_inputs_and_vm_state(self):
+        code = self._code(self._body('Wait-LabSshSession'))
+        self.assertLess(code.index('Test-LabSshUserName $UserName'), code.index('& ssh.exe'))
+        self.assertIn('[Net.IPAddress]::TryParse(', code)
+        loop = code.split('while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {', 1)[1]
+        self.assertTrue(loop.lstrip().startswith('$null = Assert-LabVMRunning $VMId'))
+    def test_ssh_wait_fails_fast_on_changed_host_key(self):
+        code = self._code(self._body('Wait-LabSshSession'))
+        self.assertIn("'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'", code)
+        self.assertIn('option U', code)
+    def test_linux_note_batch_uses_forward_slashes_and_home_relative_desktop(self):
+        code = self._code(self._body('Write-LabLinuxProvisioningNote'))
+        self.assertIn("$localPath.Replace('\\', '/')", code)
+        self.assertIn('-mkdir Desktop`nput ', code)
+        self.assertIn('Desktop/lab-vm-manager-provisioning-note.txt', code)
+        self.assertNotIn('~/Desktop', code)
 
     # --- Windows unattended install, Task 3: two-drive media attach and post-install cleanup ---
     def test_unattended_media_functions_exist(self):

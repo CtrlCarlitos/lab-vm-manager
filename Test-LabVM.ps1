@@ -2431,13 +2431,74 @@ Test-Case 'New-LabEphemeralSshKeyPair throws clearly when the OpenSSH Client too
         Assert-Throws { New-LabEphemeralSshKeyPair ([guid]'66666666-6666-6666-6666-666666666666') } 'OpenSSH Client'
     }
 }
-Test-Case 'Wait-LabSshSession retries past a no-address attempt and failed probes, sleeping between them, using accept-new only' {
+# Wait-LabSshSession tests share one disposable environment: a temp %LOCALAPPDATA% holding this VM's
+# ephemeral key file (the path Wait-LabSshSession derives from $VMId), and a temp file standing in for
+# the operator's real known_hosts (via a fake Get-LabSshUserKnownHostsPath). The fake ssh.exe below
+# behaves like accept-new does during key exchange: before any authentication result, it appends the
+# answering host's key line to the FIRST UserKnownHostsFile it was given. Nothing touches the real
+# profile's known_hosts or any real key.
+function Resolve-FakeSshOptionPath {
+    param([string]$Value)
+    if ($Value.StartsWith('~/')) { return Join-Path ([Environment]::GetFolderPath('UserProfile')) $Value.Substring(2).Replace('/', '\') }
+    return $Value.Replace('/', '\')
+}
+function Get-FakeSshKnownHostsFiles {
+    param([object[]]$SshArgs)
+    $options = @($SshArgs | Where-Object { ([string]$_).StartsWith('UserKnownHostsFile=') })
+    if ($options.Count -ne 1) { throw 'Fake ssh.exe: expected exactly one UserKnownHostsFile option.' }
+    return @(([string]$options[0]).Substring('UserKnownHostsFile='.Length) -split ' ' | ForEach-Object { Resolve-FakeSshOptionPath $_ })
+}
+function Invoke-FakeSshAcceptNew {
+    # Records the call, then writes the answering host's key line to the scratch (first) known_hosts file.
+    param([object[]]$SshArgs)
+    $script:ProbeArgsSeen.Add([string[]]@($SshArgs))
+    $files = @(Get-FakeSshKnownHostsFiles $SshArgs)
+    $script:ScratchFilesSeen.Add($files[0])
+    $address = ([string]$SshArgs[$SshArgs.Count - 2]).Split('@')[-1]
+    [IO.File]::AppendAllText($files[0], "$address ssh-ed25519 AAAAFAKEHOSTKEY`n")
+    $script:ScratchContentSeen.Add([IO.File]::ReadAllText($files[0]))
+}
+function Invoke-WithFakeSshWaitEnvironment {
+    param([scriptblock]$Body)
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('labssh-wait-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        [void][IO.Directory]::CreateDirectory($root)
+        $env:LOCALAPPDATA = Join-Path $root 'Local'
+        $script:FakeKeyPath = Join-Path $env:LOCALAPPDATA "LabVmManager\SshConnections\$($script:FakeId).key"
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $script:FakeKeyPath))
+        [IO.File]::WriteAllText($script:FakeKeyPath, 'FAKE-PRIVATE-KEY')
+        $script:FakeRealKnownHosts = Join-Path $root 'profile\.ssh\known_hosts'
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $script:FakeRealKnownHosts))
+        $script:ProbeArgsSeen = [Collections.Generic.List[string[]]]::new()
+        $script:ScratchFilesSeen = [Collections.Generic.List[string]]::new()
+        $script:ScratchContentSeen = [Collections.Generic.List[string]]::new()
+        $script:RunningChecks = 0
+        $script:SleepCalls = 0
+        & $Body
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root, $true) }
+    }
+}
+
+Test-Case 'Wait-LabSshSession no longer accepts an identity file: its parameters are exactly VMId, UserName, TimeoutSeconds' {
     & {
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession')) { . $sb }
+        $names = @((Get-Command Wait-LabSshSession).Parameters.Keys | Where-Object { $_ -in @('VMId', 'UserName', 'TimeoutSeconds', 'IdentityFilePath') })
+        Assert-Equal ($names -join ',') 'VMId,UserName,TimeoutSeconds'
+        Assert-Equal ((Get-Command Wait-LabSshSession).Parameters.ContainsKey('IdentityFilePath')) $false
+    }
+}
+Test-Case 'Wait-LabSshSession retries, uses only this VM''s derived key with IdentitiesOnly, and commits the verified host key only after success' {
+    Invoke-WithFakeSshWaitEnvironment {
+        # Pre-existing operator content without a trailing newline: the commit must not glue lines together.
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, '10.0.0.1 ssh-ed25519 AAAAPRIORKEY')
         $script:AddressCallIndex = 0
         $script:ProbeCallIndex = 0
-        $script:SleepCalls = 0
-        $script:ProbeArgsSeen = [Collections.Generic.List[string[]]]::new()
         function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
         function Get-LabGuestAddressCandidates {
             param([guid]$VMId)
             $script:AddressCallIndex++
@@ -2446,37 +2507,201 @@ Test-Case 'Wait-LabSshSession retries past a no-address attempt and failed probe
         }
         function ssh.exe {
             $script:ProbeCallIndex++
-            $script:ProbeArgsSeen.Add([string[]]@($args))
-            if ($script:ProbeCallIndex -le 2) { 'Connection refused'; $global:LASTEXITCODE = 255; return }
+            Invoke-FakeSshAcceptNew $args
+            if ($script:ProbeCallIndex -le 2) { 'Permission denied (publickey).'; $global:LASTEXITCODE = 255; return }
             $global:LASTEXITCODE = 0
         }
-        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession')) { . $sb }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
         Assert-FakeCommand 'ssh.exe'
-        $address = Wait-LabSshSession $script:FakeId 'labuser' 'C:\keys\id_eph' 60
+        Assert-FakeCommand 'Get-LabSshUserKnownHostsPath'
+        $address = Wait-LabSshSession $script:FakeId 'labuser' 60 6>$null
         Assert-Equal $address '192.168.1.77'
         Assert-Equal ($script:SleepCalls -ge 2) $true
-        Assert-Equal ($script:ProbeArgsSeen.Count -ge 3) $true
+        Assert-Equal $script:ProbeArgsSeen.Count 3
+        # One VM-state check per loop iteration (1 no-address + 2 failed + 1 successful iteration).
+        Assert-Equal $script:RunningChecks 4
         foreach ($seen in $script:ProbeArgsSeen) {
             Assert-Equal ($seen -contains 'StrictHostKeyChecking=accept-new') $true
             Assert-Equal ($seen -contains 'StrictHostKeyChecking=yes') $false
+            Assert-Equal ($seen -contains 'IdentitiesOnly=yes') $true
+            Assert-Equal ($seen -contains 'ConnectTimeout=10') $true
+            Assert-Equal ($seen -contains 'UpdateHostKeys=no') $true
+            $f = [array]::IndexOf($seen, '-F'); Assert-Equal $seen[$f + 1] 'none'
+            $i = [array]::IndexOf($seen, '-i'); Assert-Equal $seen[$i + 1] $script:FakeKeyPath
+            Assert-Equal @($seen | Where-Object { $_ -eq '-i' }).Count 1
+            # The scratch file is listed first (where accept-new writes); the real file second, read-only.
+            $files = @(Get-FakeSshKnownHostsFiles $seen)
+            Assert-Equal $files.Count 2
+            Assert-Equal ($files[0] -ne $script:FakeRealKnownHosts) $true
+            Assert-Equal ([IO.Path]::GetFullPath($files[1])) ([IO.Path]::GetFullPath($script:FakeRealKnownHosts))
         }
+        # Phase 2 appended exactly the one line OpenSSH wrote for the authenticated host, after the prior content.
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) "10.0.0.1 ssh-ed25519 AAAAPRIORKEY`n192.168.1.77 ssh-ed25519 AAAAFAKEHOSTKEY`n"
+        foreach ($scratch in $script:ScratchFilesSeen) { Assert-Equal ([IO.File]::Exists($scratch)) $false }
+    }
+}
+Test-Case 'Wait-LabSshSession: a host that answers but rejects our key never touches the real known_hosts' {
+    Invoke-WithFakeSshWaitEnvironment {
+        $before = 'existing.example ssh-ed25519 AAAAPRIORKEY' + "`n"
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        $beforeWrite = [IO.File]::GetLastWriteTimeUtc($script:FakeRealKnownHosts)
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.99') }
+        # An unrelated host: it completes key exchange (so accept-new records its key in the scratch
+        # file), then refuses this VM's ephemeral key.
+        function ssh.exe { Invoke-FakeSshAcceptNew $args; 'Permission denied (publickey).'; $global:LASTEXITCODE = 255 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 1 6>$null } 'Timed out.*Permission denied'
+        Assert-Equal ($script:ProbeArgsSeen.Count -ge 1) $true
+        # The unrelated host's key really was written -- but only to the scratch file, which is gone now.
+        Assert-Equal ($script:ScratchContentSeen[0] -match '192\.168\.1\.99 ssh-ed25519 AAAAFAKEHOSTKEY') $true
+        foreach ($scratch in $script:ScratchFilesSeen) {
+            Assert-Equal ($scratch -ne $script:FakeRealKnownHosts) $true
+            Assert-Equal ([IO.File]::Exists($scratch)) $false
+        }
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) $before
+        Assert-Equal ([IO.File]::GetLastWriteTimeUtc($script:FakeRealKnownHosts)) $beforeWrite
+    }
+}
+Test-Case 'Wait-LabSshSession: a failed probe never creates a missing real known_hosts file' {
+    Invoke-WithFakeSshWaitEnvironment {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.99') }
+        function ssh.exe { Invoke-FakeSshAcceptNew $args; 'Connection closed by 192.168.1.99 port 22'; $global:LASTEXITCODE = 255 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 1 6>$null } 'Timed out'
+        Assert-Equal ([IO.File]::Exists($script:FakeRealKnownHosts)) $false
+    }
+}
+Test-Case 'Wait-LabSshSession skips candidate addresses that are not IP addresses; they never reach ssh.exe' {
+    Invoke-WithFakeSshWaitEnvironment {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('-oProxyCommand=calc', 'evil" -oProxyCommand=calc', 'host.example', '192.168.1.80') }
+        function ssh.exe { Invoke-FakeSshAcceptNew $args; $global:LASTEXITCODE = 0 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Equal (Wait-LabSshSession $script:FakeId 'labuser' 60 6>$null) '192.168.1.80'
+        Assert-Equal $script:ProbeArgsSeen.Count 1
+        Assert-Equal ($script:ProbeArgsSeen[0] -contains 'labuser@192.168.1.80') $true
+        foreach ($arg in $script:ProbeArgsSeen[0]) { Assert-Equal ($arg -match 'calc|host\.example|evil') $false }
+    }
+}
+Test-Case 'Wait-LabSshSession with only non-IP candidates never calls ssh.exe and times out' {
+    Invoke-WithFakeSshWaitEnvironment {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('-oProxyCommand=calc', 'host.example') }
+        function ssh.exe { $script:ProbeArgsSeen.Add([string[]]@($args)); $global:LASTEXITCODE = 0 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 1 6>$null } 'Timed out.*usable IP address'
+        Assert-Equal $script:ProbeArgsSeen.Count 0
+    }
+}
+Test-Case 'Wait-LabSshSession validates the username with Test-LabSshUserName before anything else' {
+    Invoke-WithFakeSshWaitEnvironment {
+        $script:UserNameChecks = [Collections.Generic.List[string]]::new()
+        function Test-LabSshUserName { param([string]$Value) $script:UserNameChecks.Add($Value); return $false }
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.80') }
+        function ssh.exe { $script:ProbeArgsSeen.Add([string[]]@($args)); $global:LASTEXITCODE = 0 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId '-oProxyCommand=calc' 60 6>$null } 'Invalid SSH username'
+        Assert-Equal ($script:UserNameChecks -join ',') '-oProxyCommand=calc'
+        Assert-Equal $script:ProbeArgsSeen.Count 0
+        Assert-Equal $script:RunningChecks 0
+    }
+}
+Test-Case 'Wait-LabSshSession fails fast when the VM is no longer Running' {
+    Invoke-WithFakeSshWaitEnvironment {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++; throw "'LAB-Test' is Off. This operation requires Running. Start it first." }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.80') }
+        function ssh.exe { $script:ProbeArgsSeen.Add([string[]]@($args)); $global:LASTEXITCODE = 255 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 600 6>$null } 'is Off.*requires Running'
+        Assert-Equal $script:RunningChecks 1
+        Assert-Equal $script:ProbeArgsSeen.Count 0
+        Assert-Equal $script:SleepCalls 0
+    }
+}
+Test-Case 'Wait-LabSshSession stops at once on a changed host key instead of retrying, pointing at option U' {
+    Invoke-WithFakeSshWaitEnvironment {
+        $before = '192.168.1.77 ssh-ed25519 AAAASTALEKEY' + "`n"
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.77') }
+        function ssh.exe {
+            $script:ProbeArgsSeen.Add([string[]]@($args))
+            '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@'
+            '@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @'
+            'Host key for 192.168.1.77 has changed and you have requested strict checking.'
+            'Host key verification failed.'
+            $global:LASTEXITCODE = 255
+        }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 600 6>$null } 'DIFFERENT key.*option U'
+        Assert-Equal $script:ProbeArgsSeen.Count 1
+        Assert-Equal $script:SleepCalls 0
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) $before
+    }
+}
+Test-Case 'Wait-LabSshSession refuses to start without this VM''s own ephemeral key file' {
+    Invoke-WithFakeSshWaitEnvironment {
+        [IO.File]::Delete($script:FakeKeyPath)
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function ssh.exe { $script:ProbeArgsSeen.Add([string[]]@($args)); $global:LASTEXITCODE = 0 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 60 6>$null } 'No ephemeral SSH key'
+        Assert-Equal $script:ProbeArgsSeen.Count 0
     }
 }
 Test-Case 'Wait-LabSshSession times out with a clear message once its own stopwatch runs out' {
-    & {
-        $script:SleepCalls = 0
+    Invoke-WithFakeSshWaitEnvironment {
         function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
         function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.77') }
         function ssh.exe { 'Permission denied (publickey).'; $global:LASTEXITCODE = 255 }
-        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession')) { . $sb }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
         Assert-FakeCommand 'ssh.exe'
         $realWatch = [Diagnostics.Stopwatch]::StartNew()
         # 6>$null discards this fast-spinning fake's per-attempt Write-Host progress lines, same as the
         # Wait-LabPSDirectSession timeout test above.
-        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 'C:\keys\id_eph' 1 6>$null } 'Timed out.*Last error:.*Permission denied'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 1 6>$null } 'Timed out.*Last error:.*Permission denied'
         $realElapsedSeconds = $realWatch.Elapsed.TotalSeconds
         Assert-Equal ($realElapsedSeconds -lt 15) $true
         Assert-Equal ($script:SleepCalls -ge 1) $true
+    }
+}
+Test-Case 'ConvertTo-LabSshOptionPath rewrites profile paths as ~/, uses forward slashes, and refuses whitespace elsewhere' {
+    & {
+        foreach ($sb in (Import-LabRealFunction 'ConvertTo-LabSshOptionPath')) { . $sb }
+        $profilePath = [Environment]::GetFolderPath('UserProfile')
+        Assert-Equal (ConvertTo-LabSshOptionPath (Join-Path $profilePath '.ssh\known_hosts')) '~/.ssh/known_hosts'
+        Assert-Equal (ConvertTo-LabSshOptionPath 'C:\Temp\probe.known_hosts') 'C:/Temp/probe.known_hosts'
+        Assert-Throws { ConvertTo-LabSshOptionPath 'D:\has space\probe.known_hosts' } 'whitespace'
+        Assert-Throws { ConvertTo-LabSshOptionPath 'D:\quote"d\probe.known_hosts' } 'quote'
     }
 }
 Test-Case 'Write-LabLinuxProvisioningNote delivers the exact content via a KeyAgent put batch, never relaxing host key checking' {
@@ -2496,8 +2721,13 @@ Test-Case 'Write-LabLinuxProvisioningNote delivers the exact content via a KeyAg
         foreach ($sb in (Import-LabRealFunction 'Write-LabLinuxProvisioningNote')) { . $sb }
         Write-LabLinuxProvisioningNote 'guest.invalid' 'labuser' 'C:\keys\id_eph' 'Provisioning complete. SSH key below.'
         Assert-Equal $script:CapturedAuthMode 'KeyAgent'
-        Assert-Equal ($script:CapturedBatchContent -match '(?m)^put\s') $true
-        Assert-Equal ($script:CapturedBatchContent -match 'lab-vm-manager-provisioning-note\.txt') $true
+        $lines = @($script:CapturedBatchContent -split "`n" | Where-Object { $_ })
+        Assert-Equal $lines.Count 2
+        # -mkdir first (the '-' keeps the batch going when Desktop already exists), then the put.
+        Assert-Equal $lines[0] '-mkdir Desktop'
+        Assert-Equal ($lines[1] -match '^put\s+"([^"]+)"\s+"Desktop/lab-vm-manager-provisioning-note\.txt"$') $true
+        # sftp's batch parser treats '\' as an escape: the local path uses forward slashes only.
+        Assert-Equal ($lines[1].Contains('\')) $false
         Assert-Equal $script:CapturedLocalContent 'Provisioning complete. SSH key below.'
     }
 }
