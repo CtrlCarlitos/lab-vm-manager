@@ -343,6 +343,13 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('BatchMode=yes', body)
         self.assertIn('StrictHostKeyChecking=yes', body)
+    def test_sftp_key_agent_mode_restricts_to_the_given_identity(self):
+        # Final-review-after-live-test fix: a specific identity file must rule out every other key
+        # (agent keys, default identity files) so an operator's own loaded keys can never exhaust the
+        # guest sshd's MaxAuthTries before this one is tried.
+        body = self.s.split('function Invoke-LabSftpCommand {', 1)[1].split('\nfunction ', 1)[0]
+        key_agent_branch = body.split("'KeyAgent' {", 1)[1].split("'InteractivePassword' {", 1)[0]
+        self.assertIn("'-i', $IdentityFilePath, '-o', 'IdentitiesOnly=yes'", key_agent_branch)
     def test_sftp_command_recognizes_interactive_password_mode(self):
         # Presence check only -- this does not prove BatchMode=yes is absent from this
         # specific branch's code path at runtime, only that the branch exists at all.

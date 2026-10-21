@@ -647,7 +647,16 @@ function Invoke-LabSftpCommand {
     switch ($AuthMode) {
         'KeyAgent' {
             $arguments = @('-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-P', $Port)
-            if (-not [string]::IsNullOrEmpty($IdentityFilePath)) { $arguments += @('-i', $IdentityFilePath) }
+            if (-not [string]::IsNullOrEmpty($IdentityFilePath)) {
+                # IdentitiesOnly=yes only when a specific key is given, never unconditionally: this
+                # mode's whole point, when no identity file is supplied, is to let the operator's own
+                # ssh-agent authenticate instead. But once a specific key IS named, offering anything
+                # else first only adds risk, confirmed live (2026-10-21): the operator's own ssh-agent
+                # had enough other keys loaded that trying them ahead of this VM's ephemeral key
+                # exceeded the guest sshd's MaxAuthTries, disconnecting with "Too many authentication
+                # failures" before the right key was ever tried, even though it would have succeeded.
+                $arguments += @('-i', $IdentityFilePath, '-o', 'IdentitiesOnly=yes')
+            }
             $arguments += @('-b', $BatchFilePath, $target)
             $raw = & sftp.exe @arguments 2>&1
             $exitCode = $LASTEXITCODE
