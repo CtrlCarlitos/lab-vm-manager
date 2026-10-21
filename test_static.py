@@ -852,6 +852,20 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 1800))", body)
         self.assertIn('$script:LabTimeout = $TimeoutSeconds', self.s)
+    def test_provisioning_switch_defaults_to_default_switch(self):
+        body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("& $getOption 'SwitchName' 'Default Switch'", body)
+    def test_provisioning_enables_guest_services_and_graceful_stop(self):
+        body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("Enable-VMIntegrationService -VM $vm -Name 'Guest Service Interface'", body)
+        self.assertIn('-AutomaticStopAction ShutDown', body)
+        # Both must happen after the VM exists but before any Windows-specific provisioning step.
+        # Call-shaped substrings, not bare names: an earlier comment in this function mentions
+        # "Resolve-LabWindowsCredential" by name well before the real call, which would defeat a
+        # bare-name ordering check even for a correct implementation (the same class of trap fixed
+        # once already in this plan's own preflight scan).
+        self.assertLess(body.index('New-LabVMCore -Name'), body.index('Enable-VMIntegrationService'))
+        self.assertLess(body.index('Enable-VMIntegrationService'), body.index('Resolve-LabWindowsCredential -Credential'))
     def test_provisioning_note_reads_guest_desktop(self):
         body = self.s.split('function Write-LabProvisioningNote {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("GetFolderPath('Desktop')", body)

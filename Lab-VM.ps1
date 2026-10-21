@@ -134,8 +134,9 @@
 .PARAMETER MemoryMaximumGB
     Dynamic memory maximum in GB (default 8).
 .PARAMETER SwitchName
-    Virtual switch for the new VM's network adapter (default: none, Disconnected; PowerShell Direct
-    needs no network).
+    Virtual switch for the new VM's network adapter (default: 'Default Switch', Hyper-V's built-in
+    NAT switch -- PowerShell Direct itself needs no network, but a real network is useful for the
+    finished VM). Supply '' explicitly to leave the adapter Disconnected instead.
 .PARAMETER VmStorageRoot
     Existing local folder that receives the new VM's own folder (default: the Hyper-V host default).
 .PARAMETER VhdxStorageRoot
@@ -2826,9 +2827,9 @@ function Start-LabWindowsVMProvisioning {
     }
     $vhdxSizeGB = [int](& $getOption 'VhdxSizeGB' 150)
     if ($vhdxSizeGB -lt 64) { throw "-VhdxSizeGB $vhdxSizeGB is below Windows 11's 64 GB minimum." }
-    $switchName = [string](& $getOption 'SwitchName' '')
+    $switchName = [string](& $getOption 'SwitchName' 'Default Switch')
     if ($switchName -ne '' -and (Get-LabSwitchNames) -notcontains $switchName) {
-        throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to leave the adapter Disconnected."
+        throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to use 'Default Switch', or supply -SwitchName '' to leave the adapter Disconnected."
     }
     $computerName = [string](& $getOption 'ComputerName' 'lab-agent-test')
     if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
@@ -2937,6 +2938,13 @@ function Start-LabWindowsVMProvisioning {
             $createMutex.ReleaseMutex()
             $createHeld = $false
             Write-LabAudit 'provision-windows-vm' 'STARTED' $vm (& $getAuditDetail)
+
+            # VM-level settings this plan's own experience showed are worth having from the start, on
+            # a VM meant to actually be used afterward: file-copy support ready without a later manual
+            # step, and a graceful shutdown (not a forced power-off) if the host itself restarts.
+            Enable-VMIntegrationService -VM $vm -Name 'Guest Service Interface' -Confirm:$false -ErrorAction Stop
+            Set-VM -VM $vm -AutomaticStopAction ShutDown -Confirm:$false -ErrorAction Stop
+            $done.Add('Guest Service Interface enabled; automatic stop action set to Shut Down')
 
             $guestCredential = Resolve-LabWindowsCredential -Credential $suppliedCredential -NonInteractive $nonInteractive
             $accountName = ConvertTo-LabLocalAccountName $guestCredential

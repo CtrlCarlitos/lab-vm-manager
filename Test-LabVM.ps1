@@ -3498,6 +3498,16 @@ function Invoke-LabProvisioningScenario {
             $script:ProvArgs['New-LabVMCore'] = $PSBoundParameters
             return [pscustomobject]@{ Id = [guid]'00000000-0000-0000-0000-00000000c0de'; Name = $Name }
         }
+        function Enable-VMIntegrationService {
+            param($VM, [string[]]$Name)
+            Record 'Enable-VMIntegrationService'
+            $script:ProvArgs['Enable-VMIntegrationService'] = $Name
+        }
+        function Set-VM {
+            param($VM, $AutomaticStopAction)
+            Record 'Set-VM'
+            $script:ProvArgs['Set-VM'] = $AutomaticStopAction
+        }
         function Resolve-LabWindowsCredential {
             param($Credential, [bool]$NonInteractive)
             Record 'Resolve-LabWindowsCredential'
@@ -3561,7 +3571,7 @@ function Invoke-LabProvisioningScenario {
     return $result
 }
 $script:ProvHappyOrder = @('Select-LabIsoPath', 'Get-LabWindowsInstallImages', 'Test-LabWindowsIsoInScope', 'Get-LabHostDefaults',
-    'Read-LabYesNoCancel', 'New-LabVMCore', 'Resolve-LabWindowsCredential', 'Get-LabProvisioningWorkspacePath',
+    'Read-LabYesNoCancel', 'New-LabVMCore', 'Enable-VMIntegrationService', 'Set-VM', 'Resolve-LabWindowsCredential', 'Get-LabProvisioningWorkspacePath',
     'New-LabPatchedBootableIso', 'New-LabWindowsAnswerFileXml', 'New-LabSeedIso', 'Set-LabVMUnattendedInstallMedia',
     'Set-LabVMBootProfile', 'Start-LabVM', 'Wait-LabPSDirectSession', 'Write-LabProvisioningNote',
     'Request-LabVMGuestShutdown', 'Wait-LabVMState:Off', 'Complete-LabWindowsProvisioning', 'Remove-LabProvisioningWorkspace',
@@ -3577,7 +3587,7 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     Assert-Equal ($r.Calls -join ' > ') ($script:ProvHappyOrder -join ' > ')
     Assert-Equal @($r.Calls | Where-Object { $_ -eq 'Remove-LabProvisioningWorkspace' }).Count 1
     Assert-Equal @($r.Calls | Where-Object { $_ -eq 'Wait-LabPSDirectSession' }).Count 2
-    # Defaults: blank picker answer = Pro (index 3); dynamic memory 2/4/8 GB; 150 GB VHDX; Disconnected; 2 vCPUs.
+    # Defaults: blank picker answer = Pro (index 3); dynamic memory 2/4/8 GB; 150 GB VHDX; Default Switch; 2 vCPUs.
     Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ImageIndex 3
     Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].UserName 'dev'
     # Neither -ComputerName nor -TimeZone was supplied: both must be the literal project defaults,
@@ -3592,7 +3602,11 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]4GB); Assert-Equal $core.MaximumBytes ([long]8GB)
     Assert-Equal $core.IsDynamic $true
     Assert-Equal $core.VhdxMaximumBytes ([long]150GB)
-    Assert-Equal $core.SwitchName ''
+    Assert-Equal $core.SwitchName 'Default Switch'
+    # Guest Service Interface enabled and the automatic stop action set to a graceful shutdown, right
+    # after VM creation, before any Windows-specific provisioning step.
+    Assert-Equal ($r.Args['Enable-VMIntegrationService'] -join ',') 'Guest Service Interface'
+    Assert-Equal ([string]$r.Args['Set-VM']) 'ShutDown'
     Assert-Equal $r.Args['Set-LabVMBootProfile'] 'Windows11'
     Assert-Equal $r.Args['Wait-LabPSDirectSession'] 1800
     # The patched copy is what gets attached AND what cleanup later ejects.
