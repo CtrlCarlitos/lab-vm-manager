@@ -2827,7 +2827,10 @@ function Start-LabWindowsVMProvisioning {
     }
     $vhdxSizeGB = [int](& $getOption 'VhdxSizeGB' 150)
     if ($vhdxSizeGB -lt 64) { throw "-VhdxSizeGB $vhdxSizeGB is below Windows 11's 64 GB minimum." }
-    $switchName = [string](& $getOption 'SwitchName' 'Default Switch')
+    # $getOption treats a bound-but-empty string as "not supplied" and falls back to Default, which is
+    # correct for every other option here -- but -SwitchName '' is itself a meaningful, distinct value
+    # (Disconnected), not an omission, so it is resolved directly against $Options instead.
+    $switchName = if ($Options.ContainsKey('SwitchName')) { [string]$Options['SwitchName'] } else { 'Default Switch' }
     if ($switchName -ne '' -and (Get-LabSwitchNames) -notcontains $switchName) {
         throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to use 'Default Switch', or supply -SwitchName '' to leave the adapter Disconnected."
     }

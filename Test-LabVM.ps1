@@ -3631,6 +3631,12 @@ Test-Case 'Provision: a well-formed -ProductKey passes through unchanged to the 
     Assert-Equal $r.Status 'COMPLETED'
     Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ProductKey '12345-ABCDE-12345-ABCDE-12345'
 }
+Test-Case 'Provision: -SwitchName '''' is the documented escape hatch for a Disconnected adapter, not a fallback to Default Switch' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; SwitchName = '' } -Answers @('')
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Status 'COMPLETED'
+    Assert-Equal $r.Args['New-LabVMCore'].SwitchName ''
+}
 Test-Case 'Provision: an unpatched ISO falls back to the ORIGINAL source path for attach and cleanup' {
     $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' } -Patched $false
     if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
