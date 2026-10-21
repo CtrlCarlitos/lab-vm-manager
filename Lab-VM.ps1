@@ -2999,8 +2999,13 @@ function Start-LabWindowsVMProvisioning {
             Request-LabVMGuestShutdown $vmId 'LAB VM Manager: Windows unattended install finished; removing install media'
             # A first shutdown right after OOBE can take far longer than the short general state-change
             # wait (-TimeoutSeconds, default 180 s), and timing out here would strand a finished VM with
-            # its media still attached and its password-bearing workspace kept. So floor it at 10 minutes.
-            $null = Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 600))
+            # its media still attached and its password-bearing workspace kept. A 10-minute floor was
+            # tried first and was NOT enough: a real live run's first post-OOBE shutdown took longer than
+            # that (confirmed 2026-10-20 -- Windows settling in after a clean install, not a script bug).
+            # Floor it at the same 1800 s ceiling already given to the PS-Direct waits, for consistency
+            # with "a brand-new Windows instance can be slow the first time" rather than guessing a
+            # smaller number again.
+            $null = Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 1800))
             $done.Add('VM shut down')
             Complete-LabWindowsProvisioning -VMId $vmId -WindowsIsoPath $windowsIsoPath -SeedIsoPath $seedIsoPath
             $done.Add('seed drive removed, installer ISO ejected, disk first in boot order')

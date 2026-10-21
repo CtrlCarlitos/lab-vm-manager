@@ -3673,19 +3673,19 @@ Test-Case 'Provision: a failure AFTER the seed ISO is built says the kept worksp
     if ($r.Error -match 'no password had been written') { throw "Error used the pre-seed-ISO wording: $($r.Error)" }
     Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|FAILED_OR_UNCONFIRMED|*') $true
 }
-Test-Case 'Provision: the wait for Off between the two boots uses at least a 600-second floor, never below the general timeout' {
+Test-Case 'Provision: the wait for Off between the two boots uses at least a 1800-second floor, never below the general timeout' {
     $saved = $script:LabTimeout
     try {
         $script:LabTimeout = 180
         $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' }
         if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
-        Assert-Equal $r.Args['Wait-LabVMState:Off'] 600
+        Assert-Equal $r.Args['Wait-LabVMState:Off'] 1800
         # The floor never shortens a general timeout that is already longer, and leaves it unchanged.
-        $script:LabTimeout = 900
+        $script:LabTimeout = 2400
         $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' }
         if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
-        Assert-Equal $r.Args['Wait-LabVMState:Off'] 900
-        Assert-Equal $script:LabTimeout 900
+        Assert-Equal $r.Args['Wait-LabVMState:Off'] 2400
+        Assert-Equal $script:LabTimeout 2400
     } finally { $script:LabTimeout = $saved }
 }
 Test-Case 'Provision: the guest-desktop note names the VM, ISO, edition, boot profile and timing' {

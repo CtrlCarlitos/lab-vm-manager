@@ -850,7 +850,7 @@ class SourceContract(unittest.TestCase):
         self.assertIn('Get-LabBootEntryKind', body)
     def test_provisioning_off_wait_has_its_own_floor(self):
         body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
-        self.assertIn("Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 600))", body)
+        self.assertIn("Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 1800))", body)
         self.assertIn('$script:LabTimeout = $TimeoutSeconds', self.s)
     def test_provisioning_note_reads_guest_desktop(self):
         body = self.s.split('function Write-LabProvisioningNote {', 1)[1].split('\nfunction ', 1)[0]
