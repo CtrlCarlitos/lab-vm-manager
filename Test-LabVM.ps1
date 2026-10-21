@@ -2980,9 +2980,15 @@ function Get-Volume {
     return [pscustomobject]@{ DriveLetter = $script:FakeIsoDriveLetter }
 }
 function Dismount-DiskImage {
+    # The real cmdlet emits a DiskImage-shaped object even without -PassThru (confirmed live,
+    # 2026-10-20 -- it is not silent like Remove-VMDvdDrive or Set-VMDvdDrive). A caller that doesn't
+    # suppress this leaks it into its own return value; this fake mirrors that so a regression here
+    # fails a test instead of only surfacing on a real host, as it did before Get-LabWindowsInstallImages
+    # and New-LabPatchedBootableIso were fixed to wrap the call in [void](...).
     [CmdletBinding()]
     param([string]$ImagePath)
     $script:DismountDiskImageCalls++
+    return [pscustomobject]@{ ImagePath = $ImagePath; Attached = $false }
 }
 function Test-Path {
     # Forwards every path except the fake ISO's own sources\install.wim/.esd to the real cmdlet, so
@@ -3121,9 +3127,13 @@ function Get-Volume {
     return [pscustomobject]@{ DriveLetter = $script:BootPatchDriveName }
 }
 function Dismount-DiskImage {
+    # The real cmdlet emits a DiskImage-shaped object even without -PassThru (confirmed live,
+    # 2026-10-20). A caller that doesn't suppress this leaks it into its own return value; this fake
+    # mirrors that so a regression here fails a test instead of only surfacing on a real host.
     [CmdletBinding()]
     param([string]$ImagePath)
     $script:BootPatchDismountCalls++
+    return [pscustomobject]@{ ImagePath = $ImagePath; Attached = $false }
 }
 
 function Reset-LabBootPatchFakes {
