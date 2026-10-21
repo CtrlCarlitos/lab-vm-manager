@@ -1302,6 +1302,7 @@ foreach ($name in @('ConvertFrom-LabSftpListing', 'Copy-LabTransferItemSftp')) {
 }
 function ssh.exe { throw 'TRIPWIRE: a test attempted to launch the real ssh.exe.' }
 function sftp.exe { throw 'TRIPWIRE: a test attempted to launch the real sftp.exe.' }
+function ssh-keygen.exe { throw 'TRIPWIRE: a test attempted to launch the real ssh-keygen.exe.' }
 $script:SftpBase = Join-Path ([IO.Path]::GetTempPath()) ('labsftp-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $script:GuestRoot = Join-Path $script:SftpBase 'guest'
 $script:HostRoot = Join-Path $script:SftpBase 'host'
@@ -2386,6 +2387,121 @@ Test-Case 'SSH connection test (KeyAgent): a failure shows sftp''s own reason an
         if ($messages -notmatch 'option K') { throw "First-trust hint missing: $messages" }
     }
 }
+
+# --- Linux unattended install, Task 5: ephemeral SSH key, trust-on-first-connect wait, note delivery ---
+# Safety: same pattern as the SSH helper tests above -- each test loads the real function via
+# Import-LabRealFunction into its own child scope, with a fake ssh-keygen.exe/ssh.exe FUNCTION already
+# defined in that scope, confirmed with Assert-FakeCommand before anything is called. The script-level
+# tripwires for ssh.exe/sftp.exe/ssh-keygen.exe remain active underneath. No real OpenSSH process,
+# prompt, known_hosts access, or key material ever exists outside this in-memory fake.
+Test-Case 'New-LabEphemeralSshKeyPair writes a stable keypair under SshConnections, not the per-VM workspace' {
+    $tempLocal = Join-Path ([IO.Path]::GetTempPath()) ('labssh-keypair-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $env:LOCALAPPDATA = $tempLocal
+        & {
+            function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+            # Stands in for ssh-keygen.exe: writes a dummy keypair to the -f path it is given, exactly
+            # like the real tool would, so the real function's own file-existence checks still pass.
+            function ssh-keygen.exe {
+                $fIndex = [array]::IndexOf($args, '-f')
+                $privPath = $args[$fIndex + 1]
+                [IO.File]::WriteAllText($privPath, 'FAKE-PRIVATE-KEY')
+                [IO.File]::WriteAllText("$privPath.pub", 'ssh-ed25519 FAKEPUBLICKEYDATA lab-vm-manager-ephemeral')
+                $global:LASTEXITCODE = 0
+            }
+            foreach ($sb in (Import-LabRealFunction 'New-LabEphemeralSshKeyPair')) { . $sb }
+            Assert-FakeCommand 'ssh-keygen.exe'
+            $id = [guid]'55555555-5555-5555-5555-555555555555'
+            $result = New-LabEphemeralSshKeyPair $id
+            Assert-Equal ($result.PrivateKeyPath -like "*SshConnections*$id.key") $true
+            Assert-Equal ($result.PrivateKeyPath -like '*Provisioning*') $false
+            Assert-Equal $result.PublicKeyContent 'ssh-ed25519 FAKEPUBLICKEYDATA lab-vm-manager-ephemeral'
+            Assert-Equal ([IO.File]::Exists($result.PrivateKeyPath)) $true
+        }
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal
+        if ([IO.Directory]::Exists($tempLocal)) { [IO.Directory]::Delete($tempLocal, $true) }
+    }
+}
+Test-Case 'New-LabEphemeralSshKeyPair throws clearly when the OpenSSH Client tooling is missing' {
+    & {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $false } }
+        foreach ($sb in (Import-LabRealFunction 'New-LabEphemeralSshKeyPair')) { . $sb }
+        Assert-Throws { New-LabEphemeralSshKeyPair ([guid]'66666666-6666-6666-6666-666666666666') } 'OpenSSH Client'
+    }
+}
+Test-Case 'Wait-LabSshSession retries past a no-address attempt and failed probes, sleeping between them, using accept-new only' {
+    & {
+        $script:AddressCallIndex = 0
+        $script:ProbeCallIndex = 0
+        $script:SleepCalls = 0
+        $script:ProbeArgsSeen = [Collections.Generic.List[string[]]]::new()
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabGuestAddressCandidates {
+            param([guid]$VMId)
+            $script:AddressCallIndex++
+            if ($script:AddressCallIndex -le 1) { return @() }
+            return @('192.168.1.77')
+        }
+        function ssh.exe {
+            $script:ProbeCallIndex++
+            $script:ProbeArgsSeen.Add([string[]]@($args))
+            if ($script:ProbeCallIndex -le 2) { 'Connection refused'; $global:LASTEXITCODE = 255; return }
+            $global:LASTEXITCODE = 0
+        }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        $address = Wait-LabSshSession $script:FakeId 'labuser' 'C:\keys\id_eph' 60
+        Assert-Equal $address '192.168.1.77'
+        Assert-Equal ($script:SleepCalls -ge 2) $true
+        Assert-Equal ($script:ProbeArgsSeen.Count -ge 3) $true
+        foreach ($seen in $script:ProbeArgsSeen) {
+            Assert-Equal ($seen -contains 'StrictHostKeyChecking=accept-new') $true
+            Assert-Equal ($seen -contains 'StrictHostKeyChecking=yes') $false
+        }
+    }
+}
+Test-Case 'Wait-LabSshSession times out with a clear message once its own stopwatch runs out' {
+    & {
+        $script:SleepCalls = 0
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.77') }
+        function ssh.exe { 'Permission denied (publickey).'; $global:LASTEXITCODE = 255 }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        $realWatch = [Diagnostics.Stopwatch]::StartNew()
+        # 6>$null discards this fast-spinning fake's per-attempt Write-Host progress lines, same as the
+        # Wait-LabPSDirectSession timeout test above.
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 'C:\keys\id_eph' 1 6>$null } 'Timed out.*Last error:.*Permission denied'
+        $realElapsedSeconds = $realWatch.Elapsed.TotalSeconds
+        Assert-Equal ($realElapsedSeconds -lt 15) $true
+        Assert-Equal ($script:SleepCalls -ge 1) $true
+    }
+}
+Test-Case 'Write-LabLinuxProvisioningNote delivers the exact content via a KeyAgent put batch, never relaxing host key checking' {
+    & {
+        $script:CapturedAuthMode = $null
+        $script:CapturedBatchContent = $null
+        $script:CapturedLocalContent = $null
+        function Invoke-LabSftpCommand {
+            param($HostNameOrAddress, $Port, $UserName, $IdentityFilePath, $BatchFilePath, $AuthMode)
+            $script:CapturedAuthMode = $AuthMode
+            $script:CapturedBatchContent = Get-Content -LiteralPath $BatchFilePath -Raw
+            if ($script:CapturedBatchContent -match 'put\s+"([^"]+)"') {
+                $script:CapturedLocalContent = Get-Content -LiteralPath $Matches[1] -Raw
+            }
+            return [pscustomobject]@{ ExitCode = 0; Output = [string[]]@() }
+        }
+        foreach ($sb in (Import-LabRealFunction 'Write-LabLinuxProvisioningNote')) { . $sb }
+        Write-LabLinuxProvisioningNote 'guest.invalid' 'labuser' 'C:\keys\id_eph' 'Provisioning complete. SSH key below.'
+        Assert-Equal $script:CapturedAuthMode 'KeyAgent'
+        Assert-Equal ($script:CapturedBatchContent -match '(?m)^put\s') $true
+        Assert-Equal ($script:CapturedBatchContent -match 'lab-vm-manager-provisioning-note\.txt') $true
+        Assert-Equal $script:CapturedLocalContent 'Provisioning complete. SSH key below.'
+    }
+}
+
 Test-Case 'Menu copy from an SFTP VM asks for the source type and never opens PowerShell Direct' {
     & {
         $script:Answers = [Collections.Generic.Queue[string]]::new()

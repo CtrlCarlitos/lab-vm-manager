@@ -545,7 +545,15 @@ class SourceContract(unittest.TestCase):
         code = self._code(self.s)
         self.assertEqual(code.count('StrictHostKeyChecking=ask'), 1)
         self.assertNotIn('StrictHostKeyChecking=no', code)
-        self.assertNotIn('accept-new', code)
+        # Linux unattended install Task 5's Wait-LabSshSession is the ONE deliberate, narrowly-scoped
+        # exception approved for this plan: trust-on-first-connect against the single VM this same plan
+        # just created, with no human at a console yet to approve a brand-new host key. Checking the
+        # total count across the whole script is exactly 1, AND that the one occurrence sits inside
+        # Wait-LabSshSession's own body, together rule out 'accept-new' ever being introduced -- now or
+        # by a future change -- anywhere else, including inside any of the four existing SSH functions.
+        self.assertEqual(code.count('accept-new'), 1)
+        wait_body = self._code(self._body('Wait-LabSshSession'))
+        self.assertIn('accept-new', wait_body)
         for name in ['Invoke-LabSftpCommand', 'Invoke-LabSshCommand']:
             body = self._code(self._body(name))
             for branch in ["'KeyAgent' {", "'InteractivePassword' {"]:
@@ -852,6 +860,25 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Complete-LabLinuxProvisioning {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('-Path $null', body)
         self.assertIn('Remove-VMDvdDrive', body)
+
+    # --- Linux unattended install, Task 5: ephemeral SSH key, trust-on-first-connect wait, note delivery ---
+    def test_ephemeral_ssh_key_function_exists(self):
+        self.assertIn('function New-LabEphemeralSshKeyPair', self.s)
+    def test_ephemeral_ssh_key_not_in_provisioning_workspace(self):
+        body = self.s.split('function New-LabEphemeralSshKeyPair {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertNotIn('Provisioning', body)
+        self.assertIn('SshConnections', body)
+    def test_ssh_wait_functions_exist(self):
+        for name in ['Wait-LabSshSession', 'Write-LabLinuxProvisioningNote']:
+            self.assertIn('function ' + name + ' {', self.s)
+    def test_ssh_wait_uses_accept_new_not_yes(self):
+        body = self.s.split('function Wait-LabSshSession {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('accept-new', body)
+        self.assertNotIn('StrictHostKeyChecking=yes', body)
+    def test_ssh_wait_has_bounded_timeout(self):
+        body = self.s.split('function Wait-LabSshSession {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Stopwatch', body)
+        self.assertIn('throw', body)
 
     # --- Windows unattended install, Task 3: two-drive media attach and post-install cleanup ---
     def test_unattended_media_functions_exist(self):

@@ -2625,6 +2625,118 @@ function Complete-LabLinuxProvisioning {
     Set-LabVMBootOrder $VMId 'Disk'
 }
 
+function New-LabEphemeralSshKeyPair {
+    # A fresh ed25519 key pair minted by this script itself, never supplied by the operator: the
+    # unattended Linux install flow has no existing identity to reuse, so it generates one here, embeds
+    # the public half in the NoCloud user-data (New-LabLinuxAutoinstallUserData's AuthorizedKeys), and
+    # keeps the private half at a stable path -- never inside the per-VM workspace that is deleted and
+    # recreated across runs -- so it survives long enough to become the IdentityFilePath that
+    # Set-LabSshConnectionSettings later saves for this VM.
+    param([guid]$VMId)
+    # ssh-keygen.exe ships with the same Windows OpenSSH Client optional feature as ssh.exe/sftp.exe,
+    # so the already-shipped Get-LabSshToolingInfo availability check doubles as this tool's own
+    # availability check too, unmodified.
+    $tooling = Get-LabSshToolingInfo
+    if (-not $tooling.Available) {
+        throw 'ssh.exe/sftp.exe (Windows OpenSSH Client) were not found. Install the OpenSSH Client optional feature on this host.'
+    }
+    $privateKeyPath = Join-Path $env:LOCALAPPDATA "LabVmManager\SshConnections\$VMId.key"
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $privateKeyPath))
+    $publicKeyPath = "$privateKeyPath.pub"
+    # ssh-keygen.exe prompts to overwrite an existing file, a prompt this fully unattended process could
+    # never answer; clear out any stale pair from an earlier run first so that prompt can never occur.
+    if ([IO.File]::Exists($privateKeyPath)) { [IO.File]::Delete($privateKeyPath) }
+    if ([IO.File]::Exists($publicKeyPath)) { [IO.File]::Delete($publicKeyPath) }
+    # Empty passphrase (-N '""'): this key authenticates a fully unattended process with no human ever
+    # present to type one in. Its file alone is the secret -- the same trust model
+    # Get-LabSshConnectionSettingsPath's own stored IdentityFilePath already assumes for every other
+    # VM's identity file. The doubled quotes are deliberate: ssh-keygen.exe on Windows can otherwise
+    # drop a genuinely empty -N argument outright.
+    & ssh-keygen.exe -t ed25519 -N '""' -f $privateKeyPath -q
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "ssh-keygen.exe exited with code $exitCode while generating an ephemeral key pair at '$privateKeyPath'."
+    }
+    if (-not ([IO.File]::Exists($privateKeyPath)) -or -not ([IO.File]::Exists($publicKeyPath))) {
+        throw "ssh-keygen.exe reported success but the expected key files were not found at '$privateKeyPath' / '$publicKeyPath'."
+    }
+    return [pscustomobject]@{
+        PrivateKeyPath = $privateKeyPath
+        PublicKeyContent = (Get-Content -LiteralPath $publicKeyPath -Raw).Trim()
+    }
+}
+
+function Wait-LabSshSession {
+    # Trust-on-first-connect (StrictHostKeyChecking=accept-new) applies ONLY to this function's own
+    # probe, and only against the single VM this same plan just created and whose ephemeral key
+    # New-LabEphemeralSshKeyPair just minted for it: there is no human at a console yet to approve a
+    # brand-new guest's host key fingerprint, and -- being brand new -- no earlier connection exists
+    # whose trust could be silently overridden. Every other SSH connection this script ever makes --
+    # Invoke-LabSshCommand, Invoke-LabSftpCommand, Test-LabSshConnection, Add-LabSshKnownHost -- keeps
+    # requiring a strict, already-known host key (or Add-LabSshKnownHost's own deliberately interactive
+    # confirmation); none of those four functions are touched by this one. Once this probe succeeds,
+    # OpenSSH itself has written the now-trusted key to known_hosts, so every later call through those
+    # other functions, against this same guest, succeeds under their own unmodified, stricter policy
+    # without anything further needed here. This function is also never called against any other VM.
+    param([guid]$VMId, [string]$UserName, [string]$IdentityFilePath, [int]$TimeoutSeconds)
+    $tooling = Get-LabSshToolingInfo
+    if (-not $tooling.Available) {
+        throw 'ssh.exe/sftp.exe (Windows OpenSSH Client) were not found. Install the OpenSSH Client optional feature on this host.'
+    }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $lastError = $null
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $addresses = @(Get-LabGuestAddressCandidates $VMId)
+        if ($addresses.Count -eq 0) {
+            $lastError = 'the guest has not reported a network address yet'
+            Write-Host "Waiting for SSH ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $lastError"
+        }
+        foreach ($address in $addresses) {
+            try {
+                # -n: redirect ssh's stdin from /dev/null, same reasoning as Invoke-LabSshCommand's own
+                # KeyAgent branch -- a BatchMode=yes call must never read from this process's own stdin.
+                $ErrorActionPreference = 'Continue'
+                $raw = & ssh.exe -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $IdentityFilePath "$UserName@$address" exit 2>&1
+                $exitCode = $LASTEXITCODE
+                if ($exitCode -eq 0) { return [string]$address }
+                $lastError = (@($raw | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join ' ')
+                if ([string]::IsNullOrEmpty($lastError)) { $lastError = "ssh exited with code $exitCode" }
+            } catch {
+                $lastError = $_.Exception.Message
+            }
+            Write-Host "Waiting for SSH at $UserName@$address ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $lastError"
+        }
+        Start-Sleep -Seconds 10
+    }
+    $lastErrorText = if ($null -eq $lastError) { ' No connection attempt was made.' } else { " Last error: $lastError" }
+    throw "Timed out after $([int]$watch.Elapsed.TotalSeconds) seconds waiting for an SSH session to come up on VM ${VMId}.$lastErrorText"
+}
+
+function Write-LabLinuxProvisioningNote {
+    # The Linux counterpart of the already-shipped Write-LabProvisioningNote (which delivers its note
+    # over PowerShell Direct's Invoke-Command, Windows-only): this guest has no PowerShell Direct
+    # endpoint, so the note travels over SFTP instead. By this point Wait-LabSshSession's own probe has
+    # already connected once and let OpenSSH record the guest's host key in known_hosts, so
+    # Invoke-LabSftpCommand's own unmodified, always-strict host key check succeeds here without any
+    # relaxed setting of its own.
+    param([string]$HostNameOrAddress, [string]$UserName, [string]$IdentityFilePath, [string]$Content)
+    $localPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-linux-note-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $batchPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-linux-note-' + [guid]::NewGuid().ToString('N') + '.batch')
+    try {
+        [IO.File]::WriteAllText($localPath, $Content)
+        [IO.File]::WriteAllText($batchPath, "put `"$localPath`" `"~/Desktop/lab-vm-manager-provisioning-note.txt`"`n")
+        $result = Invoke-LabSftpCommand $HostNameOrAddress 22 $UserName $IdentityFilePath $batchPath 'KeyAgent'
+        if ($result.ExitCode -ne 0) {
+            $reason = @($result.Output | Where-Object { $_ -and $_ -notmatch '^sftp>' } | Select-Object -Last 3) -join ' '
+            $reasonText = if ($reason) { ": $reason" } else { '' }
+            throw "Delivering the provisioning note to $UserName@${HostNameOrAddress} failed (sftp exit code $($result.ExitCode))$reasonText."
+        }
+    } finally {
+        if ([IO.File]::Exists($localPath)) { [IO.File]::Delete($localPath) }
+        if ([IO.File]::Exists($batchPath)) { [IO.File]::Delete($batchPath) }
+    }
+}
+
 function Set-LabVMBootOrder {
     param([guid]$VMId, [ValidateSet('Dvd', 'Disk')][string]$Preference)
     # Deliberately generic: puts the chosen device class first without deleting any other existing
