@@ -3740,7 +3740,7 @@ Test-Case 'Gate: provisioning-only parameters are reported, and menu/transfer pa
     foreach ($sb in (Import-LabRealFunction 'Get-LabProvisioningOnlyParameter')) { . $sb }
     Assert-Equal @(Get-LabProvisioningOnlyParameter @('ReadOnly', 'LogRoot', 'IsoRoot', 'TimeoutSeconds', 'VMName', 'NonInteractive', 'Credential')).Count 0
     foreach ($name in @('NewVMName', 'WindowsIsoPath', 'ComputerName', 'Locale', 'TimeZone', 'OsEdition', 'VhdxSizeGB', 'VCpuCount',
-            'MemoryMinimumGB', 'MemoryStartupGB', 'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot', 'VhdxStorageRoot', 'ProvisioningTimeoutSeconds')) {
+            'MemoryMinimumGB', 'MemoryStartupGB', 'MemoryMaximumGB', 'SwitchName', 'VmStorageRoot', 'VhdxStorageRoot', 'ProvisioningTimeoutSeconds', 'ProductKey')) {
         Assert-Equal (@(Get-LabProvisioningOnlyParameter @('ReadOnly', $name)) -join ',') $name
     }
 }
