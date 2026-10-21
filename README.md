@@ -64,7 +64,7 @@ This does not persist a machine/user policy change and cannot override an organi
 
 ## Menus
 
-The first menu lists matching VMs, current state, CPU count, assigned memory and full VM ID. Assigned memory can be zero while a VM is Off. Pick a number, `N` to create a new VM, `W` to create a new VM and install Windows 11 on it unattended (both hidden in `-ReadOnly` mode), `R` to refresh or `Q` to quit. An empty list still offers `N` and `W` (unless read-only); it never creates or renames one automatically on its own.
+The first menu lists matching VMs, current state, CPU count, assigned memory and full VM ID. Assigned memory can be zero while a VM is Off. Pick a number, `N` to create a new VM, `W` to create a new VM and install Windows 11 on it unattended, `L` to create a new VM and install Ubuntu Desktop on it unattended (all three hidden in `-ReadOnly` mode), `R` to refresh or `Q` to quit. An empty list still offers `N`, `W` and `L` (unless read-only); it never creates or renames one automatically on its own.
 
 ### Create VM (`N`)
 
@@ -95,6 +95,32 @@ Creates a new `LAB-` VM and installs **Windows 11 (client editions only)** on it
 **If a step fails** after the VM exists, the error lists every step already applied, and the VM is left exactly as it is: no automatic power-off and no deletion. **The provisioning workspace is kept, not deleted**, and the error gives its path. Once the seed ISO is built, that workspace **contains the account password in plain text** (in the answer file inside `seed.iso`). Inspect the VM, then delete that folder yourself. An interrupted run (Ctrl+C) prints the same summary.
 
 The first wait covers all of Windows Setup, including its own reboots, which happen with DVD still first in the boot order (see `MANUAL-TESTS.md`, "Windows unattended install", for the live checks of that behavior).
+
+### Provision Ubuntu Desktop VM (`L`)
+
+Creates a new `LAB-` VM and installs **Ubuntu Desktop 26.04.x** on it with no console interaction (including GRUB's boot menu), ending with the VM installed, running, proven to boot on its own, and **reachable over SSH with settings already saved** for it. It is the Linux peer of `W` and has the same shape; the same flow runs from the command line with `-ProvisionLinuxVM` (see "Parameter mode: Linux unattended install" below), which is also how you change any default.
+
+1. **Pick the ISO** under `-IsoRoot`, or pass `-LinuxIsoPath`. The ISO is mounted read-only and its `.disk/info` release line is read. **Only Ubuntu Desktop 26.04.x is in scope**: any other release, Ubuntu Server, or an ISO without that file (not an Ubuntu installer) is refused right there, naming what was found; no VM is created.
+2. **VM name.** Prompted for (same rules as `N`), unless `-NewVMName` is given.
+3. **One combined preview**, with the **same VM-hardware defaults as `W`** (the two actions share that code): 2 vCPUs (capped to the host), dynamic memory 2 / 4 / 8 GB, a 150 GB dynamic VHDX, the adapter on **`Default Switch`**, the host's default VM and VHDX folders, Generation 2. Plus the Ubuntu settings: the release found, the computer name `lab-agent-test`, locale `en_US.UTF-8`, time zone `America/Guatemala` (an IANA zone ID; `-LinuxTimeZone`), the `UbuntuDesktop` boot profile, and where this VM's new SSH key will live. Then a single `[Y/n/cancel]` confirmation; nothing exists until you answer `Y`.
+
+   **Internet access during the install is required.** Ubuntu Desktop does not ship an SSH server; the installer downloads `openssh-server` while it runs (`ssh.install-server`), and this action's completion check is an SSH login. The `Default Switch` default (Hyper-V's built-in NAT switch) provides that access. With `-SwitchName ''` (Disconnected) the preview warns, and the run is expected to time out at the first SSH wait.
+4. **Create and provision**, holding the same per-name creation lock as `N`/`W` while the VM is created, then the new VM's own per-VM lock:
+   - create the VM; enable the Guest Service Interface and set the automatic stop action to "Shut down" (as `W` does);
+   - ask for the guest account (`Get-Credential`). The user name must be a valid Linux account name (lowercase letters, digits, `_` or `-`, starting with a letter or `_`, at most 32 characters) and the password must not be empty. The account gets `sudo`. The password is never logged and never written into the completion note;
+   - create the per-VM provisioning workspace, `%LOCALAPPDATA%\LabVmManager\Provisioning\<VM ID>`;
+   - write a copy of the ISO into the workspace with the `autoinstall` kernel parameter added to GRUB's boot line, so the installer runs unattended with no menu interaction. If the ISO's `grub.cfg` layout is not one this understands, nothing is patched, the original ISO is used, and you are warned that the installer will then **not** run unattended unless you add `autoinstall` by hand at the GRUB menu;
+   - generate a fresh **ed25519 SSH key pair for this VM only**, at `%LOCALAPPDATA%\LabVmManager\SshConnections\<VM ID>.key` (and `.key.pub`) -- deliberately outside the workspace, so the workspace cleanup can never delete it;
+   - build the NoCloud autoinstall `user-data` (computer name, locale, time zone, the account, the SSH server, and the new public key as the account's only authorized key) plus `meta-data`, and put both on a small seed ISO labelled `cidata`;
+   - attach the Ubuntu ISO and the seed ISO as two DVD drives, DVD first in the boot order (confirming the Ubuntu ISO's own drive is among those first DVD entries), and apply the `UbuntuDesktop` boot profile (Secure Boot with the `MicrosoftUEFICertificateAuthority` template; no key protector or vTPM);
+   - **first boot cycle:** start the VM and wait (up to `-ProvisioningTimeoutSeconds`, default 1800 s) for an SSH login as the account with the new key, which proves Ubuntu is installed. This one wait trusts the brand-new guest's host key on first connect and records it in your `~/.ssh/known_hosts`, so you never need option `K` for this VM. It then copies `lab-vm-manager-provisioning-note.txt` to the account's `~/Desktop` over SFTP, naming the VM, the ISO, the release, the computer name, the account and the time taken (no password, no secret);
+   - **cleanup:** request a normal guest shutdown (at least 1800 s wait), remove the seed drive, eject the Ubuntu ISO (the drive stays), put the disk first in the boot order, and **delete the provisioning workspace** (the SSH key is not in it, and is kept);
+   - **second boot cycle:** start the VM again and wait for a second SSH login, which proves it boots cleanly on its own and re-reads its address (a new DHCP lease is possible);
+   - only then, **save this VM's SSH connection settings**: the address the second login used, port 22, the account, and the new key as the identity file. This **replaces any SSH settings previously saved for that VM ID**. From here, `T`, `13`/`14` and `-CopyToVM`/`-CopyFromVM` use SSH/SFTP for this VM with no further setup.
+
+   The VM is left running. Audit records: `provision-linux-vm` `STARTED` right after the VM is created and one `COMPLETED` or `FAILED_OR_UNCONFIRMED` at the end, each naming the ISO, the release, the computer name and the elapsed time.
+
+**If a step fails** after the VM exists, the error lists every step already applied and the VM is left exactly as it is (no power-off, no deletion). **The provisioning workspace is kept**, and the error gives its path; once the seed ISO is built it **contains the account password in plain text** (in the `user-data` inside `seed.iso`). The error also names the kept SSH key, and **no SSH connection settings are saved by a failed run** -- they are written only as the very last step, after the second login succeeds. Inspect the VM, then delete the workspace (and, if you discard the VM, the key files) yourself. An interrupted run (Ctrl+C) prints the same summary.
 
 The selected-VM menu provides:
 
@@ -158,7 +184,7 @@ One entry point for a VM's installer media, with three sub-actions:
 - **E — Eject the current DVD media** (VM must be Off). Shows what is attached and asks `[Y/n/cancel]`. The DVD drive stays, and the boot order is not changed (an empty DVD entry is skipped at boot).
 - **I — Inspect** the DVD drives and their media, the recorded previous attachment, Secure Boot state/template, key protector and vTPM state, and the firmware boot order. A security read that fails (key protector or vTPM) shows as `unknown` instead of ending the view. Read-only; this is the only sub-action available under `-ReadOnly`, where `M` goes straight to it and never prompts for a profile or ISO.
 
-What this does **not** do: it does not install an OS. It prepares the VM (firmware profile, media, boot order) so that starting it boots the chosen installer, which you then run yourself in the VM console. For an unattended Windows 11 install on a new VM, use `W` from the VM list instead (see "Provision Windows 11 VM (`W`)"); unattended Linux installation is not implemented. Known v1 limitations: selecting among **several existing DVD drives** is not supported — attach and eject refuse with a clear message when a VM has more than one, and you attach/eject manually in Hyper-V Manager instead. The DVD-first reorder recognizes boot entries by their device type. If no DVD entry is recognized, the step fails loudly instead of silently leaving the order unchanged.
+What this does **not** do: it does not install an OS. It prepares the VM (firmware profile, media, boot order) so that starting it boots the chosen installer, which you then run yourself in the VM console. For an unattended Windows 11 install on a new VM, use `W` from the VM list instead (see "Provision Windows 11 VM (`W`)"); for an unattended Ubuntu Desktop 26.04.x install, use `L` (see "Provision Ubuntu Desktop VM (`L`)"). Known v1 limitations: selecting among **several existing DVD drives** is not supported — attach and eject refuse with a clear message when a VM has more than one, and you attach/eject manually in Hyper-V Manager instead. The DVD-first reorder recognizes boot entries by their device type. If no DVD entry is recognized, the step fails loudly instead of silently leaving the order unchanged.
 
 Hyper-V shapes this relies on are **confirmed**, not guessed. Each was read by .NET reflection from the installed Hyper-V module's own type metadata, which needs no elevation and touches no VM. `Test-LabVM.ps1` re-checks them against the installed module on every run.
 - `Get-VMFirmware`'s `BootOrder` is a `VMBootSource[]`. Each entry's `.Device` is a `DvdDrive` or `HardDiskDrive`, with no `VM` prefix on the type name.
@@ -214,7 +240,7 @@ powershell.exe -NoProfile -File .\Lab-VM.ps1 -ConfigureSsh -VMName LAB-linux -Ss
 
 Parameters:
 
-- `-ConfigureSsh` -- the switch that selects this mode. Mutually exclusive with `-CopyToVM`/`-CopyFromVM`/`-ProvisionWindowsVM`; supplying `-ConfigureSsh` together with any of them exits `1` before anything else runs ("Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, or -ProvisionWindowsVM; one action per invocation.").
+- `-ConfigureSsh` -- the switch that selects this mode. Mutually exclusive with `-CopyToVM`/`-CopyFromVM`/`-ProvisionWindowsVM`/`-ProvisionLinuxVM`; supplying `-ConfigureSsh` together with any of them exits `1` before anything else runs ("Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, -ProvisionWindowsVM, or -ProvisionLinuxVM; one action per invocation.").
 - `-VMName` / `-VMId` -- identify the target VM; pick exactly one, same resolution rules as file transfer.
 - `-SshHost` -- required hostname or IP address to save. Must not start with `-` or contain whitespace, control characters or `@`.
 - `-SshPort` -- optional; defaults to `22`; must be 1-65535 (rejected at parameter binding otherwise).
@@ -234,7 +260,7 @@ $cred = Get-Credential
 
 Parameters (all optional unless noted):
 
-- `-ProvisionWindowsVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM` and `-CopyFromVM` (exit `1` before anything runs).
+- `-ProvisionWindowsVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM`, `-CopyFromVM` and `-ProvisionLinuxVM` (exit `1` before anything runs).
 - `-NewVMName` -- name of the VM to **create** (must start with `LAB-` and be unique). This is deliberately not `-VMName`, which always names an existing VM. `-VMName`, `-VMId` and the other transfer-only parameters are rejected with `-ProvisionWindowsVM`.
 - `-WindowsIsoPath` -- the Windows 11 ISO. Default: pick one under `-IsoRoot`.
 - `-OsEdition` -- edition name, full or short (`'Windows 11 Pro'` or `Pro`). Default: the picker, preselecting Pro. With `-NonInteractive`: Pro, or the ISO's only Windows 11 client edition; otherwise it fails listing the choices.
@@ -251,7 +277,35 @@ Parameters (all optional unless noted):
 - `-Credential` -- the new guest account, built with `Get-Credential` in the calling session (as for file transfer; never a plaintext password on the command line). Without it, you are prompted after the VM is created.
 - `-NonInteractive` -- never prompt. Then `-NewVMName`, `-WindowsIsoPath` and `-Credential` are required, and a run missing any of them exits `1` before any VM exists. Without `-OsEdition`, the edition defaults to Pro, or to the ISO's only edition.
 
-The provisioning-only parameters (`-NewVMName` through `-ProvisioningTimeoutSeconds`) require `-ProvisionWindowsVM`; supplying any of them without it exits `1` rather than being ignored or opening the menu. Exit code: `0` only when the whole flow completed (both sign-ins proven). A refusal, a failure, or an interactive cancel exits `1`. The same host assertion and `session` `STARTED`/`ENDED` audit records as the other parameter modes are written, plus the `provision-windows-vm` records described above. Under `-ReadOnly`, it creates nothing and exits `1`.
+Provisioning parameters are gated in three tiers, and a parameter outside its tier exits `1` rather than being ignored or opening the menu:
+
+- **Shared VM-creation parameters** (`-NewVMName`, `-ComputerName`, `-Locale`, `-VCpuCount`, `-MemoryMinimumGB`/`-MemoryStartupGB`/`-MemoryMaximumGB`, `-VhdxSizeGB`, `-SwitchName`, `-VmStorageRoot`, `-VhdxStorageRoot`, `-ProvisioningTimeoutSeconds`) work with either `-ProvisionWindowsVM` or `-ProvisionLinuxVM`, and are rejected without one of them.
+- **Windows-only parameters** (`-WindowsIsoPath`, `-OsEdition`, `-ProductKey`, `-TimeZone`) require `-ProvisionWindowsVM`, and are rejected as foreign with `-ProvisionLinuxVM`.
+- **Linux-only parameters** (`-LinuxIsoPath`, `-LinuxTimeZone`) require `-ProvisionLinuxVM`, and are rejected as foreign with `-ProvisionWindowsVM`.
+
+`-NonInteractive` and `-Credential` are accepted by both provisioning modes (and by file transfer). Exit code: `0` only when the whole flow completed (both sign-ins proven). A refusal, a failure, or an interactive cancel exits `1`. The same host assertion and `session` `STARTED`/`ENDED` audit records as the other parameter modes are written, plus the `provision-windows-vm` records described above. Under `-ReadOnly`, it creates nothing and exits `1`.
+
+## Parameter mode: Linux unattended install
+
+Pass `-ProvisionLinuxVM` to run the `L` flow (see "Provision Ubuntu Desktop VM (`L`)" above) from the command line and exit, instead of launching the menu. Without `-NonInteractive`, anything not supplied is asked for the same way `L` asks: ISO picker, VM name, credential prompt, and the single confirmation.
+
+```powershell
+$cred = Get-Credential -UserName labagent -Message 'Guest Linux account'
+& .\Lab-VM.ps1 -ProvisionLinuxVM -NewVMName LAB-ubuntu -LinuxIsoPath E:\ISO\ubuntu-26.04.1-desktop-amd64.iso -NonInteractive -Credential $cred
+```
+
+Parameters (all optional unless noted):
+
+- `-ProvisionLinuxVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM`, `-CopyFromVM` and `-ProvisionWindowsVM` (exit `1` before anything runs).
+- `-LinuxIsoPath` -- the Ubuntu Desktop 26.04.x ISO. Default: `''`, which means pick one under `-IsoRoot`.
+- `-LinuxTimeZone` -- the guest time zone as an **IANA zone ID** such as `'America/Guatemala'` or `'Europe/Paris'` (`timedatectl list-timezones` on any Linux machine lists them). Default: `'America/Guatemala'`. This is deliberately separate from `-TimeZone`, which takes Windows time zone IDs (`'Central America Standard Time'`) and only applies to `-ProvisionWindowsVM`. Only the `Region/City` shape is checked here (Windows PowerShell 5.1 cannot validate IANA IDs); a well-formed but unknown zone is caught by the installer.
+- `-Locale` -- shared with Windows provisioning, but for Linux it is a POSIX locale such as `en_US.UTF-8` (the default when omitted).
+- `-NewVMName`, `-ComputerName` (default `'lab-agent-test'`, same 1-15 letters/digits/hyphens rule as Windows), `-VCpuCount`, `-MemoryMinimumGB`/`-MemoryStartupGB`/`-MemoryMaximumGB`, `-VhdxSizeGB`, `-SwitchName`, `-VmStorageRoot`, `-VhdxStorageRoot` -- shared with `-ProvisionWindowsVM`, same meaning and defaults (see "Parameter mode: Windows unattended install" above).
+- `-ProvisioningTimeoutSeconds` -- default `1800` (300-7200): how long each of the two SSH-login waits may take.
+- `-Credential` -- the new guest account, built with `Get-Credential` in the calling session; its user name must be a valid Linux account name. Without it, you are prompted after the VM is created.
+- `-NonInteractive` -- never prompt. Then `-NewVMName`, `-LinuxIsoPath` and `-Credential` are required, and a run missing any of them exits `1` before any VM exists.
+
+Exit code: `0` only when the whole flow completed (both SSH logins proven and the connection settings saved). A refusal (including an out-of-scope ISO), a failure, or an interactive cancel exits `1`. The same host assertion and `session` `STARTED`/`ENDED` audit records as the other parameter modes are written, plus the `provision-linux-vm` records described above. Under `-ReadOnly`, it creates nothing and exits `1`.
 
 ## First baseline
 
@@ -316,7 +370,7 @@ Option `12` calls Hyper-V's `Remove-VM`, which unregisters the VM and its config
 
 ## Intentionally not included
 
-No guest OS installation other than `W`'s unattended Windows 11 install on a newly created VM (option `M` only attaches installer media and prepares the boot profile/order; it never runs an installer), Linux unattended installation, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing (no product key is set unless `-ProductKey` is explicitly supplied), remote hosts, automatic login beyond `W`'s single first sign-in, other guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
+No guest OS installation other than `W`'s unattended Windows 11 install and `L`'s unattended Ubuntu Desktop 26.04.x install on a newly created VM (option `M` only attaches installer media and prepares the boot profile/order; it never runs an installer), no other Linux distribution or Ubuntu release, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing (no product key is set unless `-ProductKey` is explicitly supplied), remote hosts, automatic login beyond `W`'s single first sign-in, other guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
 
 ## Linux file transfer: SFTP backend design decision
 
@@ -338,11 +392,11 @@ On failure in `KeyAgent` mode, the warning includes the last lines of `sftp`'s o
 
 `Resolve-LabSshAuthMode` picks between the two authentication modes from the saved connection settings: `KeyAgent` (batch, non-interactive) when an identity file is configured, `InteractivePassword` (OpenSSH's own password prompt on the real console) otherwise. `Invoke-LabSftpCommand` is the single integration point all real SFTP operations route through, including the connection test and every later transfer; it checks `Get-LabSshToolingInfo` first and throws a clear error naming `ssh.exe`/`sftp.exe` if the OpenSSH client tooling is missing.
 
-**Password login disabled on the guest:** if the guest only accepts key-based SSH authentication (or you intend to use `KeyAgent` mode from the start), the operator establishes trust before ever attempting a `KeyAgent`-mode connection, by adding their public key to the guest's `~/.ssh/authorized_keys` through the existing guest console (or whatever provisioning already placed files there). This manager never edits `authorized_keys` itself, on the guest or otherwise, as a side effect of any configuration or transfer action — that file is entirely the operator's and the guest's own responsibility.
+**Password login disabled on the guest:** if the guest only accepts key-based SSH authentication (or you intend to use `KeyAgent` mode from the start), the operator establishes trust before ever attempting a `KeyAgent`-mode connection, by adding their public key to the guest's `~/.ssh/authorized_keys` through the existing guest console (or whatever provisioning already placed files there). This manager never edits `authorized_keys` itself, on the guest or otherwise, as a side effect of any configuration or transfer action — that file is entirely the operator's and the guest's own responsibility. (The one place a key reaches it is `L` / `-ProvisionLinuxVM`, and only at install time: the installer itself writes that VM's own generated public key as the new account's authorized key, before the guest has ever booted.)
 
 ### First connection: trusting the guest's host key (`K`)
 
-Every connection the manager makes for a transfer or connection test uses `StrictHostKeyChecking=yes`, which never asks about a host key: a guest whose key is not yet in your `~/.ssh/known_hosts` is refused ("Host key verification failed", exit `255`). So before the first `T` or transfer to a new Linux guest, trust its key once with menu option `K` (`Add-LabSshKnownHost`):
+Every connection the manager makes for a transfer or connection test uses `StrictHostKeyChecking=yes`, which never asks about a host key: a guest whose key is not yet in your `~/.ssh/known_hosts` is refused ("Host key verification failed", exit `255`). So before the first `T` or transfer to a new Linux guest, trust its key once with menu option `K` (`Add-LabSshKnownHost`). A VM created by `L` / `-ProvisionLinuxVM` is the one exception: its unattended install already recorded the guest's host key, after the VM authenticated with its own freshly minted key, so `K` is not needed for it. For any other guest:
 
 1. Select the VM (it must be `Running` and have saved SSH settings, from `C` or `-ConfigureSsh`) and choose `K`. The manager explains what will happen, including the command to read the guest's own fingerprint on its console: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
 2. Type the exact `TRUST HOST KEY <host>` confirmation. Anything else cancels: no connection is made and `known_hosts` is not changed.
