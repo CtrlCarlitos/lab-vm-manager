@@ -809,6 +809,25 @@ Test-Case 'New-LabWindowsAnswerFileXml answers Setup''s own language page via In
     if ($null -eq $setup) { throw 'Microsoft-Windows-Setup is no longer in the windowsPE pass.' }
     Assert-Equal ($result.Contains('ProductKey')) $false
 }
+Test-Case 'New-LabWindowsAnswerFileXml without -ProductKey has no ProductKey element anywhere' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 1 'labadmin' $securePassword
+    $xml = [xml]$result
+    Assert-Equal (Select-LabXmlNode $xml 'ProductKey') $null
+    # Same with the parameter explicitly supplied but empty: still no activation, by design.
+    $resultExplicitEmpty = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 1 'labadmin' $securePassword ''
+    $xmlExplicitEmpty = [xml]$resultExplicitEmpty
+    Assert-Equal (Select-LabXmlNode $xmlExplicitEmpty 'ProductKey') $null
+}
+Test-Case 'New-LabWindowsAnswerFileXml with -ProductKey adds the key and WillShowUI=OnError, keeping AcceptEula' {
+    $securePassword = ConvertTo-SecureString 'P@ssw0rd!' -AsPlainText -Force
+    $result = New-LabWindowsAnswerFileXml 'LAB-PC01' 'en-US' 'Pacific Standard Time' 1 'labadmin' $securePassword '12345-ABCDE-12345-ABCDE-12345'
+    $xml = [xml]$result
+    $productKey = $xml.SelectSingleNode("//*[local-name()='ProductKey']")
+    Assert-Equal ($productKey.SelectSingleNode("*[local-name()='Key']")).InnerText '12345-ABCDE-12345-ABCDE-12345'
+    Assert-Equal ($productKey.SelectSingleNode("*[local-name()='WillShowUI']")).InnerText 'OnError'
+    Assert-Equal (Select-LabXmlNode $xml 'AcceptEula').InnerText 'true'
+}
 
 Test-Case 'New VM name must start with LAB-' { Assert-Equal (Test-LabNewVMName 'OTHER-Test' @()) $false }
 Test-Case 'New VM name rejects case-insensitive duplicate' { Assert-Equal (Test-LabNewVMName 'lab-test' @('LAB-Test')) $false }
@@ -3483,7 +3502,8 @@ function Invoke-LabProvisioningScenario {
             return [pscustomobject]@{ Patched = $false; Reason = 'simulated: layout not understood'; OutputPath = $null }
         }
         function New-LabWindowsAnswerFileXml {
-            param([string]$ComputerName, [string]$Locale, [string]$TimeZone, [int]$ImageIndex, [string]$UserName, [securestring]$Password)
+            param([string]$ComputerName, [string]$Locale, [string]$TimeZone, [int]$ImageIndex, [string]$UserName,
+                [securestring]$Password, [string]$ProductKey = '')
             Record 'New-LabWindowsAnswerFileXml'
             $script:ProvArgs['New-LabWindowsAnswerFileXml'] = $PSBoundParameters
             return '<unattend/>'
@@ -3554,6 +3574,8 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     # independent of -NewVMName and of the host's own time zone.
     Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ComputerName 'lab-agent-test'
     Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].TimeZone 'Central America Standard Time'
+    # No -ProductKey was supplied: the answer-file call must get the empty "no activation" default.
+    Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ProductKey ''
     $core = $r.Args['New-LabVMCore']
     Assert-Equal $core.Name 'LAB-Win11'
     Assert-Equal $core.VCpuCount 2
@@ -3571,6 +3593,19 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     Assert-Equal (@($r.Args['New-LabSeedIso'].Files.Keys) -join ',') 'Autounattend.xml'
     Assert-Equal ($r.Audit[0] -like 'provision-windows-vm|STARTED|*') $true
     Assert-Equal ($r.Audit[-1] -like 'provision-windows-vm|COMPLETED|*Win11.iso*Windows 11 Pro*ComputerName=lab-agent-test*ElapsedSeconds=*') $true
+}
+Test-Case 'Provision: a malformed -ProductKey is rejected before any VM is created' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; ProductKey = 'not-a-key' } -Answers @('')
+    Assert-Equal $r.Status $null
+    if ($r.Error -notmatch 'ProductKey') { throw "Error did not name -ProductKey: $($r.Error)" }
+    Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    Assert-Equal $r.Audit.Count 0
+}
+Test-Case 'Provision: a well-formed -ProductKey passes through unchanged to the answer-file call' {
+    $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; ProductKey = '12345-ABCDE-12345-ABCDE-12345' } -Answers @('')
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Status 'COMPLETED'
+    Assert-Equal $r.Args['New-LabWindowsAnswerFileXml'].ProductKey '12345-ABCDE-12345-ABCDE-12345'
 }
 Test-Case 'Provision: an unpatched ISO falls back to the ORIGINAL source path for attach and cleanup' {
     $r = Invoke-LabProvisioningScenario @{ NewVMName = 'LAB-Win11'; OsEdition = 'Pro' } -Patched $false
