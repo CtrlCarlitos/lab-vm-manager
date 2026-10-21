@@ -1807,10 +1807,11 @@ function Get-LabLinuxIsoInfo {
             return [pscustomobject]@{ ReleaseText = ''; IsUbuntuDesktopInScope = $false }
         }
         $releaseText = [string](Get-Content -LiteralPath $infoFile -Raw -ErrorAction Stop)
-        # In scope = Ubuntu 26.04.x Desktop: a 26.04 release line that is not a Server release.
+        # In scope = Ubuntu 26.04.x Desktop: a release line that STARTS with "Ubuntu 26.04" (case-sensitive,
+        # so Kubuntu/Xubuntu/Lubuntu 26.04 lines do not pass) and is not a Server release.
         return [pscustomobject]@{
             ReleaseText = $releaseText
-            IsUbuntuDesktopInScope = ($releaseText -match 'Ubuntu 26\.04(\.\d+)? LTS' -and $releaseText -notmatch 'Server')
+            IsUbuntuDesktopInScope = ($releaseText -cmatch '^Ubuntu 26\.04(\.\d+)? LTS' -and $releaseText -notmatch 'Server')
         }
     } finally {
         # Only dismount if Mount-DiskImage itself actually succeeded, for the same reason as above.
@@ -1866,9 +1867,11 @@ function Get-LabLinuxIsoInfo {
 # this ISO's layout isn't what this technique understands, and nothing is patched or copied. The
 # file's current content is then read from its extent and searched for a `linux` boot line (the
 # fixture's own test pattern: a line containing "/casper/vmlinuz"); if not found, this refuses
-# rather than ever patching blind. ` autoinstall` is inserted right before a trailing "---" marker
-# on that line if present (GRUB's own kernel/initrd-argument separator), otherwise appended to the
-# line's end. Since ISO9660 extents are sector-aligned but file content inside them is often
+# rather than ever patching blind. ` autoinstall` is inserted right before the FIRST " ---" token
+# on that line wherever it appears (mid-line, as in `linux /casper/vmlinuz --- quiet splash`, or at
+# the end), otherwise appended to the line's end. "---" is not a GRUB concept: it is casper's own
+# marker, and the kernel arguments AFTER it are the ones carried into the installed system's own
+# kernel command line, so `autoinstall` must sit before it to stay an installer-only parameter. Since ISO9660 extents are sector-aligned but file content inside them is often
 # shorter than a whole number of sectors, the edit can only be written in place if the sector(s)
 # already backing the extent have enough slack for the longer content (rounded up to the next
 # 2048-byte boundary); if not, this refuses with a Reason naming the shortfall -- never grows a file
@@ -2097,9 +2100,10 @@ function New-LabPatchedBootableLinuxIso {
         }
     }
     $trimmedLine = $lines[$kernelLineIndex].TrimEnd()
-    $newLine = if ($trimmedLine.EndsWith('---')) {
-        $head = $trimmedLine.Substring(0, $trimmedLine.Length - 3).TrimEnd()
-        "$head $autoinstallParam ---"
+    # The first whitespace-preceded "---" token, mid-line or at the end (see the header comment).
+    $markerMatch = [regex]::Match($trimmedLine, '\s---(?=\s|$)')
+    $newLine = if ($markerMatch.Success) {
+        $trimmedLine.Substring(0, $markerMatch.Index) + " $autoinstallParam" + $trimmedLine.Substring($markerMatch.Index)
     } else {
         "$trimmedLine $autoinstallParam"
     }
@@ -2197,7 +2201,10 @@ function New-LabLinuxAutoinstallUserData {
     try {
         $passwordPtr = [Runtime.InteropServices.Marshal]::SecureStringToGlobalAllocUnicode($Password)
         $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($passwordPtr)
-        $shellCommand = 'echo ' + (ConvertTo-LabPosixShellSingleQuoted "${UserName}:${plainPassword}") + ' | chpasswd'
+        # printf '%s\n', never echo: /bin/sh on Ubuntu is dash, whose builtin echo always interprets
+        # backslash escapes in its argument (\\ becomes \, \c truncates the rest), which would silently
+        # set a different password. printf's %s prints its argument exactly as given.
+        $shellCommand = "printf '%s\n' " + (ConvertTo-LabPosixShellSingleQuoted "${UserName}:${plainPassword}") + ' | chpasswd'
         $yamlEscapedShellCommand = $shellCommand | ConvertTo-Json -Compress
     } finally {
         if ($passwordPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeGlobalAllocUnicode($passwordPtr) }
@@ -2705,7 +2712,9 @@ function New-LabEphemeralSshKeyPair {
     # Get-LabSshConnectionSettingsPath's own stored IdentityFilePath already assumes for every other
     # VM's identity file. The doubled quotes are deliberate: ssh-keygen.exe on Windows can otherwise
     # drop a genuinely empty -N argument outright.
-    & ssh-keygen.exe -t ed25519 -N '""' -f $privateKeyPath -q
+    # -C: a generic comment. ssh-keygen's default (<Windows user>@<host name>) would otherwise be written
+    # into the guest's authorized_keys and the user-data, disclosing the operator's identity.
+    & ssh-keygen.exe -t ed25519 -N '""' -C "lab-vm-manager-$VMId" -f $privateKeyPath -q
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         throw "ssh-keygen.exe exited with code $exitCode while generating an ephemeral key pair at '$privateKeyPath'."
@@ -2774,9 +2783,29 @@ function Wait-LabSshSession {
     #   OpenSSH authored; it never composes a host key entry itself.
     # - Candidate addresses must parse as IP addresses, the username is validated like every other SSH
     #   value, and the VM must still be Running on every iteration.
-    param([guid]$VMId, [string]$UserName, [int]$TimeoutSeconds)
+    # - A known_hosts entry that holds a DIFFERENT key for the address (for example left by an earlier VM
+    #   that had the same address) is refused by OpenSSH; this warns once per address with the exact
+    #   'ssh-keygen -R <address>' command and keeps polling, so the operator can clear the stale entry
+    #   from another window and this same run then completes.
+    #
+    # Pinned mode (-PinnedHostKey '<key type> <base64 key>', used for the post-install second boot): the
+    # host key the FIRST login verified for this VM. Every attempt then first runs a pin check: a strict
+    # (StrictHostKeyChecking=yes) probe whose ONLY known_hosts files (user and global) are a scratch file
+    # holding just that key for the address being tried. Only a host presenting that exact key and
+    # accepting this VM's own key passes; any other key is refused and never recorded anywhere. Only
+    # after the pin check passes does the usual two-phase probe above run, and the line it records (if
+    # any) is committed only if it is that same pinned key. So a second boot at a NEW address must prove
+    # it is the same machine the first boot was; no second trust-on-first-connect window opens.
+    #
+    # Returns Address (the address that answered) and HostKey ('<key type> <base64 key>' of the verified
+    # host key, or $null when nothing was recorded because known_hosts already trusted it, unpinned).
+    param([guid]$VMId, [string]$UserName, [int]$TimeoutSeconds, [string]$PinnedHostKey = '')
     if (-not (Test-LabSshUserName $UserName)) {
         throw "Invalid SSH username '$UserName': it must not be empty, start with '-', or contain whitespace or control characters."
+    }
+    # One line, two fields, nothing OpenSSH would read as a marker, pattern or second entry.
+    if ($PinnedHostKey -ne '' -and $PinnedHostKey -cnotmatch '\A[A-Za-z0-9@._-]+ [A-Za-z0-9+/]+={0,2}\z') {
+        throw "Invalid pinned host key: expected '<key type> <base64 key>' on one line."
     }
     $tooling = Get-LabSshToolingInfo
     if (-not $tooling.Available) {
@@ -2788,6 +2817,23 @@ function Wait-LabSshSession {
     }
     $knownHostsPath = Get-LabSshUserKnownHostsPath
     $knownHostsOption = ConvertTo-LabSshOptionPath $knownHostsPath
+    # Runs one ssh.exe probe and returns its exit code and output as one line of text.
+    $runProbe = {
+        param([string[]]$ProbeArguments)
+        $probeExitCode = $null
+        $probeText = ''
+        try {
+            $ErrorActionPreference = 'Continue'
+            $raw = & ssh.exe @ProbeArguments 2>&1
+            $probeExitCode = $LASTEXITCODE
+            $probeText = (@($raw | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join ' ')
+        } catch {
+            $probeText = $_.Exception.Message
+        }
+        return [pscustomobject]@{ ExitCode = $probeExitCode; Output = $probeText }
+    }
+    $hostKeyRefusedPattern = 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'
+    $staleKeyWarned = [Collections.Generic.HashSet[string]]::new()
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $lastError = $null
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
@@ -2806,65 +2852,106 @@ function Wait-LabSshSession {
         }
         foreach ($address in $addresses) {
             $scratchPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-ssh-probe-' + [guid]::NewGuid().ToString('N') + '.known_hosts')
+            $pinPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-ssh-pin-' + [guid]::NewGuid().ToString('N') + '.known_hosts')
             try {
-                [IO.File]::WriteAllText($scratchPath, '')
-                $scratchOption = ConvertTo-LabSshOptionPath $scratchPath
-                # -n: redirect ssh's stdin from /dev/null, same reasoning as Invoke-LabSshCommand's own
-                # KeyAgent branch -- a BatchMode=yes call must never read from this process's own stdin.
-                # ConnectTimeout bounds each attempt, so one unresponsive address cannot stall the wait
-                # past its timeout. UpdateHostKeys=no: only the one key this connection verified is ever
-                # recorded.
-                $arguments = @('-n', '-F', 'none',
-                    '-o', 'BatchMode=yes',
-                    '-o', 'StrictHostKeyChecking=accept-new',
-                    '-o', "UserKnownHostsFile=$scratchOption $knownHostsOption",
-                    '-o', 'UpdateHostKeys=no',
-                    '-o', 'IdentitiesOnly=yes',
-                    '-o', 'ConnectTimeout=10',
-                    '-i', $identityFilePath,
-                    "$UserName@$address", 'exit')
-                $exitCode = $null
-                $probeOutput = ''
-                try {
-                    $ErrorActionPreference = 'Continue'
-                    $raw = & ssh.exe @arguments 2>&1
-                    $exitCode = $LASTEXITCODE
-                    $probeOutput = (@($raw | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join ' ')
-                } catch {
-                    $probeOutput = $_.Exception.Message
-                }
-                if ($exitCode -eq 0) {
-                    # Phase 2: this VM's own key authenticated against this exact host. An empty scratch
-                    # file means the real known_hosts already trusted this key, so nothing is added.
-                    $verified = @([IO.File]::ReadAllLines($scratchPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-                    if ($verified.Count -gt 1) {
-                        throw "The SSH probe of $address recorded $($verified.Count) host key lines where one was expected; known_hosts was not changed."
+                $pinPassed = $true
+                if ($PinnedHostKey -ne '') {
+                    # Pin check (pinned mode only; see the header): the pin file is the ONLY known_hosts
+                    # file, user and global, so OpenSSH accepts nothing but the pinned key for this address,
+                    # and StrictHostKeyChecking=yes means it never records anything.
+                    [IO.File]::WriteAllText($pinPath, "$address $PinnedHostKey`n")
+                    $pinOption = ConvertTo-LabSshOptionPath $pinPath
+                    $pinArguments = @('-n', '-F', 'none',
+                        '-o', 'BatchMode=yes',
+                        '-o', 'StrictHostKeyChecking=yes',
+                        '-o', "UserKnownHostsFile=$pinOption",
+                        '-o', "GlobalKnownHostsFile=$pinOption",
+                        '-o', 'UpdateHostKeys=no',
+                        '-o', 'IdentitiesOnly=yes',
+                        '-o', 'ConnectTimeout=10',
+                        '-i', $identityFilePath,
+                        "$UserName@$address", 'exit')
+                    $pinProbe = & $runProbe $pinArguments
+                    if ($pinProbe.ExitCode -ne 0) {
+                        $pinPassed = $false
+                        $lastError = if ($pinProbe.Output -match $hostKeyRefusedPattern) {
+                            "the host at $address did not present the host key this VM proved at its first SSH login, so it was not trusted. OpenSSH said: $($pinProbe.Output)"
+                        } elseif ([string]::IsNullOrEmpty($pinProbe.Output)) { "ssh exited with code $($pinProbe.ExitCode)" } else { $pinProbe.Output }
                     }
-                    if ($verified.Count -eq 1) {
-                        $line = $verified[0].Trim()
-                        $fields = @($line -split ' ')
-                        $names = @(if ($fields.Count -ge 3) { $fields[0].Split(',') })
-                        if ($names.Count -eq 0 -or @($names | Where-Object { $_ -ne $address }).Count -gt 0) {
-                            throw "The SSH probe of $address recorded a host key line for a different host; known_hosts was not changed."
+                }
+                if ($pinPassed) {
+                    [IO.File]::WriteAllText($scratchPath, '')
+                    $scratchOption = ConvertTo-LabSshOptionPath $scratchPath
+                    # -n: redirect ssh's stdin from /dev/null, same reasoning as Invoke-LabSshCommand's own
+                    # KeyAgent branch -- a BatchMode=yes call must never read from this process's own stdin.
+                    # ConnectTimeout bounds each attempt, so one unresponsive address cannot stall the wait
+                    # past its timeout. UpdateHostKeys=no: only the one key this connection verified is ever
+                    # recorded.
+                    $arguments = @('-n', '-F', 'none',
+                        '-o', 'BatchMode=yes',
+                        '-o', 'StrictHostKeyChecking=accept-new',
+                        '-o', "UserKnownHostsFile=$scratchOption $knownHostsOption",
+                        '-o', 'UpdateHostKeys=no',
+                        '-o', 'IdentitiesOnly=yes',
+                        '-o', 'ConnectTimeout=10',
+                        '-i', $identityFilePath,
+                        "$UserName@$address", 'exit')
+                    $probe = & $runProbe $arguments
+                    $exitCode = $probe.ExitCode
+                    $probeOutput = $probe.Output
+                    if ($exitCode -eq 0) {
+                        # Phase 2: this VM's own key authenticated against this exact host. An empty scratch
+                        # file means the real known_hosts already trusted this key, so nothing is added.
+                        $verified = @([IO.File]::ReadAllLines($scratchPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                        if ($verified.Count -gt 1) {
+                            throw "The SSH probe of $address recorded $($verified.Count) host key lines where one was expected; known_hosts was not changed."
                         }
-                        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $knownHostsPath))
-                        $separator = ''
-                        if ([IO.File]::Exists($knownHostsPath)) {
-                            $existing = [IO.File]::ReadAllText($knownHostsPath)
-                            if ($existing.Length -gt 0 -and -not $existing.EndsWith("`n")) { $separator = "`n" }
+                        $line = $null
+                        $verifiedKey = $null
+                        if ($verified.Count -eq 1) {
+                            $line = $verified[0].Trim()
+                            $fields = @($line -split ' ')
+                            $names = @(if ($fields.Count -ge 3) { $fields[0].Split(',') })
+                            if ($names.Count -eq 0 -or @($names | Where-Object { $_ -ne $address }).Count -gt 0) {
+                                throw "The SSH probe of $address recorded a host key line for a different host; known_hosts was not changed."
+                            }
+                            $verifiedKey = "$($fields[1]) $($fields[2])"
                         }
-                        [IO.File]::AppendAllText($knownHostsPath, $separator + $line + "`n")
+                        if ($PinnedHostKey -ne '' -and $null -ne $verifiedKey -and $verifiedKey -cne $PinnedHostKey) {
+                            # Pinned mode: the pin check above passed, yet this second connection recorded
+                            # another key (the answering host changed in between). Never committed.
+                            $lastError = "the host at $address presented a host key different from the one this VM proved at its first SSH login; known_hosts was not changed"
+                        } else {
+                            if ($null -ne $line) {
+                                [void][IO.Directory]::CreateDirectory((Split-Path -Parent $knownHostsPath))
+                                $separator = ''
+                                if ([IO.File]::Exists($knownHostsPath)) {
+                                    $existing = [IO.File]::ReadAllText($knownHostsPath)
+                                    if ($existing.Length -gt 0 -and -not $existing.EndsWith("`n")) { $separator = "`n" }
+                                }
+                                [IO.File]::AppendAllText($knownHostsPath, $separator + $line + "`n")
+                            }
+                            $hostKey = if ($null -ne $verifiedKey) { $verifiedKey } elseif ($PinnedHostKey -ne '') { $PinnedHostKey } else { $null }
+                            return [pscustomobject]@{ Address = [string]$address; HostKey = $hostKey }
+                        }
+                    } elseif ($probeOutput -match $hostKeyRefusedPattern) {
+                        # A key already saved for this address that no longer matches is refused by OpenSSH
+                        # (accept-new never replaces a changed key). Retrying alone cannot fix that, but the
+                        # operator can: warn once with the exact command, and keep polling so this same run
+                        # completes as soon as the stale entry is gone.
+                        $lastError = "known_hosts already holds a DIFFERENT host key for $address (for example from an earlier VM that had the same address), so SSH refused it. Clear it with: ssh-keygen -R $address -- OpenSSH said: $probeOutput"
+                        if ($staleKeyWarned.Add($address)) {
+                            Write-Warning ("SSH refused the host key at $address for VM ${VMId}: your known_hosts already holds a DIFFERENT key for that address " +
+                                "(for example from an earlier VM that had the same address). To let this run continue, run this in another window: " +
+                                "ssh-keygen -R $address -- this wait keeps retrying until its timeout.")
+                        }
+                    } else {
+                        $lastError = if ([string]::IsNullOrEmpty($probeOutput)) { "ssh exited with code $exitCode" } else { $probeOutput }
                     }
-                    return [string]$address
                 }
-                # A key already saved for this address that no longer matches is refused by OpenSSH
-                # (accept-new never replaces a changed key). Retrying cannot fix that, so stop now.
-                if ($probeOutput -match 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED') {
-                    throw "SSH refused the host key at $address for VM ${VMId}: known_hosts already holds a DIFFERENT key for that address (for example from an earlier VM that used the same address). Clear the old entry with option U, then retry. OpenSSH said: $probeOutput"
-                }
-                $lastError = if ([string]::IsNullOrEmpty($probeOutput)) { "ssh exited with code $exitCode" } else { $probeOutput }
             } finally {
                 if ([IO.File]::Exists($scratchPath)) { [IO.File]::Delete($scratchPath) }
+                if ([IO.File]::Exists($pinPath)) { [IO.File]::Delete($pinPath) }
             }
             Write-Host "Waiting for SSH at $UserName@$address ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $lastError"
         }
@@ -3986,18 +4073,28 @@ function Start-LabLinuxVMProvisioning {
     if ($vhdxSizeGB -lt 64) { throw "-VhdxSizeGB $vhdxSizeGB is below this action's 64 GB minimum." }
     # -SwitchName '' is a meaningful value (Disconnected), so it is read directly, as in the Windows action.
     $switchName = if ($Options.ContainsKey('SwitchName')) { [string]$Options['SwitchName'] } else { 'Default Switch' }
-    if ($switchName -ne '' -and (Get-LabSwitchNames) -notcontains $switchName) {
-        throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to use 'Default Switch', or supply -SwitchName '' to leave the adapter Disconnected."
+    # Unlike the Windows action, Disconnected is refused outright: this action's completion check is an
+    # SSH login over the network, so it could only ever run to its full timeout and then fail.
+    if ($switchName -eq '') {
+        throw "-SwitchName '' (Disconnected) cannot be used to provision a Linux VM: completion is proven by an SSH login over the network (and the installer downloads the SSH server), so a Disconnected adapter can only time out. Omit -SwitchName to use 'Default Switch', or supply another existing switch, e.g. -SwitchName 'Default Switch'. No VM was created."
     }
-    # The Windows action's exact computer-name rule: already a strict subset of valid Linux hostnames.
+    if ((Get-LabSwitchNames) -notcontains $switchName) {
+        throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to use 'Default Switch', or supply another existing switch."
+    }
+    # The Windows action's exact computer-name rule, plus one Linux-only addition below.
     $computerName = [string](& $getOption 'ComputerName' 'lab-agent-test')
     if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
         throw "Computer name '$computerName' is invalid: use 1-15 letters, digits or hyphens, not digits only. Supply -ComputerName."
     }
-    # A POSIX locale name (language[_TERRITORY][.codeset][@modifier]). These values are written into the
-    # autoinstall YAML unquoted, so the format gate also keeps out anything YAML would treat specially.
+    # Linux hostnames (RFC 1123 labels, as systemd enforces them) may not start or end with a hyphen.
+    if ($computerName.StartsWith('-') -or $computerName.EndsWith('-')) {
+        throw "Computer name '$computerName' is invalid for Linux: it must not start or end with a hyphen. Supply -ComputerName."
+    }
+    # A POSIX locale name (language[_TERRITORY][.codeset][@modifier], or the C locale such as C.UTF-8).
+    # These values are written into the autoinstall YAML unquoted, so the format gate also keeps out
+    # anything YAML would treat specially.
     $locale = [string](& $getOption 'Locale' 'en_US.UTF-8')
-    if ($locale -notmatch '^[A-Za-z]{2,3}(_[A-Za-z0-9]{2,8})?(\.[A-Za-z0-9-]+)?(@[A-Za-z0-9]+)?$') {
+    if ($locale -cnotmatch '^(C|[A-Za-z]{2,3}(_[A-Za-z0-9]{2,8})?)(\.[A-Za-z0-9-]+)?(@[A-Za-z0-9]+)?$') {
         throw "Locale '$locale' is not a Linux locale name such as en_US.UTF-8. Supply -Locale."
     }
     # A format gate only, NOT real verification: Windows PowerShell 5.1 has no API that validates an IANA
@@ -4021,7 +4118,7 @@ function Start-LabLinuxVMProvisioning {
         VhdxMaximumGiB = $vhdxSizeGB
         VCpuCount = $hardware.VCpuCount
         DynamicMemoryGiB = '{0} min / {1} startup / {2} max' -f ($hardware.MinimumBytes / 1GB), ($hardware.StartupBytes / 1GB), ($hardware.MaximumBytes / 1GB)
-        Switch = $(if ($switchName -eq '') { 'Disconnected (the install needs internet access to add the SSH server; expect it to fail)' } else { $switchName })
+        Switch = $switchName
         Generation = 2
         CheckpointPolicy = 'Standard; automatic checkpoints disabled'
         LinuxIso = $isoPath
@@ -4151,7 +4248,8 @@ function Start-LabLinuxVMProvisioning {
             $null = Start-LabVM $vmId
             $done.Add('VM started (Ubuntu installer running)')
             Write-Host "Ubuntu is installing unattended. Waiting up to $timeoutSeconds seconds for the first SSH login with the new key..."
-            $firstAddress = Wait-LabSshSession -VMId $vmId -UserName $accountName -TimeoutSeconds $timeoutSeconds
+            $firstLogin = Wait-LabSshSession -VMId $vmId -UserName $accountName -TimeoutSeconds $timeoutSeconds
+            $firstAddress = [string]$firstLogin.Address
             $done.Add("first SSH login succeeded at $firstAddress (Ubuntu installed; host key trusted)")
             $installElapsed = $watch.Elapsed
             # Non-secret summary only: never the password. If another guest on the same switch ever
@@ -4183,7 +4281,15 @@ function Start-LabLinuxVMProvisioning {
             $done.Add('VM restarted without install media')
             Write-Host "Waiting up to $timeoutSeconds seconds for an SSH login after the clean restart..."
             # The address may differ from the first boot's (a new DHCP lease); the one proven here is saved.
-            $finalAddress = Wait-LabSshSession -VMId $vmId -UserName $accountName -TimeoutSeconds $timeoutSeconds
+            # Pinned to the host key the first login verified, so the second boot must present that SAME
+            # key at whatever address it reports: no second trust-on-first-connect window is opened.
+            $pinnedHostKey = [string]$firstLogin.HostKey
+            if ($pinnedHostKey -eq '') {
+                # Only when known_hosts already trusted the first boot's key, so no line was recorded.
+                Write-Warning 'The first SSH login did not record a host key to pin, so the second login uses the same trust rules as the first.'
+            }
+            $finalLogin = Wait-LabSshSession -VMId $vmId -UserName $accountName -TimeoutSeconds $timeoutSeconds -PinnedHostKey $pinnedHostKey
+            $finalAddress = [string]$finalLogin.Address
             $done.Add("second SSH login succeeded at $finalAddress (boots cleanly on its own)")
             Set-LabSshConnectionSettings -VMId $vmId -HostNameOrAddress $finalAddress -Port 22 -UserName $accountName -IdentityFilePath $keyPair.PrivateKeyPath
             $done.Add("SSH connection settings saved ($accountName@${finalAddress}:22, key $($keyPair.PrivateKeyPath))")

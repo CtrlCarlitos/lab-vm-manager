@@ -2404,6 +2404,7 @@ Test-Case 'New-LabEphemeralSshKeyPair writes a stable keypair under SshConnectio
             # Stands in for ssh-keygen.exe: writes a dummy keypair to the -f path it is given, exactly
             # like the real tool would, so the real function's own file-existence checks still pass.
             function ssh-keygen.exe {
+                $script:KeygenArgsSeen = @($args)
                 $fIndex = [array]::IndexOf($args, '-f')
                 $privPath = $args[$fIndex + 1]
                 [IO.File]::WriteAllText($privPath, 'FAKE-PRIVATE-KEY')
@@ -2418,6 +2419,11 @@ Test-Case 'New-LabEphemeralSshKeyPair writes a stable keypair under SshConnectio
             Assert-Equal ($result.PrivateKeyPath -like '*Provisioning*') $false
             Assert-Equal $result.PublicKeyContent 'ssh-ed25519 FAKEPUBLICKEYDATA lab-vm-manager-ephemeral'
             Assert-Equal ([IO.File]::Exists($result.PrivateKeyPath)) $true
+            # A generic comment, never ssh-keygen's default <Windows user>@<host name>.
+            $cIndex = [array]::IndexOf($script:KeygenArgsSeen, '-C')
+            Assert-Equal ($cIndex -ge 0) $true
+            Assert-Equal $script:KeygenArgsSeen[$cIndex + 1] "lab-vm-manager-$id"
+            Assert-Equal @($script:KeygenArgsSeen | Where-Object { $_ -eq '-C' }).Count 1
         }
     } finally {
         $env:LOCALAPPDATA = $savedLocal
@@ -2514,8 +2520,10 @@ Test-Case 'Wait-LabSshSession retries, uses only this VM''s derived key with Ide
         foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
         Assert-FakeCommand 'ssh.exe'
         Assert-FakeCommand 'Get-LabSshUserKnownHostsPath'
-        $address = Wait-LabSshSession $script:FakeId 'labuser' 60 6>$null
-        Assert-Equal $address '192.168.1.77'
+        $login = Wait-LabSshSession $script:FakeId 'labuser' 60 6>$null
+        Assert-Equal $login.Address '192.168.1.77'
+        # The verified key is returned too, so the caller can pin a later login to it.
+        Assert-Equal $login.HostKey 'ssh-ed25519 AAAAFAKEHOSTKEY'
         Assert-Equal ($script:SleepCalls -ge 2) $true
         Assert-Equal $script:ProbeArgsSeen.Count 3
         # One VM-state check per loop iteration (1 no-address + 2 failed + 1 successful iteration).
@@ -2588,7 +2596,7 @@ Test-Case 'Wait-LabSshSession skips candidate addresses that are not IP addresse
         function ssh.exe { Invoke-FakeSshAcceptNew $args; $global:LASTEXITCODE = 0 }
         foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
         Assert-FakeCommand 'ssh.exe'
-        Assert-Equal (Wait-LabSshSession $script:FakeId 'labuser' 60 6>$null) '192.168.1.80'
+        Assert-Equal (Wait-LabSshSession $script:FakeId 'labuser' 60 6>$null).Address '192.168.1.80'
         Assert-Equal $script:ProbeArgsSeen.Count 1
         Assert-Equal ($script:ProbeArgsSeen[0] -contains 'labuser@192.168.1.80') $true
         foreach ($arg in $script:ProbeArgsSeen[0]) { Assert-Equal ($arg -match 'calc|host\.example|evil') $false }
@@ -2639,28 +2647,223 @@ Test-Case 'Wait-LabSshSession fails fast when the VM is no longer Running' {
         Assert-Equal $script:SleepCalls 0
     }
 }
-Test-Case 'Wait-LabSshSession stops at once on a changed host key instead of retrying, pointing at option U' {
+# A fuller stand-in for ssh.exe's host key check, used by the changed-key and pinned-mode tests below.
+# It models OpenSSH's own rules: the host at the target address presents $script:FakeHostKeys[address];
+# every entry for that address across ALL the given known_hosts files (UserKnownHostsFile list plus
+# GlobalKnownHostsFile) is collected; any entry with the presented key means "known"; entries that all
+# differ mean "changed" (refused under both accept-new and yes); no entry at all means "new" (refused
+# under yes; under accept-new, written to the FIRST user file and allowed). Authentication then always
+# succeeds (this VM's own key is accepted), so exit 0 here means "host key check passed".
+function Get-FakeSshOptionValue {
+    param([object[]]$SshArgs, [string]$Name)
+    $option = @($SshArgs | Where-Object { ([string]$_).StartsWith("$Name=") })
+    if ($option.Count -gt 1) { throw "Fake ssh.exe: $Name given more than once." }
+    if ($option.Count -eq 0) { return $null }
+    return ([string]$option[0]).Substring($Name.Length + 1)
+}
+function Invoke-FakeOpenSshHostKeyCheck {
+    param([object[]]$SshArgs)
+    $script:ProbeArgsSeen.Add([string[]]@($SshArgs))
+    $address = ([string]$SshArgs[$SshArgs.Count - 2]).Split('@')[-1]
+    $mode = Get-FakeSshOptionValue $SshArgs 'StrictHostKeyChecking'
+    $userFiles = @(Get-FakeSshKnownHostsFiles $SshArgs)
+    $globalValue = Get-FakeSshOptionValue $SshArgs 'GlobalKnownHostsFile'
+    # Unset GlobalKnownHostsFile = the default system file, which in these tests holds nothing.
+    $globalFiles = @(if ($null -ne $globalValue) { $globalValue -split ' ' | ForEach-Object { Resolve-FakeSshOptionPath $_ } })
+    $presented = $script:FakeHostKeys[$address]
+    $known = @(foreach ($file in @($userFiles + $globalFiles)) {
+            if (-not [IO.File]::Exists($file)) { continue }
+            foreach ($line in [IO.File]::ReadAllLines($file)) {
+                $fields = @($line.Trim() -split ' ')
+                if ($fields.Count -ge 3 -and $fields[0] -eq $address) { "$($fields[1]) $($fields[2])" }
+            }
+        })
+    if ($known -contains $presented) { $global:LASTEXITCODE = 0; return }
+    if ($known.Count -gt 0) {
+        '@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @'
+        "Host key for $address has changed and you have requested strict checking."
+        'Host key verification failed.'
+        $global:LASTEXITCODE = 255; return
+    }
+    if ($mode -eq 'accept-new') {
+        $script:AcceptNewWrites++
+        [IO.File]::AppendAllText($userFiles[0], "$address $presented`n")
+        $global:LASTEXITCODE = 0; return
+    }
+    "No ED25519 host key is known for $address and you have requested strict checking."
+    'Host key verification failed.'
+    $global:LASTEXITCODE = 255
+}
+function Invoke-WithFakeOpenSshEnvironment {
+    # Invoke-WithFakeSshWaitEnvironment plus the state every test of the OpenSSH-semantics fake shares.
+    # (Not named $Body: the inner block runs inside Invoke-WithFakeSshWaitEnvironment, whose own $Body
+    # would shadow it.)
+    param([scriptblock]$OpenSshBody)
     Invoke-WithFakeSshWaitEnvironment {
-        $before = '192.168.1.77 ssh-ed25519 AAAASTALEKEY' + "`n"
-        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        $script:FakeHostKeys = @{}
+        $script:AcceptNewWrites = 0
+        & $OpenSshBody
+    }
+}
+function Split-FakeWarningOutput {
+    param([object[]]$Output)
+    return [pscustomobject]@{
+        Warnings = @($Output | Where-Object { $_ -is [Management.Automation.WarningRecord] } | ForEach-Object { $_.Message })
+        Results = @($Output | Where-Object { $_ -isnot [Management.Automation.WarningRecord] })
+    }
+}
+
+Test-Case 'Wait-LabSshSession: a stale known_hosts key warns with the literal ssh-keygen -R command and keeps polling, so the SAME run recovers once it is cleared' {
+    Invoke-WithFakeOpenSshEnvironment {
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, "192.168.1.77 ssh-ed25519 AAAASTALEKEY`n")
+        $script:FakeHostKeys['192.168.1.77'] = 'ssh-ed25519 AAAANEWVMKEY'
+        $script:ProbeCallIndex = 0
         function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
         function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
         function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
         function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.77') }
         function ssh.exe {
-            $script:ProbeArgsSeen.Add([string[]]@($args))
-            '@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@'
-            '@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @'
-            'Host key for 192.168.1.77 has changed and you have requested strict checking.'
-            'Host key verification failed.'
-            $global:LASTEXITCODE = 255
+            $script:ProbeCallIndex++
+            Invoke-FakeOpenSshHostKeyCheck $args
+            # The operator runs 'ssh-keygen -R 192.168.1.77' from another window after the 2nd refusal.
+            if ($script:ProbeCallIndex -eq 2) { [IO.File]::WriteAllText($script:FakeRealKnownHosts, '') }
         }
         foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
         Assert-FakeCommand 'ssh.exe'
-        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 600 6>$null } 'DIFFERENT key.*option U'
-        Assert-Equal $script:ProbeArgsSeen.Count 1
-        Assert-Equal $script:SleepCalls 0
+        $split = Split-FakeWarningOutput @(Wait-LabSshSession $script:FakeId 'labuser' 600 3>&1 6>$null)
+        Assert-Equal $split.Results.Count 1
+        Assert-Equal $split.Results[0].Address '192.168.1.77'
+        Assert-Equal $split.Results[0].HostKey 'ssh-ed25519 AAAANEWVMKEY'
+        Assert-Equal $script:ProbeArgsSeen.Count 3
+        Assert-Equal ($script:SleepCalls -ge 2) $true
+        # One warning for the address, however many refused attempts, naming the runnable command.
+        Assert-Equal $split.Warnings.Count 1
+        if (-not $split.Warnings[0].Contains('ssh-keygen -R 192.168.1.77')) { throw "Warning lacks the command: $($split.Warnings[0])" }
+        if ($split.Warnings[0] -match 'option U') { throw "Warning still points at option U: $($split.Warnings[0])" }
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) "192.168.1.77 ssh-ed25519 AAAANEWVMKEY`n"
+    }
+}
+Test-Case 'Wait-LabSshSession: a stale key that is never cleared times out with the ssh-keygen -R command in the error' {
+    Invoke-WithFakeOpenSshEnvironment {
+        $before = "192.168.1.77 ssh-ed25519 AAAASTALEKEY`n"
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        $script:FakeHostKeys['192.168.1.77'] = 'ssh-ed25519 AAAANEWVMKEY'
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('192.168.1.77') }
+        function ssh.exe { Invoke-FakeOpenSshHostKeyCheck $args }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 1 3>$null 6>$null } 'Timed out.*DIFFERENT host key for 192\.168\.1\.77.*ssh-keygen -R 192\.168\.1\.77'
+        Assert-Equal ($script:ProbeArgsSeen.Count -ge 2) $true
         Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) $before
+    }
+}
+Test-Case 'Wait-LabSshSession pinned, SAME address: the strict pin check and the existing trust both pass; nothing new is trusted or written' {
+    Invoke-WithFakeOpenSshEnvironment {
+        $before = "172.20.0.11 ssh-ed25519 AAAAVMKEYA`n"
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        $script:FakeHostKeys['172.20.0.11'] = 'ssh-ed25519 AAAAVMKEYA'
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('172.20.0.11') }
+        function ssh.exe { Invoke-FakeOpenSshHostKeyCheck $args }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        $login = Wait-LabSshSession $script:FakeId 'labuser' 60 -PinnedHostKey 'ssh-ed25519 AAAAVMKEYA' 6>$null
+        Assert-Equal $login.Address '172.20.0.11'
+        Assert-Equal $login.HostKey 'ssh-ed25519 AAAAVMKEYA'
+        Assert-Equal $script:AcceptNewWrites 0
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) $before
+        Assert-Equal $script:ProbeArgsSeen.Count 2
+        # Probe 1 is the pin check: strict, and its only known_hosts files are the pin file.
+        $pinCheck = $script:ProbeArgsSeen[0]
+        Assert-Equal ($pinCheck -contains 'StrictHostKeyChecking=yes') $true
+        Assert-Equal ($pinCheck -contains 'StrictHostKeyChecking=accept-new') $false
+        $pinFiles = @(Get-FakeSshKnownHostsFiles $pinCheck)
+        Assert-Equal $pinFiles.Count 1
+        Assert-Equal ($pinFiles[0] -ne $script:FakeRealKnownHosts) $true
+        Assert-Equal (Resolve-FakeSshOptionPath (Get-FakeSshOptionValue $pinCheck 'GlobalKnownHostsFile')) $pinFiles[0]
+        Assert-Equal ([IO.File]::Exists($pinFiles[0])) $false
+        Assert-Equal ($pinCheck -contains 'IdentitiesOnly=yes') $true
+        $i = [array]::IndexOf($pinCheck, '-i'); Assert-Equal $pinCheck[$i + 1] $script:FakeKeyPath
+    }
+}
+Test-Case 'Wait-LabSshSession pinned, DIFFERENT address, SAME key: passes via the pin and commits that same key for the new address' {
+    Invoke-WithFakeOpenSshEnvironment {
+        $before = "172.20.0.11 ssh-ed25519 AAAAVMKEYA`n"
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        $script:FakeHostKeys['172.20.0.12'] = 'ssh-ed25519 AAAAVMKEYA'
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('172.20.0.12') }
+        function ssh.exe { Invoke-FakeOpenSshHostKeyCheck $args }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        $login = Wait-LabSshSession $script:FakeId 'labuser' 60 -PinnedHostKey 'ssh-ed25519 AAAAVMKEYA' 6>$null
+        Assert-Equal $login.Address '172.20.0.12'
+        Assert-Equal $login.HostKey 'ssh-ed25519 AAAAVMKEYA'
+        Assert-Equal ($script:ProbeArgsSeen[0] -contains 'StrictHostKeyChecking=yes') $true
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) ($before + "172.20.0.12 ssh-ed25519 AAAAVMKEYA`n")
+    }
+}
+Test-Case 'Wait-LabSshSession pinned, DIFFERENT address, DIFFERENT key: refused on every attempt, never trusted, never recorded' {
+    Invoke-WithFakeOpenSshEnvironment {
+        $before = "172.20.0.11 ssh-ed25519 AAAAVMKEYA`n"
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        $script:FakeHostKeys['172.20.0.12'] = 'ssh-ed25519 AAAAIMPOSTORKEY'
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('172.20.0.12') }
+        function ssh.exe { Invoke-FakeOpenSshHostKeyCheck $args }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 1 -PinnedHostKey 'ssh-ed25519 AAAAVMKEYA' 6>$null } 'Timed out.*did not present the host key this VM proved at its first SSH login'
+        Assert-Equal ($script:ProbeArgsSeen.Count -ge 1) $true
+        # Only pin checks ever ran: the accept-new probe was never reached for the impostor's key.
+        foreach ($seen in $script:ProbeArgsSeen) {
+            Assert-Equal ($seen -contains 'StrictHostKeyChecking=yes') $true
+            Assert-Equal ($seen -contains 'StrictHostKeyChecking=accept-new') $false
+        }
+        Assert-Equal $script:AcceptNewWrites 0
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) $before
+    }
+}
+Test-Case 'Wait-LabSshSession pinned: a stale DIFFERENT key already in known_hosts for the new address is not trusted alongside the pin' {
+    Invoke-WithFakeOpenSshEnvironment {
+        # The new address's stale entry must keep blocking the commit (ssh-keygen -R guidance), so the
+        # real file never ends up trusting BOTH the stale key and the VM's key for that address.
+        $before = "172.20.0.11 ssh-ed25519 AAAAVMKEYA`n172.20.0.12 ssh-ed25519 AAAASTALEKEY`n"
+        [IO.File]::WriteAllText($script:FakeRealKnownHosts, $before)
+        $script:FakeHostKeys['172.20.0.12'] = 'ssh-ed25519 AAAAVMKEYA'
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('172.20.0.12') }
+        function ssh.exe { Invoke-FakeOpenSshHostKeyCheck $args }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 1 -PinnedHostKey 'ssh-ed25519 AAAAVMKEYA' 3>$null 6>$null } 'Timed out.*ssh-keygen -R 172\.20\.0\.12'
+        Assert-Equal ([IO.File]::ReadAllText($script:FakeRealKnownHosts)) $before
+    }
+}
+Test-Case 'Wait-LabSshSession refuses a malformed -PinnedHostKey before any probe' {
+    Invoke-WithFakeOpenSshEnvironment {
+        function Get-LabSshToolingInfo { [pscustomobject]@{ Available = $true } }
+        function Get-LabSshUserKnownHostsPath { $script:FakeRealKnownHosts }
+        function Assert-LabVMRunning { param([guid]$VMId) $script:RunningChecks++ }
+        function Get-LabGuestAddressCandidates { param([guid]$VMId) return @('172.20.0.12') }
+        function ssh.exe { Invoke-FakeOpenSshHostKeyCheck $args }
+        foreach ($sb in (Import-LabRealFunction 'Wait-LabSshSession', 'ConvertTo-LabSshOptionPath')) { . $sb }
+        Assert-FakeCommand 'ssh.exe'
+        foreach ($bad in @('ssh-ed25519', "ssh-ed25519 AAAAKEY`n* ssh-ed25519 AAAAOTHER", '@cert-authority * ssh-ed25519 AAAA', 'ssh-ed25519 AAAAKEY comment')) {
+            Assert-Throws { Wait-LabSshSession $script:FakeId 'labuser' 60 -PinnedHostKey $bad 6>$null } 'Invalid pinned host key'
+        }
+        Assert-Equal $script:ProbeArgsSeen.Count 0
     }
 }
 Test-Case 'Wait-LabSshSession refuses to start without this VM''s own ephemeral key file' {
@@ -4545,6 +4748,19 @@ Test-Case 'Get-LabLinuxIsoInfo: an Ubuntu 24.04 Desktop release is out of scope'
     Assert-Equal $info.ReleaseText 'Ubuntu 24.04.1 LTS "Example" - Release amd64'
     Assert-Equal $info.IsUbuntuDesktopInScope $false
 }
+Test-Case 'Get-LabLinuxIsoInfo: Kubuntu, Xubuntu and Lubuntu 26.04 releases are out of scope (anchored, case-sensitive match)' {
+    foreach ($text in @('Kubuntu 26.04.1 LTS "Example" - Release amd64', 'Xubuntu 26.04 LTS "Example" - Release amd64',
+            'Lubuntu 26.04.1 LTS "Example" - Release amd64', 'ubuntu 26.04.1 LTS "Example" - Release amd64')) {
+        Reset-LabLinuxIsoFakes
+        $script:FakeLinuxInfoText = $text
+        $info = Get-LabLinuxIsoInfo 'C:\iso\flavor.iso'
+        Assert-Equal $info.ReleaseText $text
+        Assert-Equal $info.IsUbuntuDesktopInScope $false
+    }
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoText = 'Ubuntu 26.04 LTS "Example" - Release amd64'
+    Assert-Equal (Get-LabLinuxIsoInfo 'C:\iso\ubuntu.iso').IsUbuntuDesktopInScope $true
+}
 Test-Case 'Get-LabLinuxIsoInfo: a mounted ISO with no .disk/info returns empty ReleaseText and no error' {
     Reset-LabLinuxIsoFakes
     $script:FakeLinuxInfoExists = $false
@@ -4845,6 +5061,27 @@ Test-Case 'New-LabPatchedBootableLinuxIso: happy path inserts autoinstall and up
         Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
     }
 }
+Test-Case 'New-LabPatchedBootableLinuxIso: a mid-line --- (casper''s marker) gets autoinstall inserted BEFORE it, not appended after it' {
+    $script:CopyCalls = 0; $script:CopyMode = 'Normal'
+    $grubCfgContent = "menuentry 'Try or Install Ubuntu' {`n`tlinux`t/casper/vmlinuz --- quiet splash`n`tinitrd`t/casper/initrd`n}`n"
+    $expectedContent = "menuentry 'Try or Install Ubuntu' {`n`tlinux`t/casper/vmlinuz autoinstall --- quiet splash`n`tinitrd`t/casper/initrd`n}`n"
+    $isoPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-src-' + [guid]::NewGuid().ToString('N') + '.iso')
+    $outputPath = Join-Path ([IO.Path]::GetTempPath()) ('lablinuxiso-out-' + [guid]::NewGuid().ToString('N') + '.iso')
+    try {
+        New-LabFakeLinuxIso9660 -Path $isoPath -GrubCfgContent $grubCfgContent
+        $result = New-LabPatchedBootableLinuxIso $isoPath $outputPath
+        Assert-Equal $result.Patched $true
+        $afterPrimary = Get-LabFakeLinuxGrubCfgInfo -Path $outputPath -Joliet $false
+        $afterJoliet = Get-LabFakeLinuxGrubCfgInfo -Path $outputPath -Joliet $true
+        Assert-Equal $afterPrimary.Content $expectedContent
+        Assert-Equal $afterJoliet.Content $expectedContent
+        $kernelLine = @($afterPrimary.Content -split "`n" | Where-Object { $_ -match '/casper/vmlinuz' })[0]
+        Assert-Equal ($kernelLine.IndexOf('autoinstall') -lt $kernelLine.IndexOf('---')) $true
+    } finally {
+        Remove-Item -LiteralPath $isoPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+    }
+}
 Test-Case 'New-LabPatchedBootableLinuxIso: insufficient slack space refuses, no output file created' {
     $script:CopyCalls = 0; $script:CopyMode = 'Normal'
     $kernelLine = "`tlinux`t/casper/vmlinuz quiet splash ---`n"
@@ -4995,14 +5232,14 @@ Test-Case 'New-LabLinuxAutoinstallUserData: identity.password is a $6$ hash shap
         if ($line.Contains($plainPassword)) { throw "Plaintext password leaked outside late-commands: $line" }
     }
 }
-Test-Case 'New-LabLinuxAutoinstallUserData: a password containing a single quote, double quote, backslash and dollar sign reaches chpasswd unchanged (Review Focus #4)' {
-    # P@ss'"\$word -- built as a single-quoted PowerShell literal so none of ' " \ $ are PowerShell-special here.
-    $plainPassword = 'P@ss''"\$word'
-    $userName = 'labagent'
-    $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
-    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' $userName $securePassword 'ssh-ed25519 AAAAexampleKey labagent'
-
-    $curtinLine = @(($result -split "`r?`n") | Where-Object { $_ -match 'curtin' })
+function Get-LabRecoveredChpasswdInput {
+    # Reverses every syntax layer between New-LabLinuxAutoinstallUserData's output and the bytes chpasswd
+    # reads on stdin, returning that "user:password" text. Layers: YAML double-quoted scalar, then the
+    # POSIX shell single-quoted argument, then the command that prints it. That last layer is required
+    # to be exactly printf '%s\n' <arg>, which prints <arg> verbatim (unlike dash's echo, which would
+    # rewrite backslash escapes), so recovering <arg> is recovering chpasswd's input.
+    param([string]$UserData)
+    $curtinLine = @(($UserData -split "`r?`n") | Where-Object { $_ -match 'curtin' })
     if ($curtinLine.Count -ne 1) { throw "Expected exactly one late-commands curtin line, found $($curtinLine.Count)." }
     $curtinLine = $curtinLine[0]
 
@@ -5017,16 +5254,27 @@ Test-Case 'New-LabLinuxAutoinstallUserData: a password containing a single quote
     $shellCommand = $yamlScalar | ConvertFrom-Json
 
     # Layer 2 reversal: simulate what a POSIX shell does with a '...'-quoted argument -- strip the
-    # surrounding 'echo '/' | chpasswd', then mechanically undo the single-quote escape (close-quote,
-    # escaped literal quote, reopen-quote -- '\'' -- becomes one literal ').
-    $prefix = 'echo '
+    # surrounding "printf '%s\n' "/' | chpasswd', then mechanically undo the single-quote escape
+    # (close-quote, escaped literal quote, reopen-quote -- '\'' -- becomes one literal '). Inside
+    # single quotes a POSIX shell treats every other character, backslash included, literally.
+    $prefix = "printf '%s\n' "
     $suffix = ' | chpasswd'
-    if (-not $shellCommand.StartsWith($prefix)) { throw "Unexpected shell command prefix: $shellCommand" }
+    if (-not $shellCommand.StartsWith($prefix)) { throw "Unexpected shell command prefix (must be printf '%s\n', never echo): $shellCommand" }
     if (-not $shellCommand.EndsWith($suffix)) { throw "Unexpected shell command suffix: $shellCommand" }
     $quotedLiteral = $shellCommand.Substring($prefix.Length, $shellCommand.Length - $prefix.Length - $suffix.Length)
     if (-not ($quotedLiteral.StartsWith("'") -and $quotedLiteral.EndsWith("'"))) { throw "Not a single-quoted literal: $quotedLiteral" }
     $inner = $quotedLiteral.Substring(1, $quotedLiteral.Length - 2)
-    $unescaped = $inner.Replace("'\''", "'")
+    # Every ' inside must be part of a '\'' sequence; anything else would end the quoting early.
+    if ($inner.Replace("'\''", '').Contains("'")) { throw "Unescaped single quote inside the quoted literal: $quotedLiteral" }
+    return $inner.Replace("'\''", "'")
+}
+Test-Case 'New-LabLinuxAutoinstallUserData: a password containing a single quote, double quote, backslash and dollar sign reaches chpasswd unchanged (Review Focus #4)' {
+    # P@ss'"\$word -- built as a single-quoted PowerShell literal so none of ' " \ $ are PowerShell-special here.
+    $plainPassword = 'P@ss''"\$word'
+    $userName = 'labagent'
+    $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' $userName $securePassword 'ssh-ed25519 AAAAexampleKey labagent'
+    $unescaped = Get-LabRecoveredChpasswdInput $result
 
     $colonIndex = $unescaped.IndexOf(':')
     if ($colonIndex -lt 0) { throw "No ':' separator found in recovered 'user:password': $unescaped" }
@@ -5035,6 +5283,18 @@ Test-Case 'New-LabLinuxAutoinstallUserData: a password containing a single quote
 
     Assert-Equal $recoveredUserName $userName
     Assert-Equal $recoveredPassword $plainPassword
+}
+Test-Case 'New-LabLinuxAutoinstallUserData: a password with backslash escape sequences (\\, \c, \t, \n, \0) reaches chpasswd exactly, via printf, never echo' {
+    # dash's builtin echo would turn \\ into \, \t into a tab and stop printing at \c; printf '%s\n'
+    # passes all of them through. Single-quoted PowerShell literal: every backslash below is literal.
+    $plainPassword = 'P@ss''"\$wo\\rd\cTail\t\n\0end\'
+    $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+    $result = New-LabLinuxAutoinstallUserData 'lab-agent-test' 'en_US.UTF-8' 'America/Belize' 'labagent' $securePassword 'ssh-ed25519 AAAAexampleKey labagent'
+    $recovered = Get-LabRecoveredChpasswdInput $result
+    Assert-Equal $recovered "labagent:$plainPassword"
+    Assert-Equal ($recovered.Contains('\\rd\cTail\t\n\0end\')) $true
+    $curtinLine = @(($result -split "`r?`n") | Where-Object { $_ -match 'curtin' })[0]
+    Assert-Equal ($curtinLine -match '\becho\b') $false
 }
 
 # --- Two-drive unattended-install media attach and post-install cleanup, Linux (Task 4) ---
@@ -5206,8 +5466,11 @@ function Invoke-LabLinuxProvisioningScenario {
         [bool]$InScope = $true,
         [string]$ThrowIn = '',
         [int]$ThrowOnWaitNumber = 0,
-        [bool]$Patched = $true
+        [bool]$Patched = $true,
+        [AllowNull()][string]$FirstHostKey = 'ssh-ed25519 AAAAFIRSTBOOTHOSTKEY'
     )
+    $script:LProvFirstHostKey = $FirstHostKey
+    $script:LProvWarnings = @()
     $script:LProvCalls = [Collections.Generic.List[string]]::new()
     $script:LProvArgs = @{}
     $script:LProvAudit = [Collections.Generic.List[string]]::new()
@@ -5286,13 +5549,14 @@ function Invoke-LabLinuxProvisioningScenario {
         }
         function Start-LabVM { param([guid]$VMId) Record 'Start-LabVM'; return 'COMPLETED' }
         function Wait-LabSshSession {
-            param([guid]$VMId, [string]$UserName, [int]$TimeoutSeconds)
+            param([guid]$VMId, [string]$UserName, [int]$TimeoutSeconds, [string]$PinnedHostKey = '')
             $script:LProvWaitCount++
             Record 'Wait-LabSshSession'
             $script:LProvArgs["Wait-LabSshSession:$($script:LProvWaitCount)"] = $PSBoundParameters
             if ($script:LProvThrowOnWait -eq $script:LProvWaitCount) { throw "simulated Wait-LabSshSession #$($script:LProvWaitCount) failure" }
             # A different address each time: the clean second boot may get a new DHCP lease.
-            return "172.20.0.$(10 + $script:LProvWaitCount)"
+            $hostKey = if ($PinnedHostKey -ne '') { $PinnedHostKey } else { $script:LProvFirstHostKey }
+            return [pscustomobject]@{ Address = "172.20.0.$(10 + $script:LProvWaitCount)"; HostKey = $hostKey }
         }
         function Write-LabLinuxProvisioningNote {
             param([string]$HostNameOrAddress, [string]$UserName, [string]$IdentityFilePath, [string]$Content)
@@ -5321,9 +5585,14 @@ function Invoke-LabLinuxProvisioningScenario {
             $script:LProvArgs['Set-LabSshConnectionSettings'] = $PSBoundParameters
         }
         foreach ($sb in (Import-LabRealFunction 'Start-LabLinuxVMProvisioning', 'ConvertTo-LabLinuxAccountName', 'Get-LabProvisioningVMHardware')) { . $sb }
-        try { $result.Status = Start-LabLinuxVMProvisioning $Options 6>$null 3>$null }
+        try {
+            $output = @(Start-LabLinuxVMProvisioning $Options 6>$null 3>&1)
+            $script:LProvWarnings = @($output | Where-Object { $_ -is [Management.Automation.WarningRecord] } | ForEach-Object { $_.Message })
+            $result.Status = @($output | Where-Object { $_ -isnot [Management.Automation.WarningRecord] }) | Select-Object -Last 1
+        }
         catch { $result.Error = $_.Exception.Message }
     }
+    $result | Add-Member -NotePropertyName Warnings -NotePropertyValue @($script:LProvWarnings)
     $result.Calls = @($script:LProvCalls)
     $result.Args = $script:LProvArgs
     $result.Audit = @($script:LProvAudit)
@@ -5480,6 +5749,53 @@ Test-Case 'Provision Linux: an invalid -ComputerName, -LinuxTimeZone or -Locale 
     if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
     Assert-Equal $r.Args['New-LabLinuxAutoinstallUserData'].TimeZone 'America/Argentina/Buenos_Aires'
     Assert-Equal $r.Args['New-LabLinuxAutoinstallUserData'].Locale 'es_GT.UTF-8'
+}
+Test-Case 'Provision Linux: the second SSH wait is pinned to the host key the first wait verified; the first is not pinned' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' }
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Args['Wait-LabSshSession:1'].ContainsKey('PinnedHostKey') $false
+    Assert-Equal $r.Args['Wait-LabSshSession:2'].PinnedHostKey 'ssh-ed25519 AAAAFIRSTBOOTHOSTKEY'
+    Assert-Equal $r.Args['Set-LabSshConnectionSettings'].HostNameOrAddress '172.20.0.12'
+    Assert-Equal $r.Warnings.Count 1   # the workspace warning in the preview only
+}
+Test-Case 'Provision Linux: when the first wait recorded no host key, the second wait runs unpinned with a warning' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu' } -FirstHostKey ''
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Args['Wait-LabSshSession:2'].PinnedHostKey ''
+    if (@($r.Warnings | Where-Object { $_ -match 'did not record a host key to pin' }).Count -ne 1) { throw "Missing the unpinned warning: $($r.Warnings -join ' | ')" }
+}
+Test-Case 'Provision Linux: -SwitchName '''' (Disconnected) is refused clearly before any VM is created' {
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; SwitchName = '' }
+    Assert-Equal $r.Status $null
+    if ($r.Error -notmatch 'Disconnected' -or $r.Error -notmatch 'SSH' -or $r.Error -notmatch "-SwitchName 'Default Switch'" -or $r.Error -notmatch 'No VM was created') {
+        throw "Unclear refusal: $($r.Error)"
+    }
+    Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    Assert-Equal ($r.Calls -contains 'Read-LabYesNoCancel') $false
+    Assert-Equal $r.Audit.Count 0
+}
+Test-Case 'Provision Linux: a computer name with a leading or trailing hyphen is refused before any VM is created (Linux-only rule)' {
+    foreach ($bad in @('-lab', 'lab-', '-')) {
+        $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; ComputerName = $bad }
+        Assert-Equal $r.Status $null
+        if ($r.Error -notmatch 'hyphen' -or -not $r.Error.Contains("'$bad'")) { throw "Unclear refusal for '$bad': $($r.Error)" }
+        Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    }
+    $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; ComputerName = 'lab-agent-2' }
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Args['New-LabLinuxAutoinstallUserData'].ComputerName 'lab-agent-2'
+}
+Test-Case 'Provision Linux: -Locale accepts the C locale (C.UTF-8, C) and still refuses malformed values' {
+    foreach ($good in @('C.UTF-8', 'C', 'en_US.UTF-8', 'sr_RS@latin')) {
+        $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; Locale = $good }
+        if ($null -ne $r.Error) { throw "Unexpected failure for '$good': $($r.Error)" }
+        Assert-Equal $r.Args['New-LabLinuxAutoinstallUserData'].Locale $good
+    }
+    foreach ($bad in @('c.UTF-8', 'C_US.UTF-8', 'C.UTF-8: x', 'X.UTF-8')) {
+        $r = Invoke-LabLinuxProvisioningScenario @{ NewVMName = 'LAB-Ubuntu'; Locale = $bad }
+        if ($r.Error -notmatch 'Locale') { throw "'$bad' was not refused: $($r.Error)" }
+        Assert-Equal ($r.Calls -contains 'New-LabVMCore') $false
+    }
 }
 Test-Case 'Provision Linux: a supplied credential with a non-Linux username or empty password is refused before any ISO is read' {
     $bad = [pscredential]::new('Dev', (ConvertTo-SecureString 'x' -AsPlainText -Force))

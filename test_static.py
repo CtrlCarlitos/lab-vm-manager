@@ -871,10 +871,21 @@ class SourceContract(unittest.TestCase):
     def test_ssh_wait_functions_exist(self):
         for name in ['Wait-LabSshSession', 'Write-LabLinuxProvisioningNote']:
             self.assertIn('function ' + name + ' {', self.s)
-    def test_ssh_wait_uses_accept_new_not_yes(self):
-        body = self.s.split('function Wait-LabSshSession {', 1)[1].split('\nfunction ', 1)[0]
-        self.assertIn('accept-new', body)
-        self.assertNotIn('StrictHostKeyChecking=yes', body)
+    def test_ssh_wait_uses_accept_new_and_strict_only_for_the_pin_check(self):
+        code = self._code(self._body('Wait-LabSshSession'))
+        self.assertEqual(code.count("'StrictHostKeyChecking=accept-new'"), 1)
+        # StrictHostKeyChecking=yes appears once: the pinned-mode pin check, whose only known_hosts files
+        # (user AND global) are the pin file -- never the operator's real known_hosts.
+        self.assertEqual(code.count("'StrictHostKeyChecking=yes'"), 1)
+        pin_block = code.split("if ($PinnedHostKey -ne '') {", 1)[1].split('if ($pinPassed) {', 1)[0]
+        self.assertIn("'StrictHostKeyChecking=yes'", pin_block)
+        self.assertIn('"UserKnownHostsFile=$pinOption"', pin_block)
+        self.assertIn('"GlobalKnownHostsFile=$pinOption"', pin_block)
+        self.assertNotIn('$knownHostsOption', pin_block)
+        self.assertNotIn('AppendAllText', pin_block)
+    def test_ssh_wait_pinned_commit_requires_the_pinned_key(self):
+        code = self._code(self._body('Wait-LabSshSession'))
+        self.assertLess(code.index('$verifiedKey -cne $PinnedHostKey'), code.index('AppendAllText($knownHostsPath'))
     def test_ssh_wait_has_bounded_timeout(self):
         body = self.s.split('function Wait-LabSshSession {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('Stopwatch', body)
@@ -884,7 +895,7 @@ class SourceContract(unittest.TestCase):
         # The identity file is never a caller parameter: it is this VM's own ephemeral key path.
         body = self.s.split('function Wait-LabSshSession {', 1)[1].split('\nfunction ', 1)[0]
         params = re.search(r'param\(([^)]*)\)', body).group(1)
-        self.assertEqual(params, '[guid]$VMId, [string]$UserName, [int]$TimeoutSeconds')
+        self.assertEqual(params, "[guid]$VMId, [string]$UserName, [int]$TimeoutSeconds, [string]$PinnedHostKey = ''")
         self.assertIn('Join-Path $env:LOCALAPPDATA "LabVmManager\\SshConnections\\$VMId.key"', body)
         self.assertIn("'-i', $identityFilePath", body)
         self.assertIn("'IdentitiesOnly=yes'", body)
@@ -906,10 +917,16 @@ class SourceContract(unittest.TestCase):
         self.assertIn('[Net.IPAddress]::TryParse(', code)
         loop = code.split('while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {', 1)[1]
         self.assertTrue(loop.lstrip().startswith('$null = Assert-LabVMRunning $VMId'))
-    def test_ssh_wait_fails_fast_on_changed_host_key(self):
+    def test_ssh_wait_changed_host_key_names_the_runnable_command_and_keeps_polling(self):
+        # Option U cannot work mid-provisioning (no SSH settings are saved yet), so the guidance is the
+        # literal command, and the wait keeps polling instead of throwing.
         code = self._code(self._body('Wait-LabSshSession'))
         self.assertIn("'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'", code)
-        self.assertIn('option U', code)
+        self.assertIn('ssh-keygen -R $address', code)
+        self.assertNotIn('option U', code)
+        branch = code.split('} elseif ($probeOutput -match $hostKeyRefusedPattern) {', 1)[1].split('} else {', 1)[0]
+        self.assertNotIn('throw', branch)
+        self.assertIn('Write-Warning', branch)
     def test_linux_note_batch_uses_forward_slashes_and_home_relative_desktop(self):
         code = self._code(self._body('Write-LabLinuxProvisioningNote'))
         self.assertIn("$localPath.Replace('\\', '/')", code)
@@ -1089,6 +1106,26 @@ class SourceContract(unittest.TestCase):
     def test_linux_user_data_has_cloud_config_header(self):
         body = self.s.split('function New-LabLinuxAutoinstallUserData {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('#cloud-config\nautoinstall:', body)
+
+    # --- Final-review fix wave ---
+    def test_linux_user_data_uses_printf_not_echo(self):
+        # dash's builtin echo interprets backslash escapes; printf '%s\n' prints its argument verbatim.
+        code = self._code(self._body('New-LabLinuxAutoinstallUserData'))
+        self.assertIn("\"printf '%s\\n' \" + (ConvertTo-LabPosixShellSingleQuoted", code)
+        self.assertNotIn("'echo '", code)
+    def test_ephemeral_ssh_key_has_generic_comment(self):
+        code = self._code(self._body('New-LabEphemeralSshKeyPair'))
+        self.assertIn('-C "lab-vm-manager-$VMId"', code)
+    def test_linux_iso_scope_is_anchored_and_case_sensitive(self):
+        code = self._code(self._body('Get-LabLinuxIsoInfo'))
+        self.assertIn("-cmatch '^Ubuntu 26\\.04(\\.\\d+)? LTS'", code)
+    def test_linux_provisioning_refuses_disconnected_before_vm_creation(self):
+        body = self._linux_orchestrator_body()
+        self.assertLess(body.index("if ($switchName -eq '') {"), body.index('New-LabVMCore -Name'))
+    def test_linux_provisioning_pins_second_login_to_first_host_key(self):
+        body = self._linux_orchestrator_body()
+        self.assertIn('-PinnedHostKey $pinnedHostKey', body)
+        self.assertEqual(body.count('-PinnedHostKey'), 1)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
