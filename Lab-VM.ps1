@@ -1726,7 +1726,7 @@ function Get-LabWindowsInstallImages {
         # mounted, and an unconditional Dismount-DiskImage here would itself throw a confusing
         # "not currently mounted"-style error, masking the real Mount-DiskImage failure above.
         if ($mounted) {
-            Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop
+            [void](Dismount-DiskImage -ImagePath $IsoPath -ErrorAction Stop)
         }
     }
 }
@@ -1832,7 +1832,7 @@ function New-LabPatchedBootableIso {
         # mounted, and an unconditional Dismount-DiskImage here would itself throw a confusing
         # "not currently mounted"-style error, masking the real Mount-DiskImage failure above.
         if ($mounted) {
-            Dismount-DiskImage -ImagePath $SourceIsoPath -ErrorAction Stop
+            [void](Dismount-DiskImage -ImagePath $SourceIsoPath -ErrorAction Stop)
         }
     }
     if ($null -ne $earlyReason) {
