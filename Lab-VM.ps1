@@ -105,11 +105,13 @@
 .PARAMETER WindowsIsoPath
     Windows 11 installer ISO for -ProvisionWindowsVM. When omitted, pick one from -IsoRoot interactively.
 .PARAMETER ComputerName
-    Guest computer name (1-15 letters, digits or hyphens). Default: derived from -NewVMName.
+    Guest computer name (1-15 letters, digits or hyphens). Default: 'lab-agent-test', independent of
+    -NewVMName.
 .PARAMETER Locale
     Guest input/system/UI/user locale, e.g. en-US (default en-US). Must be a language the ISO contains.
 .PARAMETER TimeZone
-    Guest Windows time zone ID, e.g. 'Pacific Standard Time' (see tzutil /l). Default: this host's.
+    Guest Windows time zone ID, e.g. 'Pacific Standard Time' (see tzutil /l). Default: 'Central
+    America Standard Time'.
 .PARAMETER OsEdition
     Windows 11 edition on the ISO, by full image name ('Windows 11 Pro') or short name ('Pro').
     Default: a picker preselecting Pro; with -NonInteractive, Pro (or the ISO's only edition).
@@ -182,9 +184,9 @@ param(
     [switch]$ProvisionWindowsVM,
     [string]$NewVMName,
     [string]$WindowsIsoPath,
-    [string]$ComputerName,
+    [string]$ComputerName = 'lab-agent-test',
     [string]$Locale,
-    [string]$TimeZone,
+    [string]$TimeZone = 'Central America Standard Time',
     [string]$OsEdition,
     [ValidateRange(64, 65536)]
     [int]$VhdxSizeGB = 150,
@@ -2766,15 +2768,13 @@ function Start-LabWindowsVMProvisioning {
     if ($switchName -ne '' -and (Get-LabSwitchNames) -notcontains $switchName) {
         throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to leave the adapter Disconnected."
     }
-    $defaultComputerName = ($name -replace '[^A-Za-z0-9-]', '')
-    $defaultComputerName = $defaultComputerName.Substring(0, [math]::Min(15, $defaultComputerName.Length)).Trim('-')
-    $computerName = [string](& $getOption 'ComputerName' $defaultComputerName)
+    $computerName = [string](& $getOption 'ComputerName' 'lab-agent-test')
     if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
         throw "Computer name '$computerName' is invalid: use 1-15 letters, digits or hyphens, not digits only. Supply -ComputerName."
     }
     $locale = [string](& $getOption 'Locale' 'en-US')
     if ($locale -notmatch '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$') { throw "Locale '$locale' is not a language tag such as en-US." }
-    $timeZone = [string](& $getOption 'TimeZone' ([TimeZoneInfo]::Local.Id))
+    $timeZone = [string](& $getOption 'TimeZone' 'Central America Standard Time')
     try { $null = [TimeZoneInfo]::FindSystemTimeZoneById($timeZone) }
     catch { throw "Time zone '$timeZone' is not a Windows time zone ID such as 'Pacific Standard Time' (list them with tzutil /l)." }
     $timeoutSeconds = [int](& $getOption 'ProvisioningTimeoutSeconds' 1800)
