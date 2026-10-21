@@ -2391,7 +2391,25 @@ function Wait-LabPSDirectSession {
             return New-LabPSDirectSession $VMId $Credential
         } catch {
             $lastError = $_
-            Write-Host "Waiting for PowerShell Direct to come up ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $($_.Exception.Message)"
+            # New-PSSession -VMId's own raw error text is accurate but easy to misread as a real
+            # failure while this is actually expected, normal waiting. Two specific, well-understood
+            # transient states get a calibrated explanation instead; anything else shows the raw
+            # message unchanged, so a genuinely unexpected error is never hidden behind generic text.
+            # The final timeout error (below) still carries the exact raw message either way, for
+            # real diagnosis if this never resolves.
+            $rawMessage = $_.Exception.Message
+            $shownMessage = switch -Regex ($rawMessage) {
+                'remote session might have ended' {
+                    'Windows is not far enough along yet to accept a PowerShell Direct connection (still booting or installing). This is expected.'
+                    break
+                }
+                'credential is invalid' {
+                    'the account exists but may still be finishing first-logon setup; this is expected for a while after the first sign-in.'
+                    break
+                }
+                default { $rawMessage }
+            }
+            Write-Host "Waiting for PowerShell Direct to come up ($([int]$watch.Elapsed.TotalSeconds)s elapsed): $shownMessage"
             Start-Sleep -Seconds 10
         }
     }

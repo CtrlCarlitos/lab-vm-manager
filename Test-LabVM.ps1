@@ -977,6 +977,67 @@ Test-Case 'Wait-LabPSDirectSession times out with a clear message once its own s
     Assert-Equal ($realElapsedSeconds -lt 15) $true
     Assert-Equal ($script:PSDirectAttempts -gt 1) $true
 }
+Test-Case 'Wait-LabPSDirectSession shows a calibrated explanation for the two known transient errors, not the raw text' {
+    $script:PSDirectAttempts = 0; $script:PSDirectAlwaysFails = $false; $script:SleepCalls = 0
+    $script:PSDirectRawMessages = @(
+        'An error has occurred which Windows PowerShell cannot handle. A remote session might have ended.',
+        'The credential is invalid.'
+    )
+    function New-LabPSDirectSession {
+        param($VMId, $Credential)
+        $script:PSDirectAttempts++
+        if ($script:PSDirectAttempts -le $script:PSDirectRawMessages.Count) {
+            throw $script:PSDirectRawMessages[$script:PSDirectAttempts - 1]
+        }
+        return [pscustomobject]@{ State = 'Opened' }
+    }
+    try {
+        $lines = @(Wait-LabPSDirectSession $script:FakeId $null 60 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+        if (-not $lines.Contains('Windows is not far enough along yet to accept a PowerShell Direct connection')) {
+            throw "Expected the calibrated 'not far enough along' explanation in: $lines"
+        }
+        if (-not $lines.Contains('the account exists but may still be finishing first-logon setup')) {
+            throw "Expected the calibrated 'finishing first-logon setup' explanation in: $lines"
+        }
+        if ($lines.Contains('cannot handle') -or $lines.Contains('A remote session might have ended') -or
+            $lines.Contains('The credential is invalid.')) {
+            throw "Raw, unfriendly text leaked into the progress output: $lines"
+        }
+    } finally {
+        function New-LabPSDirectSession {
+            param($VMId, $Credential)
+            $script:PSDirectAttempts++
+            if ($script:PSDirectAlwaysFails -or $script:PSDirectAttempts -le $script:PSDirectFailuresBeforeSuccess) {
+                throw 'simulated: guest not ready to accept PowerShell Direct connections yet'
+            }
+            return [pscustomobject]@{ State = 'Opened' }
+        }
+    }
+}
+Test-Case 'Wait-LabPSDirectSession shows an unrecognized error message unchanged, never hidden' {
+    $script:PSDirectAttempts = 0; $script:SleepCalls = 0
+    function New-LabPSDirectSession {
+        param($VMId, $Credential)
+        $script:PSDirectAttempts++
+        if ($script:PSDirectAttempts -eq 1) { throw 'simulated: an entirely unanticipated failure mode' }
+        return [pscustomobject]@{ State = 'Opened' }
+    }
+    try {
+        $lines = @(Wait-LabPSDirectSession $script:FakeId $null 60 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+        if (-not $lines.Contains('simulated: an entirely unanticipated failure mode')) {
+            throw "Expected the raw, unmapped message to pass through unchanged in: $lines"
+        }
+    } finally {
+        function New-LabPSDirectSession {
+            param($VMId, $Credential)
+            $script:PSDirectAttempts++
+            if ($script:PSDirectAlwaysFails -or $script:PSDirectAttempts -le $script:PSDirectFailuresBeforeSuccess) {
+                throw 'simulated: guest not ready to accept PowerShell Direct connections yet'
+            }
+            return [pscustomobject]@{ State = 'Opened' }
+        }
+    }
+}
 
 $script:NoteInvokeArgs = $null
 function Invoke-Command {
