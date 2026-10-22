@@ -1152,8 +1152,15 @@ function New-LabVMCore {
     New-VHD -Path $VhdxPath -Dynamic -SizeBytes $VhdxMaximumBytes -Confirm:$false -ErrorAction Stop | Out-Null
     Add-VMHardDiskDrive -VM $vm -Path $VhdxPath -Confirm:$false -ErrorAction Stop
     Set-VMProcessor -VM $vm -Count $VCpuCount -Confirm:$false -ErrorAction Stop
-    Set-VMMemory -VM $vm -DynamicMemoryEnabled $IsDynamic -MinimumBytes $MinimumBytes `
-        -StartupBytes $StartupBytes -MaximumBytes $MaximumBytes -Confirm:$false -ErrorAction Stop
+    # Set-VMMemory refuses -MinimumBytes/-MaximumBytes outright when -DynamicMemoryEnabled is $false
+    # (confirmed live, 2026-10-21: "Setting maximum, minimum, and buffer settings requires Dynamic
+    # Memory to be enabled") -- static memory only accepts -StartupBytes.
+    if ($IsDynamic) {
+        Set-VMMemory -VM $vm -DynamicMemoryEnabled $true -MinimumBytes $MinimumBytes `
+            -StartupBytes $StartupBytes -MaximumBytes $MaximumBytes -Confirm:$false -ErrorAction Stop
+    } else {
+        Set-VMMemory -VM $vm -DynamicMemoryEnabled $false -StartupBytes $StartupBytes -Confirm:$false -ErrorAction Stop
+    }
     # Same policy as Set-LabCheckpointPolicy; applied directly here since there is no prior VM to re-fetch under Assert-LabVMOff.
     Set-VM -VM $vm -CheckpointType Standard -AutomaticCheckpointsEnabled $false -Confirm:$false -ErrorAction Stop
     return (Get-LabVM $vm.Id)
