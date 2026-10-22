@@ -1119,11 +1119,18 @@ function New-LabVMCore {
     if (-not [string]::IsNullOrEmpty($SwitchName) -and (Get-LabSwitchNames) -notcontains $SwitchName) {
         throw "Virtual switch '$SwitchName' is no longer available. Choose another switch."
     }
+    # New-VM's own -Path convention always appends "<Name>\Virtual Machines" under whatever path it is
+    # given (confirmed live, 2026-10-21: passing $VmStoragePath -- already the intended per-VM folder --
+    # directly produced a double-nested "<Name>\<Name>\Virtual Machines"). Passing its PARENT instead
+    # lets Hyper-V's own convention land exactly on $VmStoragePath\Virtual Machines, matching the single
+    # per-VM folder (sibling to the VHDX's own "Virtual Hard Disks" folder below) every caller of this
+    # function already expects $VmStoragePath to mean.
+    $vmStorageParent = Split-Path -Parent $VmStoragePath
     if ([string]::IsNullOrEmpty($SwitchName)) {
-        $vm = New-VM -Name $Name -Generation 2 -Path $VmStoragePath -NoVHD `
+        $vm = New-VM -Name $Name -Generation 2 -Path $vmStorageParent -NoVHD `
             -MemoryStartupBytes $StartupBytes -Confirm:$false -ErrorAction Stop
     } else {
-        $vm = New-VM -Name $Name -Generation 2 -Path $VmStoragePath -NoVHD `
+        $vm = New-VM -Name $Name -Generation 2 -Path $vmStorageParent -NoVHD `
             -MemoryStartupBytes $StartupBytes -SwitchName $SwitchName -Confirm:$false -ErrorAction Stop
     }
     # New-VHD does not create missing parent folders; create the dedicated (verified-absent) VHDX folder.
@@ -1202,9 +1209,15 @@ function New-LabVM {
     }
 
     while ($true) {
-        $vhdxRootInput = Read-LabText "VHDX storage root [$($defaults.VirtualHardDiskPath)] (blank = default; C cancels)"
+        # Default to the SAME root as the VM storage path above, not the host's own separate
+        # VirtualHardDiskPath default: those two host defaults already differ by convention (a bare
+        # root for VM config, a "Virtual Hard Disks" subfolder for disks), which -- once each gets its
+        # own per-VM-named subfolder here -- would produce a redundant nested "Virtual Hard
+        # Disks\<name>\Virtual Hard Disks\<name>.vhdx" instead of one clean per-VM folder. Only an
+        # explicit, different answer here (e.g. disks on another physical drive) keeps them separate.
+        $vhdxRootInput = Read-LabText "VHDX storage root [$storageRoot] (blank = same as VM storage root; C cancels)"
         if ($vhdxRootInput -ieq 'C') { return 'CANCELLED' }
-        $vhdxRoot = $(if ($vhdxRootInput -eq '') { $defaults.VirtualHardDiskPath } else { $vhdxRootInput })
+        $vhdxRoot = $(if ($vhdxRootInput -eq '') { $storageRoot } else { $vhdxRootInput })
         # Same local-only rule as Export-LabVM: absolute local drive path, no UNC/mapped network drive.
         if ($vhdxRoot -notmatch '^[A-Za-z]:\\') { Write-Host 'Use an absolute local drive path, e.g. D:\Hyper-V, or C to cancel.'; continue }
         if (-not (Test-Path -LiteralPath $vhdxRoot -PathType Container)) { Write-Host 'Enter an existing directory, or C to cancel.'; continue }
@@ -1213,7 +1226,11 @@ function New-LabVM {
         }
         break
     }
-    $vhdxPath = Join-Path (Join-Path $vhdxRoot $name) "$name.vhdx"
+    # "Virtual Hard Disks" sibling to the VM folder's own "Virtual Machines" (New-LabVMCore's own
+    # header comment): matches Hyper-V Manager's own single-VM folder convention instead of dropping
+    # the VHDX flat into the per-VM folder, where every VM's disk would otherwise look identical at a
+    # glance and a shared top-level folder becomes a trap for any path operation scoped too broadly.
+    $vhdxPath = Join-Path (Join-Path (Join-Path $vhdxRoot $name) 'Virtual Hard Disks') "$name.vhdx"
 
     while ($true) {
         $vhdxSizeText = Read-LabText 'VHDX maximum capacity in bytes, e.g. 68719476736 for 64GB (blank cancels)'
@@ -3752,7 +3769,12 @@ function Get-LabProvisioningVMHardware {
         if ($name -eq '') { return $null }
     }
     $vmRoot = [string](& $getOption 'VmStorageRoot' $defaults.VirtualMachinePath)
-    $vhdxRoot = [string](& $getOption 'VhdxStorageRoot' $defaults.VirtualHardDiskPath)
+    # Default -VhdxStorageRoot to the SAME root as -VmStorageRoot, not the host's own separate
+    # VirtualHardDiskPath default -- see New-LabVM's identical comment on why those two host defaults,
+    # once each gets its own per-VM-named subfolder, would otherwise produce a redundant nested
+    # "Virtual Hard Disks\<name>\Virtual Hard Disks\<name>.vhdx" instead of one clean per-VM folder.
+    # Only an explicitly supplied, different value keeps VM config and disks on separate roots.
+    $vhdxRoot = [string](& $getOption 'VhdxStorageRoot' $vmRoot)
     foreach ($root in @(@{ Label = 'VM storage root (-VmStorageRoot)'; Path = $vmRoot }, @{ Label = 'VHDX storage root (-VhdxStorageRoot)'; Path = $vhdxRoot })) {
         # Same local-only rules as New-LabVM's storage prompts.
         if ($root.Path -notmatch '^[A-Za-z]:\\' -or -not (Test-Path -LiteralPath $root.Path -PathType Container) -or
@@ -3774,7 +3796,9 @@ function Get-LabProvisioningVMHardware {
     return [pscustomobject]@{
         Name = $name
         VmStoragePath = (Join-Path $vmRoot $name)
-        VhdxPath = (Join-Path (Join-Path $vhdxRoot $name) "$name.vhdx")
+        # "Virtual Hard Disks" sibling to "Virtual Machines" under the per-VM folder -- see
+        # New-LabVMCore's and New-LabVM's own comments on this same convention.
+        VhdxPath = (Join-Path (Join-Path (Join-Path $vhdxRoot $name) 'Virtual Hard Disks') "$name.vhdx")
         VCpuCount = $vCpuCount
         MinimumBytes = $minimumBytes
         StartupBytes = $startupBytes
