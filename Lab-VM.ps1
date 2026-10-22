@@ -238,7 +238,10 @@ param(
     [int]$ProvisioningTimeoutSeconds = 1800,
     [switch]$ProvisionLinuxVM,
     [string]$LinuxIsoPath = '',
-    [string]$LinuxTimeZone = 'America/Guatemala'
+    [string]$LinuxTimeZone = 'America/Guatemala',
+    [switch]$ProvisionLinuxServerVM,
+    [string]$LinuxServerIsoPath = '',
+    [string]$LinuxServerTimeZone = 'America/Guatemala'
 )
 
 Set-StrictMode -Version Latest
@@ -973,7 +976,7 @@ function Select-LabVM {
             Sort-Object Name, Id)
         if ($items.Count -eq 0) {
             if (-not $script:LabReadOnly) {
-                Write-Host 'No local VMs whose names begin with LAB- were found. Choose N to create one, W to provision a Windows 11 VM unattended, or L to provision an Ubuntu Desktop VM unattended.'
+                Write-Host 'No local VMs whose names begin with LAB- were found. Choose N to create one, W to provision a Windows 11 VM unattended, L to provision an Ubuntu Desktop VM unattended, or S to provision an Ubuntu Server VM unattended.'
             } else {
                 Write-Host 'No local VMs whose names begin with LAB- were found. Read-only mode: VM creation is disabled.'
             }
@@ -987,7 +990,7 @@ function Select-LabVM {
             $rows | Format-Table -AutoSize -Wrap | Out-Host
         }
         if (-not $script:LabReadOnly) {
-            $answer = Read-LabText 'VM number; N create VM; W provision Windows 11 VM (unattended); L provision Ubuntu Desktop VM (unattended); R refresh; Q quit'
+            $answer = Read-LabText 'VM number; N create VM; W provision Windows 11 VM (unattended); L provision Ubuntu Desktop VM (unattended); S provision Ubuntu Server VM (unattended); R refresh; Q quit'
         } else {
             $answer = Read-LabText 'VM number; R refresh; Q quit'
         }
@@ -1013,9 +1016,17 @@ function Select-LabVM {
             $null = Read-LabText 'Press Enter to continue'
             continue
         }
+        if ($answer -ieq 'S' -and -not $script:LabReadOnly) {
+            # Same pattern as L: discard the status, show a thrown failure, hold it on screen.
+            try { $null = Start-LabLinuxServerVMProvisioning @{} }
+            catch [Management.Automation.PipelineStoppedException] { throw }
+            catch { Write-Warning $_.Exception.Message }
+            $null = Read-LabText 'Press Enter to continue'
+            continue
+        }
         $index = ConvertTo-LabMenuIndex $answer $items.Count
         if ($index -ge 0) { return Get-LabVM ([guid]$items[$index].Id) }
-        if (-not $script:LabReadOnly) { Write-Host 'Choose a listed number, N, W, L, R or Q.' }
+        if (-not $script:LabReadOnly) { Write-Host 'Choose a listed number, N, W, L, S, R or Q.' }
         else { Write-Host 'Choose a listed number, R or Q.' }
     }
 }
@@ -4439,6 +4450,314 @@ function Start-LabLinuxVMProvisioning {
     }
 }
 
+function Start-LabLinuxServerVMProvisioning {
+    param([hashtable]$Options = @{})
+    # Creates a new LAB- VM and installs Ubuntu Server 26.04.x on it unattended: menu S (all defaults)
+    # and the engine behind -ProvisionLinuxServerVM ($Options carries only the parameters the caller
+    # bound). Returns COMPLETED or CANCELLED; throws on any failure. The Server peer of
+    # Start-LabLinuxVMProvisioning, a parallel (not shared) orchestrator -- same precedent as
+    # Windows-vs-Desktop-Linux -- reusing every shared helper that has no Desktop-specific logic in
+    # it unchanged: version scope checked before any VM exists, VM hardware from the shared
+    # Get-LabProvisioningVMHardware, one combined preview and confirmation, the create-name lock and
+    # then the new VM's own lock, one catch after creation that names every applied step and keeps
+    # the workspace, and two boot cycles (install, then a clean standalone boot). Completion is
+    # proven by key-based SSH logins with an ephemeral key minted for this VM, kept at its own stable
+    # path OUTSIDE the provisioning workspace; this VM's SSH connection settings are saved only at the
+    # very end, after the second login succeeds, so a failed run never leaves stale ones.
+    if ($script:LabReadOnly) { Write-Warning 'Read-only mode: VM creation is disabled.'; return 'CANCELLED' }
+    $getOption = {
+        param([string]$Key, $Default)
+        if ($Options.ContainsKey($Key) -and $null -ne $Options[$Key] -and -not ($Options[$Key] -is [string] -and $Options[$Key] -eq '')) {
+            return $Options[$Key]
+        }
+        return $Default
+    }
+    $nonInteractive = [bool](& $getOption 'NonInteractive' $false)
+    $suppliedCredential = & $getOption 'Credential' $null
+    # Checked now, before an ISO is read or a VM exists (same reason as the Windows action).
+    if ($null -ne $suppliedCredential) { $null = ConvertTo-LabLinuxAccountName $suppliedCredential }
+    elseif ($nonInteractive) { throw 'Guest Linux account credentials are required in non-interactive mode. Supply -Credential.' }
+
+    # --- 1. ISO, then its release: refused here, before any VM exists, unless it is Ubuntu Server 26.04.x.
+    $isoPath = [string](& $getOption 'LinuxServerIsoPath' '')
+    if ($isoPath -eq '') {
+        if ($nonInteractive) { throw 'Supply -LinuxServerIsoPath in non-interactive mode.' }
+        $isoPath = Select-LabIsoPath $script:LabIsoRoot
+        if ($null -eq $isoPath) { return 'CANCELLED' }
+    } else {
+        # Same checks as Select-LabIsoPath's own selection-time validation.
+        if (-not (Test-Path -LiteralPath $isoPath -PathType Leaf)) { throw "Linux ISO '$isoPath' does not exist." }
+        try {
+            $stream = [IO.File]::OpenRead($isoPath)
+            try { $isoLength = $stream.Length } finally { $stream.Close() }
+        } catch { throw "Linux ISO '$isoPath' could not be opened for reading ($($_.Exception.Message))." }
+        if ($isoLength -le 0) { throw "Linux ISO '$isoPath' is empty (0 bytes)." }
+    }
+    Write-Host "Reading the release information in '$isoPath'..."
+    $isoInfo = Get-LabLinuxIsoInfo $isoPath
+    $releaseText = ([string]$isoInfo.ReleaseText).Trim()
+    if (-not $isoInfo.IsUbuntuServerInScope) {
+        $found = if ($releaseText -eq '') { 'no .disk/info release file (not an Ubuntu installer ISO)' } else { "'$releaseText'" }
+        throw "Refusing '$isoPath': it is not an Ubuntu Server 26.04.x installer ISO, which is the only thing this action installs. Found: $found. No VM was created."
+    }
+
+    # --- 2. VM hardware (shared with the Windows action) and Linux settings: validated strictly, never adjusted.
+    $hardware = Get-LabProvisioningVMHardware -Options $Options -NonInteractive $nonInteractive
+    if ($null -eq $hardware) { return 'CANCELLED' }
+    $name = $hardware.Name
+    $vhdxSizeGB = [int](& $getOption 'VhdxSizeGB' 150)
+    if ($vhdxSizeGB -lt 64) { throw "-VhdxSizeGB $vhdxSizeGB is below this action's 64 GB minimum." }
+    # -SwitchName '' is a meaningful value (Disconnected), so it is read directly, as in the Windows action.
+    $switchName = if ($Options.ContainsKey('SwitchName')) { [string]$Options['SwitchName'] } else { 'Default Switch' }
+    # Unlike the Windows action, Disconnected is refused outright: this action's completion check is an
+    # SSH login over the network, so it could only ever run to its full timeout and then fail.
+    if ($switchName -eq '') {
+        throw "-SwitchName '' (Disconnected) cannot be used to provision a Linux Server VM: completion is proven by an SSH login over the network (and the installer downloads the SSH server), so a Disconnected adapter can only time out. Omit -SwitchName to use 'Default Switch', or supply another existing switch, e.g. -SwitchName 'Default Switch'. No VM was created."
+    }
+    if ((Get-LabSwitchNames) -notcontains $switchName) {
+        throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to use 'Default Switch', or supply another existing switch."
+    }
+    # The Windows action's exact computer-name rule, plus one Linux-only addition below. Default is
+    # distinct from Desktop's 'lab-agent-test' so the two don't collide if both are created with defaults.
+    $computerName = [string](& $getOption 'ComputerName' 'lab-agent-srv')
+    if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
+        throw "Computer name '$computerName' is invalid: use 1-15 letters, digits or hyphens, not digits only. Supply -ComputerName."
+    }
+    # Linux hostnames (RFC 1123 labels, as systemd enforces them) may not start or end with a hyphen.
+    if ($computerName.StartsWith('-') -or $computerName.EndsWith('-')) {
+        throw "Computer name '$computerName' is invalid for Linux: it must not start or end with a hyphen. Supply -ComputerName."
+    }
+    # A POSIX locale name (language[_TERRITORY][.codeset][@modifier], or the C locale such as C.UTF-8).
+    # These values are written into the autoinstall YAML unquoted, so the format gate also keeps out
+    # anything YAML would treat specially.
+    $locale = [string](& $getOption 'Locale' 'en_US.UTF-8')
+    if ($locale -cnotmatch '^(C|[A-Za-z]{2,3}(_[A-Za-z0-9]{2,8})?)(\.[A-Za-z0-9-]+)?(@[A-Za-z0-9]+)?$') {
+        throw "Locale '$locale' is not a Linux locale name such as en_US.UTF-8. Supply -Locale."
+    }
+    # A format gate only, NOT real verification: Windows PowerShell 5.1 has no API that validates an IANA
+    # zone ID, so this only requires the Region/City shape (e.g. America/Guatemala, Etc/GMT+6). A
+    # well-formed but unknown zone is caught by the installer, not here.
+    $linuxTimeZone = [string](& $getOption 'LinuxServerTimeZone' 'America/Guatemala')
+    if ($linuxTimeZone -notmatch '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+$') {
+        throw "-LinuxServerTimeZone '$linuxTimeZone' is not an IANA time zone ID such as 'America/Guatemala' (list them with timedatectl list-timezones). Windows time zone IDs belong in -TimeZone, which only -ProvisionWindowsVM uses."
+    }
+    $timeoutSeconds = [int](& $getOption 'ProvisioningTimeoutSeconds' 1800)
+    if ($timeoutSeconds -lt 300 -or $timeoutSeconds -gt 7200) { throw "-ProvisioningTimeoutSeconds $timeoutSeconds is outside 300-7200." }
+    $workspaceHint = Join-Path $env:LOCALAPPDATA 'LabVmManager\Provisioning\<new VM id>'
+    $keyHint = Join-Path $env:LOCALAPPDATA 'LabVmManager\SshConnections\<new VM id>.key'
+
+    # --- 3. One combined preview, one confirmation. Nothing has been created or changed above.
+    Write-Host "`n=== Provision Linux Server VM preview (nothing has been created yet) ==="
+    [pscustomobject]@{
+        Name = $name
+        VMStoragePath = $hardware.VmStoragePath
+        VhdxPath = $hardware.VhdxPath
+        VhdxMaximumGiB = $vhdxSizeGB
+        VCpuCount = $hardware.VCpuCount
+        DynamicMemoryGiB = '{0} min / {1} startup / {2} max' -f ($hardware.MinimumBytes / 1GB), ($hardware.StartupBytes / 1GB), ($hardware.MaximumBytes / 1GB)
+        Switch = $switchName
+        Generation = 2
+        CheckpointPolicy = 'Standard; automatic checkpoints disabled'
+        LinuxIso = $isoPath
+        Release = $releaseText
+        ComputerName = $computerName
+        Locale = $locale
+        TimeZone = $linuxTimeZone
+        GuestAccount = $(if ($null -ne $suppliedCredential) { "$(ConvertTo-LabLinuxAccountName $suppliedCredential) (sudo)" } else { 'prompted for after the VM is created (sudo)' })
+        BootProfile = 'UbuntuServer: Secure Boot (MicrosoftUEFICertificateAuthority template); no key protector or vTPM'
+        SshKey = "$keyHint (new ed25519 key, kept; becomes this VM's saved SSH identity)"
+        WaitPerLogin = "$timeoutSeconds seconds"
+    } | Format-List | Out-Host
+    Write-Host 'The VM is created, Ubuntu is installed unattended from the ISO plus a generated NoCloud seed ISO, and the VM'
+    Write-Host 'boots twice: once to install (proven by an SSH login with the new key and a note in the account''s home'
+    Write-Host 'directory), then, after the install media are removed, once more to prove it boots cleanly on its own.'
+    Write-Host 'Only then are this VM''s SSH connection settings saved, replacing any saved for it before.'
+    Write-Warning ("Until the end of the run, the provisioning workspace ($workspaceHint) holds a copy of the ISO and " +
+        'the autoinstall user-data containing the account password in plain text. It is deleted after a successful run and KEPT if a step fails.')
+    if (-not $nonInteractive) {
+        Write-Host 'To change any value above, cancel and rerun with -ProvisionLinuxServerVM and the matching parameter.'
+        if ((Read-LabYesNoCancel 'Create this VM and install Ubuntu now') -ne 'Y') { return 'CANCELLED' }
+    }
+
+    # --- 4. Create the VM under the create-name lock (same lock as New-LabVM), then hand over to the VM's own lock.
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $getAuditDetail = { 'Iso={0}; Release={1}; ComputerName={2}; ElapsedSeconds={3}' -f
+        $isoPath, $releaseText, $computerName, [int]$watch.Elapsed.TotalSeconds }
+    $createMutex = [Threading.Mutex]::new($false, "Global\LabVmManager-Create-$($name.ToUpperInvariant())")
+    $createHeld = $false
+    $vmMutex = $null
+    $vmHeld = $false
+    try {
+        try { $createHeld = $createMutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $createHeld = $true }
+        if (-not $createHeld) { throw 'Another copy of this script is already creating a VM with this name. No operation was started here.' }
+        try {
+            $vm = New-LabVMCore -Name $name -VmStoragePath $hardware.VmStoragePath -VCpuCount $hardware.VCpuCount `
+                -MinimumBytes $hardware.MinimumBytes -StartupBytes $hardware.StartupBytes -MaximumBytes $hardware.MaximumBytes `
+                -IsDynamic $true -VhdxPath $hardware.VhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName
+        } catch [Management.Automation.PipelineStoppedException] {
+            throw
+        } catch {
+            $message = $_.Exception.Message
+            try { Write-LabAudit 'provision-linux-server-vm' 'FAILED_OR_UNCONFIRMED' $null "$name`: VM creation: $message; $(& $getAuditDetail)" }
+            catch { Write-Warning 'Audit logging also failed.' }
+            throw "Creating '$name' failed or is unconfirmed: $message Inspect Hyper-V inventory; do not assume nothing was created. No Linux provisioning step ran, so no workspace, password file or SSH key was written."
+        }
+        $vmId = [guid]$vm.Id
+
+        # --- 5. Everything after creation: one catch, which names what was applied and keeps the workspace.
+        $done = [Collections.Generic.List[string]]::new()
+        $done.Add("VM '$name' [$vmId] created")
+        $workspace = $null
+        $seedIsoBuilt = $false
+        $workspaceRemoved = $false
+        $keyPair = $null
+        $completed = $false
+        $reported = $false
+        $getFailureText = {
+            param([string]$Cause)
+            $workspaceText = if ($null -eq $workspace) {
+                'No provisioning workspace was created, so no password was written to disk.'
+            } elseif ($workspaceRemoved) {
+                'The provisioning workspace (and the password in it) was already deleted.'
+            } elseif ($seedIsoBuilt) {
+                "The provisioning workspace was KEPT, not deleted: $workspace -- it contains the account password in plain text (the autoinstall user-data inside seed.iso). Delete that folder yourself once you no longer need it."
+            } else {
+                "The provisioning workspace was KEPT, not deleted: $workspace -- no password had been written to it yet, but check it and delete that folder yourself once you no longer need it."
+            }
+            $keyText = if ($null -eq $keyPair) { 'No SSH key had been generated yet.' } else {
+                "This VM's SSH private key was kept at $($keyPair.PrivateKeyPath) (it is not part of the workspace); delete it and its .pub file yourself if you discard the VM." }
+            "Linux provisioning of '$name' stopped partway: $Cause Steps already applied: $($done -join '; '). The VM was left exactly as it is (not powered off, not deleted); inspect it before retrying. $workspaceText $keyText No SSH connection settings were saved for this VM by this run."
+        }
+        try {
+            # A brand-new VM id: nobody else can hold this lock yet, but take it before releasing the
+            # create lock so there is no moment when the new VM is unlocked.
+            $vmMutex = [Threading.Mutex]::new($false, "Global\LabVmManager-$vmId")
+            try { $vmHeld = $vmMutex.WaitOne(0) }
+            catch [Threading.AbandonedMutexException] { $vmHeld = $true }
+            if (-not $vmHeld) { throw 'Another copy of this script is already operating on the new VM.' }
+            $createMutex.ReleaseMutex()
+            $createHeld = $false
+            Write-LabAudit 'provision-linux-server-vm' 'STARTED' $vm (& $getAuditDetail)
+
+            # Same VM-level settings the Windows action applies right after creation.
+            Enable-VMIntegrationService -VM $vm -Name 'Guest Service Interface' -Confirm:$false -ErrorAction Stop
+            Set-VM -VM $vm -AutomaticStopAction ShutDown -Confirm:$false -ErrorAction Stop
+            $done.Add('Guest Service Interface enabled; automatic stop action set to Shut Down')
+
+            $guestCredential = Resolve-LabLinuxCredential -Credential $suppliedCredential -NonInteractive $nonInteractive
+            $accountName = ConvertTo-LabLinuxAccountName $guestCredential
+            $done.Add("guest credential resolved (account '$accountName')")
+            $workspace = Get-LabProvisioningWorkspacePath $vmId
+            $done.Add("provisioning workspace created ($workspace)")
+            Write-Host 'Writing an autoinstall boot copy of the ISO into the workspace (this can take a few minutes)...'
+            $patchResult = New-LabPatchedBootableLinuxIso -SourceIsoPath $isoPath -OutputPath (Join-Path $workspace 'ubuntu-autoinstall.iso')
+            # OutputPath is $null when nothing was patched: fall back to the original ISO here, by design.
+            $linuxIsoPath = if ($patchResult.Patched) { [string]$patchResult.OutputPath } else { $isoPath }
+            if ($patchResult.Patched) {
+                $done.Add('autoinstall boot copy of the ISO written')
+            } else {
+                Write-Warning ("The ISO's GRUB menu was not patched ($($patchResult.Reason)); the original ISO is used. Without the " +
+                    "'autoinstall' boot parameter the installer will NOT run unattended: open the VM's console in Hyper-V Manager, " +
+                    "press 'e' at the GRUB menu, add 'autoinstall' to the linux line and boot with F10, or the SSH wait will time out.")
+                $done.Add("GRUB menu not patched ($($patchResult.Reason)); original ISO used")
+            }
+            # Minted at its stable path (never inside the workspace), so the workspace cleanup below can
+            # never remove it: it becomes this VM's saved SSH identity at the end of a successful run.
+            $keyPair = New-LabEphemeralSshKeyPair -VMId $vmId
+            $done.Add("ephemeral SSH key generated ($($keyPair.PrivateKeyPath))")
+            # Splatted: the SecureString goes straight through; it is never turned into plaintext here.
+            $userDataArguments = @{ ComputerName = $computerName; Locale = $locale; TimeZone = $linuxTimeZone
+                UserName = $accountName; Password = $guestCredential.Password; SshPublicKey = $keyPair.PublicKeyContent }
+            $userData = New-LabLinuxAutoinstallUserData @userDataArguments
+            $metaData = "instance-id: lab-$vmId`nlocal-hostname: $computerName`n"
+            $seedIsoPath = Join-Path $workspace 'seed.iso'
+            # From here on the workspace holds the password, so mark that before the write, not after.
+            $seedIsoBuilt = $true
+            New-LabSeedIso -Files @{ 'user-data' = $userData; 'meta-data' = $metaData } -OutputPath $seedIsoPath -VolumeLabel 'cidata'
+            $userData = $null
+            $done.Add('NoCloud seed ISO (cidata) built')
+            Set-LabVMUnattendedLinuxInstallMedia -VMId $vmId -LinuxIsoPath $linuxIsoPath -SeedIsoPath $seedIsoPath
+            $done.Add('Ubuntu and seed ISOs attached, DVD first in boot order')
+            $profileResult = Set-LabVMBootProfile $vmId 'UbuntuServer'
+            $done.Add(('UbuntuServer boot profile (template changed: {0}; Secure Boot turned on: {1})' -f
+                $profileResult.SecureBootTemplateChanged, $profileResult.SecureBootEnabled))
+            $null = Start-LabVM $vmId
+            $done.Add('VM started (Ubuntu installer running)')
+            Write-Host "Ubuntu is installing unattended. Waiting up to $timeoutSeconds seconds for the first SSH login with the new key..."
+            $firstLogin = Wait-LabSshSession -VMId $vmId -UserName $accountName -TimeoutSeconds $timeoutSeconds
+            $firstAddress = [string]$firstLogin.Address
+            $done.Add("first SSH login succeeded at $firstAddress (Ubuntu installed; host key trusted)")
+            $installElapsed = $watch.Elapsed
+            # Non-secret summary only: never the password. If another guest on the same switch ever
+            # impersonated this VM during the trust window, this text is all it would receive.
+            $note = (@(
+                "This VM ($name) was installed unattended by LAB VM Manager from $env:COMPUTERNAME on $(Get-Date -Format 'yyyy-MM-dd HH:mm').",
+                "Ubuntu ISO: $isoPath$(if ($patchResult.Patched) { ' (booted from an autoinstall copy of it)' } else { ' (booted as-is; its GRUB menu was not patched)' }).",
+                "Release: $releaseText. Computer name: $computerName. Account: $accountName (sudo).",
+                ('Boot profile: UbuntuServer (Secure Boot template changed: {0}; Secure Boot turned on: {1}).' -f
+                    $profileResult.SecureBootTemplateChanged, $profileResult.SecureBootEnabled),
+                ('Time from VM creation to this first SSH login: {0} min {1} s ({2} seconds).' -f
+                    [int][math]::Floor($installElapsed.TotalMinutes), $installElapsed.Seconds, [int]$installElapsed.TotalSeconds),
+                'Right after this note was written, the host shut the VM down once, removed the installer and seed media,',
+                'deleted its host-side copy of the autoinstall user-data, and started the VM again. SSH access uses a key',
+                'the host generated for this VM only; the host saves it as this VM''s SSH connection once the restart is confirmed.'
+            ) -join "`n") + "`n"
+            Write-LabLinuxProvisioningNote -HostNameOrAddress $firstAddress -UserName $accountName -IdentityFilePath $keyPair.PrivateKeyPath -RemoteRelativePath 'lab-vm-manager-provisioning-note.txt' -Content $note
+            $done.Add("completion note written to the guest's home directory")
+            Request-LabVMGuestShutdown $vmId 'LAB VM Manager: Ubuntu unattended install finished; removing install media'
+            # Same 1800-second floor as the Windows action's first post-install shutdown, for the same reason.
+            $null = Wait-LabVMState $vmId 'Off' -TimeoutSeconds ([math]::Max($script:LabTimeout, 1800))
+            $done.Add('VM shut down')
+            Complete-LabLinuxProvisioning -VMId $vmId -LinuxIsoPath $linuxIsoPath -SeedIsoPath $seedIsoPath
+            $done.Add('seed drive removed, installer ISO ejected, disk first in boot order')
+            Remove-LabProvisioningWorkspace $vmId
+            $workspaceRemoved = $true
+            $done.Add('provisioning workspace deleted')
+            $null = Start-LabVM $vmId
+            $done.Add('VM restarted without install media')
+            Write-Host "Waiting up to $timeoutSeconds seconds for an SSH login after the clean restart..."
+            # The address may differ from the first boot's (a new DHCP lease); the one proven here is saved.
+            # Pinned to the host key the first login verified, so the second boot must present that SAME
+            # key at whatever address it reports: no second trust-on-first-connect window is opened.
+            $pinnedHostKey = [string]$firstLogin.HostKey
+            if ($pinnedHostKey -eq '') {
+                # Only when known_hosts already trusted the first boot's key, so no line was recorded.
+                Write-Warning 'The first SSH login did not record a host key to pin, so the second login uses the same trust rules as the first.'
+            }
+            $finalLogin = Wait-LabSshSession -VMId $vmId -UserName $accountName -TimeoutSeconds $timeoutSeconds -PinnedHostKey $pinnedHostKey
+            $finalAddress = [string]$finalLogin.Address
+            $done.Add("second SSH login succeeded at $finalAddress (boots cleanly on its own)")
+            Set-LabSshConnectionSettings -VMId $vmId -HostNameOrAddress $finalAddress -Port 22 -UserName $accountName -IdentityFilePath $keyPair.PrivateKeyPath
+            $done.Add("SSH connection settings saved ($accountName@${finalAddress}:22, key $($keyPair.PrivateKeyPath))")
+            $completed = $true
+        } catch [Management.Automation.PipelineStoppedException] {
+            throw
+        } catch {
+            $failureText = & $getFailureText $_.Exception.Message
+            $reported = $true
+            try { Write-LabAudit 'provision-linux-server-vm' 'FAILED_OR_UNCONFIRMED' $vm "$($_.Exception.Message); $(& $getAuditDetail)" }
+            catch { Write-Warning 'Audit logging also failed. Inspect the VM; do not assume nothing changed.' }
+            throw $failureText
+        } finally {
+            if (-not $completed -and -not $reported) {
+                # Interrupted (e.g. Ctrl+C): the catch above never ran, so say where things stand here.
+                try { $Host.UI.WriteWarningLine((& $getFailureText 'the run was interrupted.')) } catch { }
+                try { Write-LabAudit 'provision-linux-server-vm' 'FAILED_OR_UNCONFIRMED' $vm "interrupted; $(& $getAuditDetail)" } catch { }
+            }
+        }
+        Write-LabAudit 'provision-linux-server-vm' 'COMPLETED' $vm (& $getAuditDetail)
+        foreach ($line in $done) { Write-Host "Done: $line" }
+        Write-Host "'$name' is installed and running; '$accountName' can sign in over SSH with the saved key. A note is in that account's home directory."
+        return 'COMPLETED'
+    } finally {
+        if ($createHeld) { $createMutex.ReleaseMutex() }
+        $createMutex.Dispose()
+        if ($vmHeld) { $vmMutex.ReleaseMutex() }
+        if ($null -ne $vmMutex) { $vmMutex.Dispose() }
+    }
+}
+
 function Get-LabVMRemovalPreview {
     param([guid]$VMId)
     $vm = Get-LabVM $VMId
@@ -6341,6 +6660,16 @@ function Get-LabLinuxProvisioningOnlyParameter {
     return @($linuxOnly | Where-Object { $BoundParameterNames -contains $_ })
 }
 
+function Get-LabLinuxServerProvisioningOnlyParameter {
+    param([AllowEmptyCollection()][string[]]$BoundParameterNames)
+    # Linux Server-only: valid with -ProvisionLinuxServerVM alone. Separate names from
+    # Get-LabLinuxProvisioningOnlyParameter's -LinuxIsoPath/-LinuxTimeZone (confirmed with the
+    # project owner): mirrors the existing one-switch-owns-its-names pattern exactly, rather than
+    # restructuring the gating below to let a name belong to more than one switch.
+    $linuxServerOnly = @('LinuxServerIsoPath', 'LinuxServerTimeZone')
+    return @($linuxServerOnly | Where-Object { $BoundParameterNames -contains $_ })
+}
+
 function Start-LabWindowsVMProvisioningCli {
     param([hashtable]$Options, [string]$RequestedLogRoot)
     # $Options carries only the parameters the caller actually bound, plus NonInteractive/Credential,
@@ -6383,6 +6712,30 @@ function Start-LabLinuxVMProvisioningCli {
     Write-LabAudit 'session' 'STARTED' $null ("ReadOnly={0}" -f $script:LabReadOnly)
     try {
         return Start-LabLinuxVMProvisioning $Options
+    } finally {
+        try { Write-LabAudit 'session' 'ENDED' }
+        catch { Write-Warning 'Could not write the final audit entry.' }
+        Write-Host "Audit log: $script:LabLogFile"
+    }
+}
+
+function Start-LabLinuxServerVMProvisioningCli {
+    param([hashtable]$Options, [string]$RequestedLogRoot)
+    # Mirrors Start-LabLinuxVMProvisioningCli: required-value checks first, so a scripted run fails
+    # before any host check or log; then the same session audit framing around the orchestrator.
+    if ($Options['NonInteractive']) {
+        foreach ($required in @('NewVMName', 'LinuxServerIsoPath', 'Credential')) {
+            if (-not $Options.ContainsKey($required) -or $null -eq $Options[$required] -or [string]$Options[$required] -eq '') {
+                throw "Supply -$required with -ProvisionLinuxServerVM -NonInteractive."
+            }
+        }
+    }
+    $ErrorActionPreference = 'Stop'
+    Assert-LabHost
+    Initialize-LabLog $RequestedLogRoot
+    Write-LabAudit 'session' 'STARTED' $null ("ReadOnly={0}" -f $script:LabReadOnly)
+    try {
+        return Start-LabLinuxServerVMProvisioning $Options
     } finally {
         try { Write-LabAudit 'session' 'ENDED' }
         catch { Write-Warning 'Could not write the final audit entry.' }
@@ -6470,27 +6823,28 @@ function Start-LabFileTransferCli {
 
 # Dot-sourcing loads functions without launching the UI; normal invocation runs it.
 if ($MyInvocation.InvocationName -ne '.') {
-    if (@(@([bool]$ConfigureSsh, [bool]($CopyToVM -or $CopyFromVM), [bool]$ProvisionWindowsVM, [bool]$ProvisionLinuxVM) | Where-Object { $_ }).Count -gt 1) {
-        Write-Error -Message 'Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, -ProvisionWindowsVM, or -ProvisionLinuxVM; one action per invocation.' -ErrorAction Continue
+    if (@(@([bool]$ConfigureSsh, [bool]($CopyToVM -or $CopyFromVM), [bool]$ProvisionWindowsVM, [bool]$ProvisionLinuxVM, [bool]$ProvisionLinuxServerVM) | Where-Object { $_ }).Count -gt 1) {
+        Write-Error -Message 'Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, -ProvisionWindowsVM, -ProvisionLinuxVM, or -ProvisionLinuxServerVM; one action per invocation.' -ErrorAction Continue
         exit 1
     }
     # Provisioning parameters are gated in three tiers, refused rather than silently ignored in every mode
-    # they do not apply to (menu, -ConfigureSsh, -CopyToVM/-CopyFromVM, or the other OS's provisioning),
-    # mirroring the transfer gate below: the shared VM-creation tier needs either provisioning switch,
-    # and each OS-specific tier needs its own switch (with the other OS's switch it is foreign).
+    # they do not apply to (menu, -ConfigureSsh, -CopyToVM/-CopyFromVM, or another OS's provisioning),
+    # mirroring the transfer gate below: the shared VM-creation tier needs any provisioning switch,
+    # and each OS-specific tier needs its own switch (with any other switch it is foreign).
     $boundParameterNames = @($PSBoundParameters.Keys)
     $formatParameterList = { param([string[]]$Names) ($Names | ForEach-Object { "-$_" }) -join ', ' }
-    if (-not ($ProvisionWindowsVM -or $ProvisionLinuxVM)) {
+    if (-not ($ProvisionWindowsVM -or $ProvisionLinuxVM -or $ProvisionLinuxServerVM)) {
         $orphanCreationParameters = @(Get-LabCreationOnlyParameter $boundParameterNames)
         if ($orphanCreationParameters.Count -gt 0) {
-            Write-Error -Message ('{0} only apply to -ProvisionWindowsVM or -ProvisionLinuxVM; add one. Nothing was run.' -f
+            Write-Error -Message ('{0} only apply to -ProvisionWindowsVM, -ProvisionLinuxVM, or -ProvisionLinuxServerVM; add one. Nothing was run.' -f
                 (& $formatParameterList $orphanCreationParameters)) -ErrorAction Continue
             exit 1
         }
     }
     $osTiers = @(
         @{ Switch = 'ProvisionWindowsVM'; Supplied = [bool]$ProvisionWindowsVM; Names = @(Get-LabProvisioningOnlyParameter $boundParameterNames) },
-        @{ Switch = 'ProvisionLinuxVM'; Supplied = [bool]$ProvisionLinuxVM; Names = @(Get-LabLinuxProvisioningOnlyParameter $boundParameterNames) })
+        @{ Switch = 'ProvisionLinuxVM'; Supplied = [bool]$ProvisionLinuxVM; Names = @(Get-LabLinuxProvisioningOnlyParameter $boundParameterNames) },
+        @{ Switch = 'ProvisionLinuxServerVM'; Supplied = [bool]$ProvisionLinuxServerVM; Names = @(Get-LabLinuxServerProvisioningOnlyParameter $boundParameterNames) })
     foreach ($tier in $osTiers) {
         if ($tier.Supplied -or $tier.Names.Count -eq 0) { continue }
         $otherTier = @($osTiers | Where-Object { $_.Supplied })
@@ -6503,8 +6857,8 @@ if ($MyInvocation.InvocationName -ne '.') {
         }
         exit 1
     }
-    if ($ProvisionWindowsVM -or $ProvisionLinuxVM) {
-        $provisionSwitch = if ($ProvisionWindowsVM) { 'ProvisionWindowsVM' } else { 'ProvisionLinuxVM' }
+    if ($ProvisionWindowsVM -or $ProvisionLinuxVM -or $ProvisionLinuxServerVM) {
+        $provisionSwitch = if ($ProvisionWindowsVM) { 'ProvisionWindowsVM' } elseif ($ProvisionLinuxVM) { 'ProvisionLinuxVM' } else { 'ProvisionLinuxServerVM' }
         # -VMName/-VMId always mean an EXISTING VM; the VM to create is named with -NewVMName. Transfer
         # parameters other than the shared -NonInteractive/-Credential are refused rather than ignored.
         $foreignParameters = @(Get-LabTransferOnlyParameter $boundParameterNames | Where-Object { $_ -notin @('NonInteractive', 'Credential') })
@@ -6514,12 +6868,15 @@ if ($MyInvocation.InvocationName -ne '.') {
             exit 1
         }
         # Only the parameters the caller actually bound are passed on, so the orchestrator's own defaults apply to the rest.
-        $osSpecificNames = if ($ProvisionWindowsVM) { @(Get-LabProvisioningOnlyParameter $boundParameterNames) } else { @(Get-LabLinuxProvisioningOnlyParameter $boundParameterNames) }
+        $osSpecificNames = if ($ProvisionWindowsVM) { @(Get-LabProvisioningOnlyParameter $boundParameterNames) }
+            elseif ($ProvisionLinuxVM) { @(Get-LabLinuxProvisioningOnlyParameter $boundParameterNames) }
+            else { @(Get-LabLinuxServerProvisioningOnlyParameter $boundParameterNames) }
         $provisioningOptions = @{ NonInteractive = [bool]$NonInteractive; Credential = $Credential }
         foreach ($key in @(@(Get-LabCreationOnlyParameter $boundParameterNames) + $osSpecificNames)) { $provisioningOptions[$key] = $PSBoundParameters[$key] }
         try {
             $status = if ($ProvisionWindowsVM) { Start-LabWindowsVMProvisioningCli -Options $provisioningOptions -RequestedLogRoot $LogRoot }
-                else { Start-LabLinuxVMProvisioningCli -Options $provisioningOptions -RequestedLogRoot $LogRoot }
+                elseif ($ProvisionLinuxVM) { Start-LabLinuxVMProvisioningCli -Options $provisioningOptions -RequestedLogRoot $LogRoot }
+                else { Start-LabLinuxServerVMProvisioningCli -Options $provisioningOptions -RequestedLogRoot $LogRoot }
             exit $(if ($status -eq 'COMPLETED') { 0 } else { 1 })
         }
         catch {

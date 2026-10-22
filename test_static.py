@@ -1146,5 +1146,50 @@ class SourceContract(unittest.TestCase):
         self.assertIn('-PinnedHostKey $pinnedHostKey', body)
         self.assertEqual(body.count('-PinnedHostKey'), 1)
 
+    # --- Linux Server unattended install, Task 3: orchestrator, CLI/menu wiring ---
+    def _linux_server_orchestrator_body(self):
+        return self.s.split('function Start-LabLinuxServerVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+    def test_linux_server_provisioning_orchestrator_exists(self):
+        self.assertIn('function Start-LabLinuxServerVMProvisioning {', self.s)
+        self.assertIn('function Start-LabLinuxServerVMProvisioningCli {', self.s)
+        self.assertIn('function Get-LabLinuxServerProvisioningOnlyParameter {', self.s)
+    def test_provision_linux_server_vm_cli_gates(self):
+        self.assertIn('[switch]$ProvisionLinuxServerVM', self.s)
+        self.assertIn("[string]$LinuxServerIsoPath = ''", self.s)
+        self.assertIn("[string]$LinuxServerTimeZone = 'America/Guatemala'", self.s)
+        dispatcher = self.s.split("if ($MyInvocation.InvocationName -ne '.') {", 1)[1]
+        self.assertIn('Start-LabLinuxServerVMProvisioningCli', dispatcher)
+        self.assertIn('Get-LabLinuxServerProvisioningOnlyParameter', dispatcher)
+        first_check = dispatcher.split('exit 1', 1)[0]
+        self.assertIn('[bool]$ProvisionLinuxServerVM', first_check)
+        self.assertIn('-ProvisionLinuxServerVM', first_check)
+    def test_linux_server_provisioning_only_parameter_narrowed(self):
+        body = self.s.split('function Get-LabLinuxServerProvisioningOnlyParameter {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("'LinuxServerIsoPath'", body)
+        self.assertIn("'LinuxServerTimeZone'", body)
+        self.assertNotIn("'LinuxIsoPath'", body)
+        self.assertNotIn("'LinuxTimeZone'", body)
+    def test_linux_server_provisioning_scope_check_before_vm_creation(self):
+        body = self._linux_server_orchestrator_body()
+        self.assertIn('IsUbuntuServerInScope', body)
+        self.assertLess(body.index('IsUbuntuServerInScope'), body.index('New-LabVMCore -Name'))
+    def test_linux_server_provisioning_refuses_disconnected_before_vm_creation(self):
+        body = self._linux_server_orchestrator_body()
+        self.assertLess(body.index("if ($switchName -eq '') {"), body.index('New-LabVMCore -Name'))
+    def test_linux_server_provisioning_computer_name_default_distinct_from_desktop(self):
+        body = self._linux_server_orchestrator_body()
+        self.assertIn("'ComputerName' 'lab-agent-srv'", body)
+    def test_linux_server_provisioning_uses_server_boot_profile(self):
+        body = self._linux_server_orchestrator_body()
+        self.assertIn("'UbuntuServer'", body)
+        self.assertNotIn("'UbuntuDesktop'", body)
+    def test_linux_server_provisioning_note_goes_to_home_directory(self):
+        body = self._linux_server_orchestrator_body()
+        self.assertIn("-RemoteRelativePath 'lab-vm-manager-provisioning-note.txt'", body)
+    def test_s_menu_entry_wired(self):
+        body = self.s.split('function Select-LabVM {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("-ieq 'S'", body)
+        self.assertIn('Start-LabLinuxServerVMProvisioning', body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
