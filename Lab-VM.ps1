@@ -135,7 +135,7 @@
 .PARAMETER MemoryMinimumGB
     Dynamic memory minimum in GB (default 2).
 .PARAMETER MemoryStartupGB
-    Dynamic memory startup in GB (default 6).
+    Dynamic memory startup in GB (default 8, equal to the maximum).
 .PARAMETER MemoryMaximumGB
     Dynamic memory maximum in GB (default 8).
 .PARAMETER SwitchName
@@ -229,7 +229,7 @@ param(
     [ValidateRange(1, 4096)]
     [int]$MemoryMinimumGB = 2,
     [ValidateRange(1, 4096)]
-    [int]$MemoryStartupGB = 6,
+    [int]$MemoryStartupGB = 8,
     [ValidateRange(1, 4096)]
     [int]$MemoryMaximumGB = 8,
     [string]$SwitchName = '',
@@ -3819,14 +3819,17 @@ function Get-LabProvisioningVMHardware {
         throw "-VCpuCount $vCpuCount is outside 1-$($defaults.LogicalProcessorCount) (this host's logical processor count)."
     }
     $minimumBytes = [long](& $getOption 'MemoryMinimumGB' 2) * 1GB
-    # Startup default raised from 4 to 6 GB (confirmed live, 2026-10-21): Ubuntu Server's own
-    # first-boot burst of background work (cloud-init final modules, networkd-dispatcher,
-    # unattended-upgrades all competing at once) triggered the kernel OOM killer on a freshly
-    # provisioned VM before Hyper-V's dynamic memory could ramp up from 4 GB toward the 8 GB max --
-    # the VM still finished provisioning successfully, but killing systemd/networkd-dispatcher/
-    # unattended-upgrades under memory pressure right after boot is not something to leave as the
-    # default experience for any of the three provisioning flows that share this same default.
-    $startupBytes = [long](& $getOption 'MemoryStartupGB' 6) * 1GB
+    # Startup default raised to equal the maximum, 8 GB (confirmed live, 2026-10-21): a freshly
+    # provisioned Ubuntu Server VM hit a SUSTAINED kernel OOM storm -- systemd-networkd,
+    # systemd-resolved, polkitd, apparmor_parser, udev-worker and systemd itself repeatedly killed
+    # over more than a minute -- that an initial 4->6 GB bump did not address, because this host's
+    # dynamic-memory ramp-up for Linux guests cannot be assumed reliable (the same class of gap as
+    # this plan's own KVP/address-discovery finding: Hyper-V's VMBus-based signaling to and from a
+    # Linux guest is not something to depend on here). Starting at the full maximum sidesteps the
+    # ramp-up question entirely instead of trying to tune a ramp-up window that may never complete;
+    # the host's plentiful RAM (128 GB, confirmed with the project owner) makes this affordable
+    # across every provisioning flow that shares this default, not just this one.
+    $startupBytes = [long](& $getOption 'MemoryStartupGB' 8) * 1GB
     $maximumBytes = [long](& $getOption 'MemoryMaximumGB' 8) * 1GB
     if (-not (Test-LabMemorySpec $minimumBytes $startupBytes $maximumBytes $true)) {
         throw 'Memory must satisfy 0 < -MemoryMinimumGB <= -MemoryStartupGB <= -MemoryMaximumGB.'

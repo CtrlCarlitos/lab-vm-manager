@@ -4239,7 +4239,7 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     $core = $r.Args['New-LabVMCore']
     Assert-Equal $core.Name 'LAB-Win11'
     Assert-Equal $core.VCpuCount 2
-    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]6GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]8GB); Assert-Equal $core.MaximumBytes ([long]8GB)
     Assert-Equal $core.IsDynamic $true
     Assert-Equal $core.VhdxMaximumBytes ([long]150GB)
     Assert-Equal $core.SwitchName 'Default Switch'
@@ -5735,7 +5735,7 @@ Test-Case 'Provision Linux: happy path runs every phase once, in the documented 
     $core = $r.Args['New-LabVMCore']
     Assert-Equal $core.Name 'LAB-Ubuntu'
     Assert-Equal $core.VCpuCount 2
-    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]6GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]8GB); Assert-Equal $core.MaximumBytes ([long]8GB)
     Assert-Equal $core.VhdxMaximumBytes ([long]150GB)
     Assert-Equal $core.SwitchName 'Default Switch'
     Assert-Equal $r.Args['Set-LabVMBootProfile'] 'UbuntuDesktop'
