@@ -1862,14 +1862,19 @@ function Get-LabLinuxIsoInfo {
         # Plain string concatenation, not Join-Path, for the same drive-letter reason as above.
         $infoFile = "$($volume.DriveLetter):\.disk\info"
         if (-not (Test-Path -LiteralPath $infoFile -PathType Leaf)) {
-            return [pscustomobject]@{ ReleaseText = ''; IsUbuntuDesktopInScope = $false }
+            return [pscustomobject]@{ ReleaseText = ''; IsUbuntuDesktopInScope = $false; IsUbuntuServerInScope = $false }
         }
         $releaseText = [string](Get-Content -LiteralPath $infoFile -Raw -ErrorAction Stop)
         # In scope = Ubuntu 26.04.x Desktop: a release line that STARTS with "Ubuntu 26.04" (case-sensitive,
         # so Kubuntu/Xubuntu/Lubuntu 26.04 lines do not pass) and is not a Server release.
+        # Server's own release line starts "Ubuntu-Server 26.04.x" (hyphenated, confirmed live against
+        # the real ubuntu-26.04.1-live-server-amd64.iso) -- already distinct from Desktop's "Ubuntu
+        # 26.04" prefix, so no separate "-notmatch" exclusion is needed for it the way Desktop's own
+        # check excludes Server.
         return [pscustomobject]@{
             ReleaseText = $releaseText
             IsUbuntuDesktopInScope = ($releaseText -cmatch '^Ubuntu 26\.04(\.\d+)? LTS' -and $releaseText -notmatch 'Server')
+            IsUbuntuServerInScope = ($releaseText -cmatch '^Ubuntu-Server 26\.04(\.\d+)? LTS')
         }
     } finally {
         # Only dismount if Mount-DiskImage itself actually succeeded, for the same reason as above.
@@ -2525,7 +2530,7 @@ function Test-LabVMHasKeyProtector {
 }
 
 function Set-LabVMBootProfile {
-    param([guid]$VMId, [ValidateSet('Windows11', 'UbuntuDesktop')][string]$OsProfile)
+    param([guid]$VMId, [ValidateSet('Windows11', 'UbuntuDesktop', 'UbuntuServer')][string]$OsProfile)
     $vm = Assert-LabVMOff $VMId
     if ([int]$vm.Generation -ne 2) {
         throw "'$($vm.Name)' is Generation $($vm.Generation). Secure Boot and vTPM boot profiles require Generation 2."
@@ -2551,6 +2556,15 @@ function Set-LabVMBootProfile {
         }
         'UbuntuDesktop' {
             # Ubuntu's Secure Boot template never touches the key protector or vTPM.
+            $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
+            if ([string]$firmware.SecureBootTemplate -ne 'MicrosoftUEFICertificateAuthority') {
+                Set-VMFirmware -VM $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority -Confirm:$false -ErrorAction Stop
+                $secureBootTemplateChanged = $true
+            }
+        }
+        'UbuntuServer' {
+            # Same signing chain as UbuntuDesktop (PowerShell's switch has no fallthrough/grouping
+            # syntax, so this is a separate clause with an identical body, not a shared one).
             $firmware = Get-VMFirmware -VM $vm -ErrorAction Stop
             if ([string]$firmware.SecureBootTemplate -ne 'MicrosoftUEFICertificateAuthority') {
                 Set-VMFirmware -VM $vm -SecureBootTemplate MicrosoftUEFICertificateAuthority -Confirm:$false -ErrorAction Stop

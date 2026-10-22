@@ -304,6 +304,16 @@ Test-Case 'Set-LabVMBootProfile applies the Ubuntu Secure Boot template without 
     Assert-Equal $script:SetVMKeyProtectorCalls 0
     Assert-Equal $script:EnableVMTPMCalls 0
 }
+Test-Case 'Set-LabVMBootProfile UbuntuServer applies the same Secure Boot template as UbuntuDesktop, touches no key protector' {
+    $script:FakeFirmware.SecureBootTemplate = 'MicrosoftWindows'
+    $script:SetVMFirmwareCalls.Clear()
+    $script:SetVMKeyProtectorCalls = 0
+    $script:EnableVMTPMCalls = 0
+    $result = Set-LabVMBootProfile $script:FakeId 'UbuntuServer'
+    Assert-Equal $script:SetVMFirmwareCalls[-1] 'MicrosoftUEFICertificateAuthority'
+    Assert-Equal $script:SetVMKeyProtectorCalls 0
+    Assert-Equal $script:EnableVMTPMCalls 0
+}
 Test-Case 'Set-LabVMBootProfile turns Secure Boot on when it is Off, for both profiles' {
     foreach ($osProfileName in @('Windows11', 'UbuntuDesktop')) {
         $script:FakeFirmware.SecureBoot = 'Off'
@@ -4760,6 +4770,31 @@ Test-Case 'Get-LabLinuxIsoInfo: Kubuntu, Xubuntu and Lubuntu 26.04 releases are 
     Reset-LabLinuxIsoFakes
     $script:FakeLinuxInfoText = 'Ubuntu 26.04 LTS "Example" - Release amd64'
     Assert-Equal (Get-LabLinuxIsoInfo 'C:\iso\ubuntu.iso').IsUbuntuDesktopInScope $true
+}
+Test-Case 'Get-LabLinuxIsoInfo: Ubuntu-Server 26.04.x is in scope for Server, not Desktop' {
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoText = 'Ubuntu-Server 26.04.1 LTS "Resolute Raccoon" - Release amd64 (20260826)'
+    $info = Get-LabLinuxIsoInfo 'C:\iso\server.iso'
+    Assert-Equal $info.IsUbuntuServerInScope $true
+    Assert-Equal $info.IsUbuntuDesktopInScope $false
+}
+Test-Case 'Get-LabLinuxIsoInfo: Ubuntu Desktop 26.04.x is NOT in scope for Server' {
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoText = 'Ubuntu 26.04.1 LTS "Example" - Release amd64'
+    $info = Get-LabLinuxIsoInfo 'C:\iso\ubuntu.iso'
+    Assert-Equal $info.IsUbuntuServerInScope $false
+}
+Test-Case 'Get-LabLinuxIsoInfo: Kubuntu/Xubuntu/Lubuntu-Server-ish strings are never in scope for Server (anchored, case-sensitive match)' {
+    foreach ($text in @('Kubuntu-Server 26.04.1 LTS "Example" - Release amd64', 'Xubuntu-Server 26.04 LTS "Example" - Release amd64',
+            'Lubuntu-Server 26.04.1 LTS "Example" - Release amd64', 'ubuntu-server 26.04.1 LTS "Example" - Release amd64')) {
+        Reset-LabLinuxIsoFakes
+        $script:FakeLinuxInfoText = $text
+        $info = Get-LabLinuxIsoInfo 'C:\iso\flavor.iso'
+        Assert-Equal $info.IsUbuntuServerInScope $false
+    }
+    Reset-LabLinuxIsoFakes
+    $script:FakeLinuxInfoText = 'Ubuntu-Server 26.04 LTS "Example" - Release amd64'
+    Assert-Equal (Get-LabLinuxIsoInfo 'C:\iso\server.iso').IsUbuntuServerInScope $true
 }
 Test-Case 'Get-LabLinuxIsoInfo: a mounted ISO with no .disk/info returns empty ReleaseText and no error' {
     Reset-LabLinuxIsoFakes

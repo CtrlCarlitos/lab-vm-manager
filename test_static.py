@@ -812,6 +812,10 @@ class SourceContract(unittest.TestCase):
         body = self.s.split('function Get-LabLinuxIsoInfo {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn('26.04', body)
         self.assertIn('Desktop', body)
+    def test_server_scope_regex_excludes_variants_and_desktop(self):
+        body = self.s.split('function Get-LabLinuxIsoInfo {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn("IsUbuntuServerInScope", body)
+        self.assertIn(r"-cmatch '^Ubuntu-Server 26\.04(\.\d+)? LTS'", body)
 
     # --- Linux unattended install, Task 2: autoinstall-parameter GRUB patch ---
     def test_linux_boot_patch_function_exists(self):
