@@ -11,7 +11,7 @@ A standalone menu-driven PowerShell script for managing **local Hyper-V VMs whos
 - `MANUAL-TESTS.md`: acceptance checklist for a disposable VM.
 - `test_static.py`: source-level regression checks; optional, requires Python.
 
-The script has been source-reviewed: all 114 `test_static.py` source-contract checks pass, and all 197 `Test-LabVM.ps1` helper tests pass in Windows PowerShell 5.1. An earlier version (before the Create, Edit and Delete VM workflows were added) was exercised live against real Hyper-V VMs (inventory, `-ReadOnly` mode, and checkpoint creation all confirmed working). The full `MANUAL-TESTS.md` checklist — restore, rename, checkpoint deletion, export, concurrency and shutdown-failure scenarios, and the new Create VM, Edit VM settings and Delete VM workflows — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
+The script has been source-reviewed: all 249 `test_static.py` source-contract checks pass, and all 411 `Test-LabVM.ps1` helper tests pass in Windows PowerShell 5.1. It has also been exercised live against real Hyper-V VMs well beyond the original inventory/`-ReadOnly`/checkpoint checks: the Windows 11, Ubuntu Desktop and Ubuntu Server unattended installs (`W`/`L`/`S`) have each been confirmed end to end on real ISOs, including both boot cycles, SSH/PowerShell Direct completion checks and the guest-desktop/home-directory completion note (see `MANUAL-TESTS.md` for exactly what each confirmation covers and what, within each flow, is not yet covered). The rest of the full `MANUAL-TESTS.md` checklist — restore, rename, checkpoint deletion, export, concurrency and shutdown-failure scenarios — has not yet been walked end-to-end. Validate those remaining paths on one disposable `LAB-*` VM before relying on them for anything you care about.
 
 ## Start
 
@@ -61,6 +61,28 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\Lab-VM.ps1 -Read
 ```
 
 This does not persist a machine/user policy change and cannot override an organization's Group Policy. Do not change organizational policy to run this tool.
+
+## Getting started: your first VM
+
+This walks through the fastest path to one working, disposable `LAB-` VM, assuming you have already done the "Start" steps above (unblocked the scripts, run the tests, and confirmed `-ReadOnly` shows your existing inventory). It does not replace the "Menus" and "Parameter mode" sections below -- it is the shortest route to a first result, with pointers into the full reference once you want to change a default.
+
+1. **Pick an OS and launch the manager normally** (no `-ReadOnly`):
+
+   ```powershell
+   powershell.exe -NoProfile -File .\Lab-VM.ps1
+   ```
+
+   At the menu, type `W` for Windows 11, `L` for Ubuntu Desktop, or `S` for Ubuntu Server. All three need an installer ISO under `-IsoRoot` (default `E:\ISO`) -- the manager lists what it finds there and lets you pick one. If you have no ISO yet, cancel out, download one, and come back.
+
+2. **Answer the handful of prompts** (VM name, which ISO/edition, the guest account credential) and review the single combined preview it shows before anything is created. Nothing exists on disk until you answer `Y` to the `[Y/n/cancel]` confirmation -- cancel freely to re-pick a value, or rerun later with the matching parameter (e.g. `-ProvisionLinuxVM -ComputerName myhost`) to skip a prompt next time.
+
+3. **Wait.** The VM installs its OS with zero further console interaction, reboots once cleanup finishes, and boots a second time to prove it comes up cleanly on its own -- typically under 30 minutes, bounded by `-ProvisioningTimeoutSeconds` (default 1800 s per boot). Progress prints as `Done: <step>` lines; do not touch the VM's console while this runs.
+
+4. **Connect to it.** A Windows VM is signed in automatically on its first boot (the account and password you supplied); for later sessions, use Hyper-V Manager's console or your own RDP setup. A Linux VM (`L`/`S`) saves its SSH connection automatically -- from the main menu, select the VM and choose `T` ("Test connection") to confirm it right away with no extra setup, then option `13`/`14` to copy files to or from it.
+
+5. **When you are done with it**, select the VM from the main menu and choose option `12` to delete it. This unregisters the VM but keeps its virtual disk file; delete that yourself from Hyper-V Manager or File Explorer once you are sure you do not need it.
+
+From here, "Menus" below documents every option in full (including the fully manual `N` / Create VM path, for when you want to attach existing media yourself instead of an unattended install), and the "Parameter mode" sections document every `-Provision*VM` parameter for scripting a repeatable setup instead of answering prompts each time.
 
 ## Menus
 
