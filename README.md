@@ -122,6 +122,17 @@ Creates a new `LAB-` VM and installs **Ubuntu Desktop 26.04.x** on it with no co
 
 **If a step fails** after the VM exists, the error lists every step already applied and the VM is left exactly as it is (no power-off, no deletion). **The provisioning workspace is kept**, and the error gives its path; once the seed ISO is built it **contains the account password in plain text** (in the `user-data` inside `seed.iso`). The error also names the kept SSH key, and **no SSH connection settings are saved by a failed run** -- they are written only as the very last step, after the second login succeeds. Inspect the VM, then delete the workspace (and, if you discard the VM, the key files) yourself. An interrupted run (Ctrl+C) prints the same summary.
 
+### Provision Ubuntu Server VM (`S`)
+
+Creates a new `LAB-` VM and installs **Ubuntu Server 26.04.x** on it with no console interaction, ending with the VM installed, running, proven to boot on its own, and **reachable over SSH with settings already saved** for it. It is the Server peer of `L` and shares nearly all of its mechanics unchanged (the same ISO-patching, boot-order, address-discovery and cleanup code -- none of it was ever Desktop-specific); the same flow runs from the command line with `-ProvisionLinuxServerVM` (see "Parameter mode: Linux Server unattended install" below). Two differences from `L`:
+
+- **Scope is Ubuntu Server 26.04.x**, not Desktop: the ISO's `.disk/info` must start with `Ubuntu-Server 26.04` (hyphenated); any other release, Ubuntu Desktop, or an ISO without that file is refused before any VM is created.
+- **No desktop environment, so the completion note goes to the account's home directory**, not `~/Desktop` -- it lands at `~/lab-vm-manager-provisioning-note.txt` over SFTP, with no `-mkdir` needed.
+
+Everything else matches `L` exactly: the same shared VM-hardware defaults, the same two-DVD attach/boot-order/cleanup mechanics, the same ephemeral SSH key lifecycle and two-phase host-key trust (including the second wait being pinned to the first login's verified key), and the same `UbuntuServer` boot profile (identical Secure Boot template to `UbuntuDesktop`). The computer-name default is `lab-agent-srv` (distinct from `L`'s `lab-agent-test`, so the two don't collide if both are created with defaults), and `-SwitchName ''` (Disconnected) is refused for the same reason as `L` (the completion check is an SSH login over the network). Audit records use `provision-linux-server-vm` instead of `provision-linux-vm`.
+
+**If a step fails**, the same guarantees as `L` apply: every step already applied is listed, the VM is left exactly as it is, the workspace (and its plain-text password) is kept with its path named, the kept SSH key is named, and no SSH connection settings are saved by a failed run.
+
 The selected-VM menu provides:
 
 | Choice | Operation |
@@ -307,6 +318,28 @@ Parameters (all optional unless noted):
 
 Exit code: `0` only when the whole flow completed (both SSH logins proven and the connection settings saved). A refusal (including an out-of-scope ISO), a failure, or an interactive cancel exits `1`. The same host assertion and `session` `STARTED`/`ENDED` audit records as the other parameter modes are written, plus the `provision-linux-vm` records described above. Under `-ReadOnly`, it creates nothing and exits `1`.
 
+## Parameter mode: Linux Server unattended install
+
+Pass `-ProvisionLinuxServerVM` to run the `S` flow (see "Provision Ubuntu Server VM (`S`)" above) from the command line and exit, instead of launching the menu. Without `-NonInteractive`, anything not supplied is asked for the same way `S` asks: ISO picker, VM name, credential prompt, and the single confirmation.
+
+```powershell
+$cred = Get-Credential -UserName labagent -Message 'Guest Linux account'
+& .\Lab-VM.ps1 -ProvisionLinuxServerVM -NewVMName LAB-ubuntu-srv -LinuxServerIsoPath E:\ISO\ubuntu-26.04.1-live-server-amd64.iso -NonInteractive -Credential $cred
+```
+
+Parameters (all optional unless noted; this mode has its own `-LinuxServerIsoPath`/`-LinuxServerTimeZone`, never shared with `-ProvisionLinuxVM`'s `-LinuxIsoPath`/`-LinuxTimeZone`):
+
+- `-ProvisionLinuxServerVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM`, `-CopyFromVM`, `-ProvisionWindowsVM` and `-ProvisionLinuxVM` (exit `1` before anything runs).
+- `-LinuxServerIsoPath` -- the Ubuntu Server 26.04.x ISO. Default: `''`, which means pick one under `-IsoRoot`.
+- `-LinuxServerTimeZone` -- the guest time zone as an **IANA zone ID**, same rules and default (`'America/Guatemala'`) as `-LinuxTimeZone`.
+- `-Locale` -- shared with the other provisioning modes; for Linux it is a POSIX locale such as `en_US.UTF-8` (the default when omitted) or `C.UTF-8`.
+- `-NewVMName`, `-ComputerName` (default `'lab-agent-srv'`, same 1-15 letters/digits/hyphens rule as Windows/Desktop, plus the Linux-only no-leading/trailing-hyphen rule), `-VCpuCount`, `-MemoryMinimumGB`/`-MemoryStartupGB`/`-MemoryMaximumGB`, `-VhdxSizeGB`, `-SwitchName`, `-VmStorageRoot`, `-VhdxStorageRoot` -- shared with the other provisioning modes, same meaning and defaults, except that `-SwitchName ''` (Disconnected) is refused here too.
+- `-ProvisioningTimeoutSeconds` -- default `1800` (300-7200): how long each of the two SSH-login waits may take.
+- `-Credential` -- the new guest account, built with `Get-Credential` in the calling session; its user name must be a valid Linux account name. Without it, you are prompted after the VM is created.
+- `-NonInteractive` -- never prompt. Then `-NewVMName`, `-LinuxServerIsoPath` and `-Credential` are required, and a run missing any of them exits `1` before any VM exists.
+
+Exit code: `0` only when the whole flow completed (both SSH logins proven and the connection settings saved). A refusal (including an out-of-scope ISO), a failure, or an interactive cancel exits `1`. The same host assertion and `session` `STARTED`/`ENDED` audit records as the other parameter modes are written, plus the `provision-linux-server-vm` records described above. Under `-ReadOnly`, it creates nothing and exits `1`.
+
 ## First baseline
 
 1. Install/update the guest, finish required reboots, and shut it down **normally**.
@@ -380,7 +413,7 @@ This task's investigation produced two empirical findings, recorded here as fact
 
 Those findings produce a two-mode authentication design: `-o BatchMode=yes` plus a configured identity file for noninteractive/key-based transfers (never prompts; fails cleanly without a usable key), and an invocation that leaves the console's input and error streams to OpenSSH (with `-o BatchMode=no` stated explicitly) for an interactive, password-authenticated connection, so OpenSSH's own native password prompt reaches the operator directly. The explicit `BatchMode=no` matters for `sftp`: its `-b` batch-file option silently passes `-oBatchMode yes` to its own `ssh` child (upstream `sftp.c` does this, and the bundled `sftp.exe` contains that string, although the man page does not mention it), which would switch password authentication off. Because `ssh` keeps the first value it sees for an option, the manager passes `-o BatchMode=no` *before* `-b`.
 
-Both modes use `StrictHostKeyChecking=yes` on every connection that moves data or tests the connection: an unknown or changed host key is refused outright, never prompted for. Trusting a new guest's key is a separate, explicit action (option `K`, below), the only place `StrictHostKeyChecking=ask` is used. The one documented exception is the Linux unattended-install action (`L` / `-ProvisionLinuxVM`): during its own completion check, and only against the VM it just created and that authenticated with that VM's own freshly minted key, it trusts the new guest's host key on first connect (`StrictHostKeyChecking=accept-new`, narrowly scoped; see "Provision Ubuntu Desktop VM (`L`)" above). No human is at a console yet to compare fingerprints at that point. Nothing else trusts an unknown key without option `K`.
+Both modes use `StrictHostKeyChecking=yes` on every connection that moves data or tests the connection: an unknown or changed host key is refused outright, never prompted for. Trusting a new guest's key is a separate, explicit action (option `K`, below), the only place `StrictHostKeyChecking=ask` is used. The documented exception is the two unattended-install actions (`L` / `-ProvisionLinuxVM` and `S` / `-ProvisionLinuxServerVM`): during their own completion check, and only against the VM each just created and that authenticated with that VM's own freshly minted key, they trust the new guest's host key on first connect (`StrictHostKeyChecking=accept-new`, narrowly scoped; see "Provision Ubuntu Desktop VM (`L`)" and "Provision Ubuntu Server VM (`S`)" above). No human is at a console yet to compare fingerprints at that point. Nothing else trusts an unknown key without option `K`.
 
 **Directory-merge-into-existing-destination limitation** (restated from the Global Constraints): `sftp`'s batch vocabulary has no recursive delete and no built-in tree-merge primitive, and OpenSSH's own documented behavior for nested symlinks under `put -r`/`get -r` is not independently verified by this plan without a live guest. See `MANUAL-TESTS.md` for the specific live-verification step this gap requires before the limitation note can be removed or narrowed in a future version.
 
@@ -396,7 +429,7 @@ On failure in `KeyAgent` mode, the warning includes the last lines of `sftp`'s o
 
 ### First connection: trusting the guest's host key (`K`)
 
-Every connection the manager makes for a transfer or connection test uses `StrictHostKeyChecking=yes`, which never asks about a host key: a guest whose key is not yet in your `~/.ssh/known_hosts` is refused ("Host key verification failed", exit `255`). So before the first `T` or transfer to a new Linux guest, trust its key once with menu option `K` (`Add-LabSshKnownHost`). A VM created by `L` / `-ProvisionLinuxVM` is the one exception: its unattended install already recorded the guest's host key, after the VM authenticated with its own freshly minted key, so `K` is not needed for it. For any other guest:
+Every connection the manager makes for a transfer or connection test uses `StrictHostKeyChecking=yes`, which never asks about a host key: a guest whose key is not yet in your `~/.ssh/known_hosts` is refused ("Host key verification failed", exit `255`). So before the first `T` or transfer to a new Linux guest, trust its key once with menu option `K` (`Add-LabSshKnownHost`). A VM created by `L` / `-ProvisionLinuxVM` or `S` / `-ProvisionLinuxServerVM` is the exception: its unattended install already recorded the guest's host key, after the VM authenticated with its own freshly minted key, so `K` is not needed for it. For any other guest:
 
 1. Select the VM (it must be `Running` and have saved SSH settings, from `C` or `-ConfigureSsh`) and choose `K`. The manager explains what will happen, including the command to read the guest's own fingerprint on its console: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
 2. Type the exact `TRUST HOST KEY <host>` confirmation. Anything else cancels: no connection is made and `known_hosts` is not changed.

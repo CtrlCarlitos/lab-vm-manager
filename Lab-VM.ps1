@@ -14,8 +14,9 @@
     surface that runs one transfer and exits; see README.md ("Parameter
     mode: file transfer") for the full parameter list and examples. A new
     LAB- VM can also be created with Windows 11 installed unattended (menu W,
-    or -ProvisionWindowsVM), or with Ubuntu Desktop 26.04.x installed unattended
-    (menu L, or -ProvisionLinuxVM). Other guest provisioning, credential copying, and
+    or -ProvisionWindowsVM), with Ubuntu Desktop 26.04.x installed unattended
+    (menu L, or -ProvisionLinuxVM), or with Ubuntu Server 26.04.x installed unattended
+    (menu S, or -ProvisionLinuxServerVM). Other guest provisioning, credential copying, and
     disk file deletion are not implemented. This is an operator tool, not a security boundary against
     another administrator or an untrusted guest.
 
