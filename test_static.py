@@ -938,12 +938,20 @@ class SourceContract(unittest.TestCase):
         branch = code.split('} elseif ($probeOutput -match $hostKeyRefusedPattern) {', 1)[1].split('} else {', 1)[0]
         self.assertNotIn('throw', branch)
         self.assertIn('Write-Warning', branch)
-    def test_linux_note_batch_uses_forward_slashes_and_home_relative_desktop(self):
+    def test_linux_note_batch_uses_forward_slashes_and_conditional_mkdir(self):
         code = self._code(self._body('Write-LabLinuxProvisioningNote'))
         self.assertIn("$localPath.Replace('\\', '/')", code)
-        self.assertIn('-mkdir Desktop`nput ', code)
-        self.assertIn('Desktop/lab-vm-manager-provisioning-note.txt', code)
+        # -mkdir is only emitted when $RemoteRelativePath actually names a directory (generalized
+        # for Task 3's home-directory-only Server call site, which needs no -mkdir at all).
+        self.assertIn("Split-Path -Parent $RemoteRelativePath", code)
+        self.assertIn('-mkdir `"$remoteDir`"', code)
+        self.assertIn('`"$RemoteRelativePath`"', code)
         self.assertNotIn('~/Desktop', code)
+    def test_linux_note_desktop_call_site_names_its_own_remote_path(self):
+        # Desktop's own exact pre-existing destination now travels as an explicit argument at its
+        # one call site, rather than being hardcoded inside the function itself.
+        body = self._body('Start-LabLinuxVMProvisioning')
+        self.assertIn("-RemoteRelativePath 'Desktop/lab-vm-manager-provisioning-note.txt'", body)
 
     # --- Windows unattended install, Task 3: two-drive media attach and post-install cleanup ---
     def test_unattended_media_functions_exist(self):

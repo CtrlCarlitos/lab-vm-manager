@@ -2932,16 +2932,34 @@ Test-Case 'Write-LabLinuxProvisioningNote delivers the exact content via a KeyAg
             return [pscustomobject]@{ ExitCode = 0; Output = [string[]]@() }
         }
         foreach ($sb in (Import-LabRealFunction 'Write-LabLinuxProvisioningNote')) { . $sb }
-        Write-LabLinuxProvisioningNote 'guest.invalid' 'labuser' 'C:\keys\id_eph' 'Provisioning complete. SSH key below.'
+        Write-LabLinuxProvisioningNote 'guest.invalid' 'labuser' 'C:\keys\id_eph' 'Desktop/lab-vm-manager-provisioning-note.txt' 'Provisioning complete. SSH key below.'
         Assert-Equal $script:CapturedAuthMode 'KeyAgent'
         $lines = @($script:CapturedBatchContent -split "`n" | Where-Object { $_ })
         Assert-Equal $lines.Count 2
         # -mkdir first (the '-' keeps the batch going when Desktop already exists), then the put.
-        Assert-Equal $lines[0] '-mkdir Desktop'
+        # This is Desktop's own pre-existing behavior (now passed explicitly via -RemoteRelativePath
+        # instead of hardcoded inside the function) -- byte for byte unchanged.
+        Assert-Equal $lines[0] '-mkdir "Desktop"'
         Assert-Equal ($lines[1] -match '^put\s+"([^"]+)"\s+"Desktop/lab-vm-manager-provisioning-note\.txt"$') $true
         # sftp's batch parser treats '\' as an escape: the local path uses forward slashes only.
         Assert-Equal ($lines[1].Contains('\')) $false
         Assert-Equal $script:CapturedLocalContent 'Provisioning complete. SSH key below.'
+    }
+}
+Test-Case 'Write-LabLinuxProvisioningNote: a bare filename (no directory) skips -mkdir' {
+    & {
+        $script:CapturedBatchContent = $null
+        function Invoke-LabSftpCommand {
+            param($HostNameOrAddress, $Port, $UserName, $IdentityFilePath, $BatchFilePath, $AuthMode)
+            $script:CapturedBatchContent = Get-Content -LiteralPath $BatchFilePath -Raw
+            return [pscustomobject]@{ ExitCode = 0; Output = [string[]]@() }
+        }
+        foreach ($sb in (Import-LabRealFunction 'Write-LabLinuxProvisioningNote')) { . $sb }
+        Write-LabLinuxProvisioningNote 'guest.invalid' 'labuser' 'C:\keys\id_eph' 'lab-vm-manager-provisioning-note.txt' 'Home-directory note.'
+        $lines = @($script:CapturedBatchContent -split "`n" | Where-Object { $_ })
+        Assert-Equal $lines.Count 1
+        Assert-Equal ($lines[0] -match '-mkdir') $false
+        Assert-Equal ($lines[0] -match '^put\s+"([^"]+)"\s+"lab-vm-manager-provisioning-note\.txt"$') $true
     }
 }
 

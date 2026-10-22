@@ -3052,7 +3052,7 @@ function Write-LabLinuxProvisioningNote {
     # authenticated with this VM's own key and committed the guest's verified host key to known_hosts,
     # so Invoke-LabSftpCommand's own unmodified, always-strict host key check succeeds here without any
     # relaxed setting of its own.
-    param([string]$HostNameOrAddress, [string]$UserName, [string]$IdentityFilePath, [string]$Content)
+    param([string]$HostNameOrAddress, [string]$UserName, [string]$IdentityFilePath, [string]$RemoteRelativePath, [string]$Content)
     $localPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-linux-note-' + [guid]::NewGuid().ToString('N') + '.txt')
     $batchPath = Join-Path ([IO.Path]::GetTempPath()) ('lab-linux-note-' + [guid]::NewGuid().ToString('N') + '.batch')
     try {
@@ -3060,8 +3060,13 @@ function Write-LabLinuxProvisioningNote {
         # sftp's batch parser treats '\' as an escape character, so the local path uses forward slashes
         # (the same convention as the transfer code). The remote path is relative: sftp starts in the
         # user's home directory, and an older client may send '~' literally instead of expanding it.
-        # '-mkdir': the leading '-' lets the batch continue when Desktop already exists.
-        $batch = "-mkdir Desktop`nput `"$($localPath.Replace('\', '/'))`" `"Desktop/lab-vm-manager-provisioning-note.txt`"`n"
+        # '-mkdir': the leading '-' lets the batch continue when the directory already exists. Only
+        # issued when $RemoteRelativePath actually names a directory (Desktop's own call site) -- a
+        # bare filename (Server's own call site, straight into the home directory) needs no -mkdir.
+        $remoteDir = Split-Path -Parent $RemoteRelativePath
+        $remoteDir = $remoteDir -replace '\\', '/'
+        $mkdirLine = if ($remoteDir -ne '') { "-mkdir `"$remoteDir`"`n" } else { '' }
+        $batch = "$mkdirLine" + "put `"$($localPath.Replace('\', '/'))`" `"$RemoteRelativePath`"`n"
         [IO.File]::WriteAllText($batchPath, $batch)
         $result = Invoke-LabSftpCommand $HostNameOrAddress 22 $UserName $IdentityFilePath $batchPath 'KeyAgent'
         if ($result.ExitCode -ne 0) {
@@ -4379,7 +4384,7 @@ function Start-LabLinuxVMProvisioning {
                 'deleted its host-side copy of the autoinstall user-data, and started the VM again. SSH access uses a key',
                 'the host generated for this VM only; the host saves it as this VM''s SSH connection once the restart is confirmed.'
             ) -join "`n") + "`n"
-            Write-LabLinuxProvisioningNote -HostNameOrAddress $firstAddress -UserName $accountName -IdentityFilePath $keyPair.PrivateKeyPath -Content $note
+            Write-LabLinuxProvisioningNote -HostNameOrAddress $firstAddress -UserName $accountName -IdentityFilePath $keyPair.PrivateKeyPath -RemoteRelativePath 'Desktop/lab-vm-manager-provisioning-note.txt' -Content $note
             $done.Add('completion note written to the guest desktop')
             Request-LabVMGuestShutdown $vmId 'LAB VM Manager: Ubuntu unattended install finished; removing install media'
             # Same 1800-second floor as the Windows action's first post-install shutdown, for the same reason.
