@@ -4239,7 +4239,7 @@ Test-Case 'Provision: happy path runs every phase once, in the documented order,
     $core = $r.Args['New-LabVMCore']
     Assert-Equal $core.Name 'LAB-Win11'
     Assert-Equal $core.VCpuCount 2
-    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]8GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]4GB); Assert-Equal $core.MaximumBytes ([long]8GB)
     Assert-Equal $core.IsDynamic $true
     Assert-Equal $core.VhdxMaximumBytes ([long]150GB)
     Assert-Equal $core.SwitchName 'Default Switch'
@@ -5731,11 +5731,13 @@ Test-Case 'Provision Linux: happy path runs every phase once, in the documented 
     if ([string]$seed.Files['meta-data'] -notmatch 'instance-id: ' -or [string]$seed.Files['meta-data'] -notmatch 'local-hostname: lab-agent-test') {
         throw "Unexpected meta-data: $($seed.Files['meta-data'])"
     }
-    # Shared VM hardware defaults, identical to the Windows action's.
+    # Shared VM hardware defaults, same vCPU/VHDX/switch as the Windows action's, but static memory
+    # (not dynamic): Hyper-V's dynamic-memory demand signal for a Linux guest cannot be trusted on this host.
     $core = $r.Args['New-LabVMCore']
     Assert-Equal $core.Name 'LAB-Ubuntu'
     Assert-Equal $core.VCpuCount 2
-    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]8GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]4GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.IsDynamic $false
     Assert-Equal $core.VhdxMaximumBytes ([long]150GB)
     Assert-Equal $core.SwitchName 'Default Switch'
     Assert-Equal $r.Args['Set-LabVMBootProfile'] 'UbuntuDesktop'
@@ -6063,6 +6065,10 @@ Test-Case 'Provision Linux Server: happy path runs every phase once, UbuntuServe
     Assert-Equal ($r.Calls -join ' > ') ($script:LinuxServerProvHappyOrder -join ' > ')
     Assert-Equal $r.Args['Set-LabVMBootProfile'] 'UbuntuServer'
     Assert-Equal $r.Args['Write-LabLinuxProvisioningNote'].RemoteRelativePath 'lab-vm-manager-provisioning-note.txt'
+    # Static memory, not dynamic: same fix as the Desktop action, same untrustworthy demand signal.
+    $core = $r.Args['New-LabVMCore']
+    Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]4GB); Assert-Equal $core.MaximumBytes ([long]8GB)
+    Assert-Equal $core.IsDynamic $false
 }
 Test-Case 'Provision Linux Server: an out-of-scope ISO is refused, naming what was found, before any VM is created' {
     $r = Invoke-LabLinuxServerProvisioningScenario @{ NewVMName = 'LAB-Ubuntu-Srv' } -InScope $false

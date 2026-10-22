@@ -135,7 +135,9 @@
 .PARAMETER MemoryMinimumGB
     Dynamic memory minimum in GB (default 2).
 .PARAMETER MemoryStartupGB
-    Dynamic memory startup in GB (default 8, equal to the maximum).
+    Memory startup/fixed size in GB (default 4). Dynamic for -ProvisionWindowsVM; a genuine fixed
+    allocation (not a dynamic starting point) for -ProvisionLinuxVM/-ProvisionLinuxServerVM, since
+    Hyper-V's dynamic-memory demand signal for a Linux guest cannot be trusted on this host.
 .PARAMETER MemoryMaximumGB
     Dynamic memory maximum in GB (default 8).
 .PARAMETER SwitchName
@@ -229,7 +231,7 @@ param(
     [ValidateRange(1, 4096)]
     [int]$MemoryMinimumGB = 2,
     [ValidateRange(1, 4096)]
-    [int]$MemoryStartupGB = 8,
+    [int]$MemoryStartupGB = 4,
     [ValidateRange(1, 4096)]
     [int]$MemoryMaximumGB = 8,
     [string]$SwitchName = '',
@@ -3819,17 +3821,7 @@ function Get-LabProvisioningVMHardware {
         throw "-VCpuCount $vCpuCount is outside 1-$($defaults.LogicalProcessorCount) (this host's logical processor count)."
     }
     $minimumBytes = [long](& $getOption 'MemoryMinimumGB' 2) * 1GB
-    # Startup default raised to equal the maximum, 8 GB (confirmed live, 2026-10-21): a freshly
-    # provisioned Ubuntu Server VM hit a SUSTAINED kernel OOM storm -- systemd-networkd,
-    # systemd-resolved, polkitd, apparmor_parser, udev-worker and systemd itself repeatedly killed
-    # over more than a minute -- that an initial 4->6 GB bump did not address, because this host's
-    # dynamic-memory ramp-up for Linux guests cannot be assumed reliable (the same class of gap as
-    # this plan's own KVP/address-discovery finding: Hyper-V's VMBus-based signaling to and from a
-    # Linux guest is not something to depend on here). Starting at the full maximum sidesteps the
-    # ramp-up question entirely instead of trying to tune a ramp-up window that may never complete;
-    # the host's plentiful RAM (128 GB, confirmed with the project owner) makes this affordable
-    # across every provisioning flow that shares this default, not just this one.
-    $startupBytes = [long](& $getOption 'MemoryStartupGB' 8) * 1GB
+    $startupBytes = [long](& $getOption 'MemoryStartupGB' 4) * 1GB
     $maximumBytes = [long](& $getOption 'MemoryMaximumGB' 8) * 1GB
     if (-not (Test-LabMemorySpec $minimumBytes $startupBytes $maximumBytes $true)) {
         throw 'Memory must satisfy 0 < -MemoryMinimumGB <= -MemoryStartupGB <= -MemoryMaximumGB.'
@@ -4257,7 +4249,7 @@ function Start-LabLinuxVMProvisioning {
         VhdxPath = $hardware.VhdxPath
         VhdxMaximumGiB = $vhdxSizeGB
         VCpuCount = $hardware.VCpuCount
-        DynamicMemoryGiB = '{0} min / {1} startup / {2} max' -f ($hardware.MinimumBytes / 1GB), ($hardware.StartupBytes / 1GB), ($hardware.MaximumBytes / 1GB)
+        MemoryGiB = '{0} GB static (not dynamic)' -f ($hardware.StartupBytes / 1GB)
         Switch = $switchName
         Generation = 2
         CheckpointPolicy = 'Standard; automatic checkpoints disabled'
@@ -4295,9 +4287,17 @@ function Start-LabLinuxVMProvisioning {
         catch [Threading.AbandonedMutexException] { $createHeld = $true }
         if (-not $createHeld) { throw 'Another copy of this script is already creating a VM with this name. No operation was started here.' }
         try {
+            # Static memory, not dynamic (confirmed live, 2026-10-21): this VM's own Hyper-V-reported
+            # MemoryDemand sat at a small fraction of what the guest was actually using while it
+            # deadlocked from real memory starvation -- ballooning's demand signal for this Linux
+            # guest cannot be trusted on this host, so -StartupBytes is used as a genuine fixed
+            # allocation instead of a dynamic starting point Hyper-V might shrink out from under it.
+            # -MinimumBytes/-MaximumBytes are passed through unused by Hyper-V under static memory,
+            # kept only so -MemoryMinimumGB/-MemoryMaximumGB stay meaningful if dynamic is ever
+            # reintroduced here; -MemoryStartupGB alone is what this VM actually gets.
             $vm = New-LabVMCore -Name $name -VmStoragePath $hardware.VmStoragePath -VCpuCount $hardware.VCpuCount `
                 -MinimumBytes $hardware.MinimumBytes -StartupBytes $hardware.StartupBytes -MaximumBytes $hardware.MaximumBytes `
-                -IsDynamic $true -VhdxPath $hardware.VhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName
+                -IsDynamic $false -VhdxPath $hardware.VhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName
         } catch [Management.Automation.PipelineStoppedException] {
             throw
         } catch {
@@ -4565,7 +4565,7 @@ function Start-LabLinuxServerVMProvisioning {
         VhdxPath = $hardware.VhdxPath
         VhdxMaximumGiB = $vhdxSizeGB
         VCpuCount = $hardware.VCpuCount
-        DynamicMemoryGiB = '{0} min / {1} startup / {2} max' -f ($hardware.MinimumBytes / 1GB), ($hardware.StartupBytes / 1GB), ($hardware.MaximumBytes / 1GB)
+        MemoryGiB = '{0} GB static (not dynamic)' -f ($hardware.StartupBytes / 1GB)
         Switch = $switchName
         Generation = 2
         CheckpointPolicy = 'Standard; automatic checkpoints disabled'
@@ -4603,9 +4603,17 @@ function Start-LabLinuxServerVMProvisioning {
         catch [Threading.AbandonedMutexException] { $createHeld = $true }
         if (-not $createHeld) { throw 'Another copy of this script is already creating a VM with this name. No operation was started here.' }
         try {
+            # Static memory, not dynamic (confirmed live, 2026-10-21): this VM's own Hyper-V-reported
+            # MemoryDemand sat at a small fraction of what the guest was actually using while it
+            # deadlocked from real memory starvation -- ballooning's demand signal for this Linux
+            # guest cannot be trusted on this host, so -StartupBytes is used as a genuine fixed
+            # allocation instead of a dynamic starting point Hyper-V might shrink out from under it.
+            # -MinimumBytes/-MaximumBytes are passed through unused by Hyper-V under static memory,
+            # kept only so -MemoryMinimumGB/-MemoryMaximumGB stay meaningful if dynamic is ever
+            # reintroduced here; -MemoryStartupGB alone is what this VM actually gets.
             $vm = New-LabVMCore -Name $name -VmStoragePath $hardware.VmStoragePath -VCpuCount $hardware.VCpuCount `
                 -MinimumBytes $hardware.MinimumBytes -StartupBytes $hardware.StartupBytes -MaximumBytes $hardware.MaximumBytes `
-                -IsDynamic $true -VhdxPath $hardware.VhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName
+                -IsDynamic $false -VhdxPath $hardware.VhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName
         } catch [Management.Automation.PipelineStoppedException] {
             throw
         } catch {
