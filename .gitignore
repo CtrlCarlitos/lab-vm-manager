@@ -16,3 +16,6 @@ PowerShell_transcript.*.txt
 # Dropped from the repo (redundant with git / goes stale quickly); keep them from sneaking back in
 /SHA256SUMS.txt
 /VALIDATION.txt
+
+# Git worktrees created for isolated plan work -- a nested working directory, not repo content
+.claude/worktrees/
