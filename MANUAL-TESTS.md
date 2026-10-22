@@ -1,6 +1,6 @@
 # Hyper-V acceptance checklist
 
-**Status: partially exercised live** — the "Before mutation" checks and disposable-baseline checkpoint creation have been run against real `LAB-*` VMs; restore, rename, deletion, export, concurrency and shutdown-failure sections below have not yet been walked end-to-end. Use one disposable `LAB-*` VM with no valuable data. Do not use production, domain-controller, shared-disk, or customer VMs. Record host/guest OS versions and the Hyper-V module version alongside the audit log.
+**Status: partially exercised live** — the "Before mutation" checks and disposable-baseline checkpoint creation have been run against real `LAB-*` VMs, as have all three unattended-install actions end to end (`W`/`L`/`S`, see their own sections below for exactly what each confirmation covers); restore, rename, deletion, export, concurrency, shutdown-failure and the `M` installation-media menu's own end-to-end behavior have not yet been walked live. Use one disposable `LAB-*` VM with no valuable data. Do not use production, domain-controller, shared-disk, or customer VMs. Record host/guest OS versions and the Hyper-V module version alongside the audit log.
 
 ## Before mutation
 
@@ -246,7 +246,7 @@ A live, elevated run is still recommended for everything below. The steps check 
 - **Existing data warning.** Point `M` → `A` at a VM with a checkpoint, and separately at a VM whose VHDX holds an installed OS (several GB on disk): the preview must list the reason(s) and suggest a checkpoint/export, and after `Y` a typed `INSTALL OVER <name>` must be required. Type something else and confirm nothing changed (`Get-VMFirmware`, `Get-VMSecurity`, `Get-VMDvdDrive`, and boot order all identical to before). Also answer `n` at the first confirmation on a fresh VM and confirm the same: in particular, no key protector was created.
 - **Multiple DVD drives (v1 limitation).** Add a second DVD drive manually; `M` → `A` and `M` → `E` must both refuse with "doesn't choose among them" before changing anything.
 - **Read-only.** Run with `-ReadOnly`: `M` must go straight to the inspect output and never prompt for a profile, ISO or eject.
-- Still to exercise once a Windows/Linux unattended-install plan calls `New-LabSeedIso` with real Autounattend.xml/cloud-init content and actually boots a VM from the result: attaching the generated seed ISO as a second DVD drive alongside the OS install media, and confirming the guest's installer actually reads it. (Windows: exercised by the end-to-end `W` run under "Windows unattended install" below. Linux: by the end-to-end `L` run under "Linux unattended install".)
+- Still to exercise once a Windows/Linux unattended-install plan calls `New-LabSeedIso` with real Autounattend.xml/cloud-init content and actually boots a VM from the result: attaching the generated seed ISO as a second DVD drive alongside the OS install media, and confirming the guest's installer actually reads it. (Windows: exercised by the end-to-end `W` run under "Windows unattended install" below. Linux: by the end-to-end `L` and `S` runs under "Linux unattended install" and "Linux Server unattended install".)
 
 ## Windows unattended install
 
