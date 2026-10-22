@@ -3781,11 +3781,15 @@ function Select-LabWindowsEdition {
 }
 
 function Get-LabProvisioningVMHardware {
-    param([hashtable]$Options = @{}, [bool]$NonInteractive)
-    # The VM-hardware half of both unattended-install actions (Windows and Linux): the new VM's name,
-    # storage locations, vCPUs and dynamic memory, from $Options (only the parameters the caller bound)
-    # or the documented defaults. Explicit values are validated strictly, never adjusted, with the same
-    # validators New-LabVM uses. Interactive only for the VM name (re-prompted when missing or invalid);
+    param([hashtable]$Options = @{}, [bool]$NonInteractive, [bool]$IsDynamic = $true)
+    # The VM-hardware half of all three unattended-install actions (Windows, Linux Desktop, Linux
+    # Server): the new VM's name, storage locations, vCPUs and memory, from $Options (only the
+    # parameters the caller bound) or the documented defaults. Explicit values are validated strictly,
+    # never adjusted, with the same validators New-LabVM uses. -IsDynamic must match what the caller
+    # will actually pass to New-LabVMCore: under static memory, -MemoryMaximumGB is never sent to
+    # Hyper-V, so Test-LabMemorySpec must not enforce -MemoryStartupGB <= -MemoryMaximumGB for it (the
+    # documented -MemoryStartupGB override would otherwise fail above the 8GB maximum default).
+    # Interactive only for the VM name (re-prompted when missing or invalid);
     # returns $null if the operator cancels that prompt, otherwise one object with every resolved value.
     # Reads the host and the VM inventory only; creates and changes nothing.
     $getOption = {
@@ -3830,8 +3834,11 @@ function Get-LabProvisioningVMHardware {
     $minimumBytes = [long](& $getOption 'MemoryMinimumGB' 2) * 1GB
     $startupBytes = [long](& $getOption 'MemoryStartupGB' 4) * 1GB
     $maximumBytes = [long](& $getOption 'MemoryMaximumGB' 8) * 1GB
-    if (-not (Test-LabMemorySpec $minimumBytes $startupBytes $maximumBytes $true)) {
-        throw 'Memory must satisfy 0 < -MemoryMinimumGB <= -MemoryStartupGB <= -MemoryMaximumGB.'
+    if (-not (Test-LabMemorySpec $minimumBytes $startupBytes $maximumBytes $IsDynamic)) {
+        if ($IsDynamic) {
+            throw 'Memory must satisfy 0 < -MemoryMinimumGB <= -MemoryStartupGB <= -MemoryMaximumGB.'
+        }
+        throw '-MemoryStartupGB must be a positive multiple of 2MB.'
     }
     return [pscustomobject]@{
         Name = $name
@@ -3898,7 +3905,7 @@ function Start-LabWindowsVMProvisioning {
 
     # --- 2. VM hardware and Windows settings: explicit values are validated strictly, never adjusted.
     # The hardware half (name, storage, vCPUs, memory) is shared with the Linux action, verbatim.
-    $hardware = Get-LabProvisioningVMHardware -Options $Options -NonInteractive $nonInteractive
+    $hardware = Get-LabProvisioningVMHardware -Options $Options -NonInteractive $nonInteractive -IsDynamic $true
     if ($null -eq $hardware) { return 'CANCELLED' }
     $name = $hardware.Name
     $vmStoragePath = $hardware.VmStoragePath
@@ -4205,7 +4212,7 @@ function Start-LabLinuxVMProvisioning {
     }
 
     # --- 2. VM hardware (shared with the Windows action) and Linux settings: validated strictly, never adjusted.
-    $hardware = Get-LabProvisioningVMHardware -Options $Options -NonInteractive $nonInteractive
+    $hardware = Get-LabProvisioningVMHardware -Options $Options -NonInteractive $nonInteractive -IsDynamic $false
     if ($null -eq $hardware) { return 'CANCELLED' }
     $name = $hardware.Name
     $vhdxSizeGB = [int](& $getOption 'VhdxSizeGB' 150)
@@ -4520,7 +4527,7 @@ function Start-LabLinuxServerVMProvisioning {
     }
 
     # --- 2. VM hardware (shared with the Windows action) and Linux settings: validated strictly, never adjusted.
-    $hardware = Get-LabProvisioningVMHardware -Options $Options -NonInteractive $nonInteractive
+    $hardware = Get-LabProvisioningVMHardware -Options $Options -NonInteractive $nonInteractive -IsDynamic $false
     if ($null -eq $hardware) { return 'CANCELLED' }
     $name = $hardware.Name
     $vhdxSizeGB = [int](& $getOption 'VhdxSizeGB' 150)
@@ -4967,8 +4974,14 @@ function Set-LabVMSettingsCore {
                     'DynamicMemoryEnabled' { $isDynamic = $entry.NewValue }
                 }
             }
-            Set-VMMemory -VM $vm -DynamicMemoryEnabled $isDynamic -MinimumBytes $minimumBytes `
-                -StartupBytes $startupBytes -MaximumBytes $maximumBytes -Confirm:$false -ErrorAction Stop
+            # Set-VMMemory refuses -MinimumBytes/-MaximumBytes outright when -DynamicMemoryEnabled is $false
+            # (same restriction as New-LabVMCore; confirmed live, 2026-10-21).
+            if ($isDynamic) {
+                Set-VMMemory -VM $vm -DynamicMemoryEnabled $true -MinimumBytes $minimumBytes `
+                    -StartupBytes $startupBytes -MaximumBytes $maximumBytes -Confirm:$false -ErrorAction Stop
+            } else {
+                Set-VMMemory -VM $vm -DynamicMemoryEnabled $false -StartupBytes $startupBytes -Confirm:$false -ErrorAction Stop
+            }
             $vm = Get-LabVM $VMId
             foreach ($entry in $memoryDiff) {
                 $actual = switch ($entry.Field) {

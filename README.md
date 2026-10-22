@@ -251,7 +251,7 @@ powershell.exe -NoProfile -File .\Lab-VM.ps1 -ConfigureSsh -VMName LAB-linux -Ss
 
 Parameters:
 
-- `-ConfigureSsh` -- the switch that selects this mode. Mutually exclusive with `-CopyToVM`/`-CopyFromVM`/`-ProvisionWindowsVM`/`-ProvisionLinuxVM`; supplying `-ConfigureSsh` together with any of them exits `1` before anything else runs ("Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, -ProvisionWindowsVM, or -ProvisionLinuxVM; one action per invocation.").
+- `-ConfigureSsh` -- the switch that selects this mode. Mutually exclusive with `-CopyToVM`/`-CopyFromVM`/`-ProvisionWindowsVM`/`-ProvisionLinuxVM`/`-ProvisionLinuxServerVM`; supplying `-ConfigureSsh` together with any of them exits `1` before anything else runs ("Supply only one of -ConfigureSsh, -CopyToVM, -CopyFromVM, -ProvisionWindowsVM, -ProvisionLinuxVM, or -ProvisionLinuxServerVM; one action per invocation.").
 - `-VMName` / `-VMId` -- identify the target VM; pick exactly one, same resolution rules as file transfer.
 - `-SshHost` -- required hostname or IP address to save. Must not start with `-` or contain whitespace, control characters or `@`.
 - `-SshPort` -- optional; defaults to `22`; must be 1-65535 (rejected at parameter binding otherwise).
@@ -271,7 +271,7 @@ $cred = Get-Credential
 
 Parameters (all optional unless noted):
 
-- `-ProvisionWindowsVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM`, `-CopyFromVM` and `-ProvisionLinuxVM` (exit `1` before anything runs).
+- `-ProvisionWindowsVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM`, `-CopyFromVM`, `-ProvisionLinuxVM` and `-ProvisionLinuxServerVM` (exit `1` before anything runs).
 - `-NewVMName` -- name of the VM to **create** (must start with `LAB-` and be unique). This is deliberately not `-VMName`, which always names an existing VM. `-VMName`, `-VMId` and the other transfer-only parameters are rejected with `-ProvisionWindowsVM`.
 - `-WindowsIsoPath` -- the Windows 11 ISO. Default: pick one under `-IsoRoot`.
 - `-OsEdition` -- edition name, full or short (`'Windows 11 Pro'` or `Pro`). Default: the picker, preselecting Pro. With `-NonInteractive`: Pro, or the ISO's only Windows 11 client edition; otherwise it fails listing the choices.
@@ -290,9 +290,10 @@ Parameters (all optional unless noted):
 
 Provisioning parameters are gated in three tiers, and a parameter outside its tier exits `1` rather than being ignored or opening the menu:
 
-- **Shared VM-creation parameters** (`-NewVMName`, `-ComputerName`, `-Locale`, `-VCpuCount`, `-MemoryMinimumGB`/`-MemoryStartupGB`/`-MemoryMaximumGB`, `-VhdxSizeGB`, `-SwitchName`, `-VmStorageRoot`, `-VhdxStorageRoot`, `-ProvisioningTimeoutSeconds`) work with either `-ProvisionWindowsVM` or `-ProvisionLinuxVM`, and are rejected without one of them.
-- **Windows-only parameters** (`-WindowsIsoPath`, `-OsEdition`, `-ProductKey`, `-TimeZone`) require `-ProvisionWindowsVM`, and are rejected as foreign with `-ProvisionLinuxVM`.
-- **Linux-only parameters** (`-LinuxIsoPath`, `-LinuxTimeZone`) require `-ProvisionLinuxVM`, and are rejected as foreign with `-ProvisionWindowsVM`.
+- **Shared VM-creation parameters** (`-NewVMName`, `-ComputerName`, `-Locale`, `-VCpuCount`, `-MemoryMinimumGB`/`-MemoryStartupGB`/`-MemoryMaximumGB`, `-VhdxSizeGB`, `-SwitchName`, `-VmStorageRoot`, `-VhdxStorageRoot`, `-ProvisioningTimeoutSeconds`) work with any one of `-ProvisionWindowsVM`, `-ProvisionLinuxVM` or `-ProvisionLinuxServerVM`, and are rejected without one of them.
+- **Windows-only parameters** (`-WindowsIsoPath`, `-OsEdition`, `-ProductKey`, `-TimeZone`) require `-ProvisionWindowsVM`, and are rejected as foreign with `-ProvisionLinuxVM`/`-ProvisionLinuxServerVM`.
+- **Linux-only parameters** (`-LinuxIsoPath`, `-LinuxTimeZone`) require `-ProvisionLinuxVM`, and are rejected as foreign with `-ProvisionWindowsVM`/`-ProvisionLinuxServerVM`.
+- **Linux Server-only parameters** (`-LinuxServerIsoPath`, `-LinuxServerTimeZone`) require `-ProvisionLinuxServerVM`, and are rejected as foreign with `-ProvisionWindowsVM`/`-ProvisionLinuxVM`.
 
 `-NonInteractive` and `-Credential` are accepted by both provisioning modes (and by file transfer). Exit code: `0` only when the whole flow completed (both sign-ins proven). A refusal, a failure, or an interactive cancel exits `1`. The same host assertion and `session` `STARTED`/`ENDED` audit records as the other parameter modes are written, plus the `provision-windows-vm` records described above. Under `-ReadOnly`, it creates nothing and exits `1`.
 
@@ -307,7 +308,7 @@ $cred = Get-Credential -UserName labagent -Message 'Guest Linux account'
 
 Parameters (all optional unless noted):
 
-- `-ProvisionLinuxVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM`, `-CopyFromVM` and `-ProvisionWindowsVM` (exit `1` before anything runs).
+- `-ProvisionLinuxVM` -- the switch that selects this mode. Mutually exclusive with `-ConfigureSsh`, `-CopyToVM`, `-CopyFromVM`, `-ProvisionWindowsVM` and `-ProvisionLinuxServerVM` (exit `1` before anything runs).
 - `-LinuxIsoPath` -- the Ubuntu Desktop 26.04.x ISO. Default: `''`, which means pick one under `-IsoRoot`.
 - `-LinuxTimeZone` -- the guest time zone as an **IANA zone ID** such as `'America/Guatemala'` or `'Europe/Paris'` (`timedatectl list-timezones` on any Linux machine lists them). Default: `'America/Guatemala'`. This is deliberately separate from `-TimeZone`, which takes Windows time zone IDs (`'Central America Standard Time'`) and only applies to `-ProvisionWindowsVM`. Only the `Region/City` shape is checked here (Windows PowerShell 5.1 cannot validate IANA IDs); a well-formed but unknown zone is caught by the installer.
 - `-Locale` -- shared with Windows provisioning, but for Linux it is a POSIX locale such as `en_US.UTF-8` (the default when omitted) or `C.UTF-8`.
@@ -403,7 +404,7 @@ Option `12` calls Hyper-V's `Remove-VM`, which unregisters the VM and its config
 
 ## Intentionally not included
 
-No guest OS installation other than `W`'s unattended Windows 11 install and `L`'s unattended Ubuntu Desktop 26.04.x install on a newly created VM (option `M` only attaches installer media and prepares the boot profile/order; it never runs an installer), no other Linux distribution or Ubuntu release, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing (no product key is set unless `-ProductKey` is explicitly supplied), remote hosts, automatic login beyond `W`'s single first sign-in, other guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
+No guest OS installation other than `W`'s unattended Windows 11 install, `L`'s unattended Ubuntu Desktop 26.04.x install, and `S`'s unattended Ubuntu Server 26.04.x install, on a newly created VM (option `M` only attaches installer media and prepares the boot profile/order; it never runs an installer), no other Linux distribution or Ubuntu release, VM clone/import, virtual disk resizing or guest partition changes, virtual switch creation, OS activation/licensing (no product key is set unless `-ProductKey` is explicitly supplied), remote hosts, automatic login beyond `W`'s single first sign-in, other guest provisioning or dotfiles execution, guest result collection, or automatic checkpoint pruning. VM deletion (option `12`) is implemented through the Hyper-V API and retains virtual disk files; purging those retained disk files is still out of scope for this tool. On a Linux guest, `-PermissionProfile PrivateFiles` with `-Recurse` sets the mode of the new directory root only; a per-file `chmod` of every file inside a recursive upload is future work, not implemented here (see "Private files on the Linux/SFTP adapter").
 
 ## Linux file transfer: SFTP backend design decision
 
@@ -425,7 +426,7 @@ On failure in `KeyAgent` mode, the warning includes the last lines of `sftp`'s o
 
 `Resolve-LabSshAuthMode` picks between the two authentication modes from the saved connection settings: `KeyAgent` (batch, non-interactive) when an identity file is configured, `InteractivePassword` (OpenSSH's own password prompt on the real console) otherwise. `Invoke-LabSftpCommand` is the single integration point all real SFTP operations route through, including the connection test and every later transfer; it checks `Get-LabSshToolingInfo` first and throws a clear error naming `ssh.exe`/`sftp.exe` if the OpenSSH client tooling is missing.
 
-**Password login disabled on the guest:** if the guest only accepts key-based SSH authentication (or you intend to use `KeyAgent` mode from the start), the operator establishes trust before ever attempting a `KeyAgent`-mode connection, by adding their public key to the guest's `~/.ssh/authorized_keys` through the existing guest console (or whatever provisioning already placed files there). This manager never edits `authorized_keys` itself, on the guest or otherwise, as a side effect of any configuration or transfer action — that file is entirely the operator's and the guest's own responsibility. (The one place a key reaches it is `L` / `-ProvisionLinuxVM`, and only at install time: the installer itself writes that VM's own generated public key as the new account's authorized key, before the guest has ever booted.)
+**Password login disabled on the guest:** if the guest only accepts key-based SSH authentication (or you intend to use `KeyAgent` mode from the start), the operator establishes trust before ever attempting a `KeyAgent`-mode connection, by adding their public key to the guest's `~/.ssh/authorized_keys` through the existing guest console (or whatever provisioning already placed files there). This manager never edits `authorized_keys` itself, on the guest or otherwise, as a side effect of any configuration or transfer action — that file is entirely the operator's and the guest's own responsibility. (The one place a key reaches it is `L` / `-ProvisionLinuxVM` or `S` / `-ProvisionLinuxServerVM`, and only at install time: the installer itself writes that VM's own generated public key as the new account's authorized key, before the guest has ever booted.)
 
 ### First connection: trusting the guest's host key (`K`)
 

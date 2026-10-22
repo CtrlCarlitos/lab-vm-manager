@@ -35,6 +35,27 @@ class SourceContract(unittest.TestCase):
             for line in self.s.splitlines():
                 if re.match(r'\s*'+re.escape(cmd)+r'\s', line):
                     self.assertIn('-VMSnapshot ', line, line)
+    def _assert_set_vm_memory_branches_on_dynamic(self, fn_name):
+        # Set-VMMemory throws ("requires Dynamic Memory to be enabled") if -MinimumBytes/
+        # -MaximumBytes are passed alongside -DynamicMemoryEnabled $false (confirmed live,
+        # 2026-10-21) -- it does not silently ignore them. Every call site must branch instead
+        # of passing all four memory parameters unconditionally.
+        body = self.s.split(f'function {fn_name} {{', 1)[1].split('\nfunction ', 1)[0]
+        calls = re.findall(r'Set-VMMemory -VM(?:[^\r\n]*`\r?\n)*[^\r\n]*', body)
+        dynamic_calls = [c for c in calls if '-DynamicMemoryEnabled $true' in c]
+        static_calls = [c for c in calls if '-DynamicMemoryEnabled $false' in c]
+        self.assertEqual(len(dynamic_calls), 1, f'{fn_name}: expected exactly one dynamic Set-VMMemory call')
+        self.assertEqual(len(static_calls), 1, f'{fn_name}: expected exactly one static Set-VMMemory call')
+        self.assertIn('-MinimumBytes', dynamic_calls[0])
+        self.assertIn('-MaximumBytes', dynamic_calls[0])
+        self.assertIn('-StartupBytes', dynamic_calls[0])
+        self.assertNotIn('-MinimumBytes', static_calls[0])
+        self.assertNotIn('-MaximumBytes', static_calls[0])
+        self.assertIn('-StartupBytes', static_calls[0])
+    def test_new_lab_vm_core_set_vm_memory_branches_on_dynamic(self):
+        self._assert_set_vm_memory_branches_on_dynamic('New-LabVMCore')
+    def test_edit_vm_settings_set_vm_memory_branches_on_dynamic(self):
+        self._assert_set_vm_memory_branches_on_dynamic('Set-LabVMSettingsCore')
     def test_no_implicit_auto_start_after_restore(self):
         body=self.s.split('function Restore-LabCheckpoint {',1)[1].split('\nfunction ',1)[0]
         self.assertNotIn('Start-VM ',body)

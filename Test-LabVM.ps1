@@ -6070,6 +6070,12 @@ Test-Case 'Provision Linux Server: happy path runs every phase once, UbuntuServe
     Assert-Equal $core.MinimumBytes ([long]2GB); Assert-Equal $core.StartupBytes ([long]4GB); Assert-Equal $core.MaximumBytes ([long]8GB)
     Assert-Equal $core.IsDynamic $false
 }
+Test-Case 'Provision Linux Server: -MemoryStartupGB above the 8GB maximum default succeeds, since static memory never checks startup against maximum' {
+    $r = Invoke-LabLinuxServerProvisioningScenario @{ NewVMName = 'LAB-Ubuntu-Srv'; MemoryStartupGB = 16 }
+    if ($null -ne $r.Error) { throw "Unexpected failure: $($r.Error)" }
+    Assert-Equal $r.Status 'COMPLETED'
+    Assert-Equal $r.Args['New-LabVMCore'].StartupBytes ([long]16GB)
+}
 Test-Case 'Provision Linux Server: an out-of-scope ISO is refused, naming what was found, before any VM is created' {
     $r = Invoke-LabLinuxServerProvisioningScenario @{ NewVMName = 'LAB-Ubuntu-Srv' } -InScope $false
     Assert-Equal $r.Status $null
