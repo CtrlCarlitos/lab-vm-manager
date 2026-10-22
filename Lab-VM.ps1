@@ -157,16 +157,35 @@
     does the same with all defaults), then exit. Shows one combined preview and asks once before creating
     anything; with -NonInteractive it never prompts and requires -NewVMName, -LinuxIsoPath and -Credential
     (a Linux username: lowercase letters, digits, '_' or '-'). Mutually exclusive with -ConfigureSsh,
-    -CopyToVM/-CopyFromVM and -ProvisionWindowsVM. Shares -NewVMName, -ComputerName, -Locale, -VhdxSizeGB,
-    -VCpuCount, -Memory*GB, -SwitchName, -VmStorageRoot, -VhdxStorageRoot and -ProvisioningTimeoutSeconds
-    with -ProvisionWindowsVM; -WindowsIsoPath, -OsEdition, -ProductKey and -TimeZone are Windows-only and
-    are rejected with it. On success it saves this VM's SSH connection settings (replacing any saved before).
+    -CopyToVM/-CopyFromVM, -ProvisionWindowsVM and -ProvisionLinuxServerVM. Shares -NewVMName, -ComputerName,
+    -Locale, -VhdxSizeGB, -VCpuCount, -Memory*GB, -SwitchName, -VmStorageRoot, -VhdxStorageRoot and
+    -ProvisioningTimeoutSeconds with -ProvisionWindowsVM; -WindowsIsoPath, -OsEdition, -ProductKey and
+    -TimeZone are Windows-only and are rejected with it. On success it saves this VM's SSH connection
+    settings (replacing any saved before).
 .PARAMETER LinuxIsoPath
     Ubuntu Desktop 26.04.x installer ISO for -ProvisionLinuxVM. When omitted, pick one from -IsoRoot interactively.
 .PARAMETER LinuxTimeZone
     Guest time zone for -ProvisionLinuxVM, as an IANA zone ID such as 'America/Guatemala' or 'Europe/Paris'
     (list them on any Linux machine with timedatectl list-timezones). Default: 'America/Guatemala'. Distinct
     from -TimeZone, which takes Windows time zone IDs.
+.PARAMETER ProvisionLinuxServerVM
+    Parameter mode: create a new LAB- VM and install Ubuntu Server 26.04.x on it unattended (menu option S
+    does the same with all defaults), then exit. Shows one combined preview and asks once before creating
+    anything; with -NonInteractive it never prompts and requires -NewVMName, -LinuxServerIsoPath and
+    -Credential (a Linux username: lowercase letters, digits, '_' or '-'). Mutually exclusive with
+    -ConfigureSsh, -CopyToVM/-CopyFromVM, -ProvisionWindowsVM and -ProvisionLinuxVM. Shares -NewVMName,
+    -ComputerName, -Locale, -VhdxSizeGB, -VCpuCount, -Memory*GB, -SwitchName, -VmStorageRoot,
+    -VhdxStorageRoot and -ProvisioningTimeoutSeconds with the other two provisioning modes;
+    -LinuxServerIsoPath and -LinuxServerTimeZone are Server-only and are rejected with
+    -ProvisionWindowsVM/-ProvisionLinuxVM. The completion note lands at the account's home directory
+    (not under Desktop/, since Server has no desktop environment). On success it saves this VM's SSH
+    connection settings (replacing any saved before).
+.PARAMETER LinuxServerIsoPath
+    Ubuntu Server 26.04.x installer ISO for -ProvisionLinuxServerVM. When omitted, pick one from -IsoRoot interactively.
+.PARAMETER LinuxServerTimeZone
+    Guest time zone for -ProvisionLinuxServerVM, as an IANA zone ID such as 'America/Guatemala' or
+    'Europe/Paris' (list them on any Linux machine with timedatectl list-timezones). Default:
+    'America/Guatemala'. Distinct from -TimeZone, which takes Windows time zone IDs.
 .EXAMPLE
     powershell.exe -NoProfile -File .\Lab-VM.ps1 -ReadOnly
 .EXAMPLE
@@ -422,6 +441,18 @@ function Test-LabNewVMName {
         if ([string]::Equals($existing, $Name, [StringComparison]::OrdinalIgnoreCase)) { return $false }
     }
     return $true
+}
+
+function Test-LabComputerNameFormat {
+    param([string]$Name)
+    return ($Name -match '^[A-Za-z0-9-]{1,15}$' -and $Name -notmatch '^\d+$')
+}
+
+function Test-LabLinuxComputerName {
+    # Linux hostnames (RFC 1123 labels, as systemd enforces them) may not start or end with a hyphen,
+    # on top of the base format every OS this tool provisions shares.
+    param([string]$Name)
+    return ((Test-LabComputerNameFormat $Name) -and -not $Name.StartsWith('-') -and -not $Name.EndsWith('-'))
 }
 
 function Test-LabVCpuCount {
@@ -3924,7 +3955,7 @@ function Start-LabWindowsVMProvisioning {
         throw "Virtual switch '$switchName' does not exist. Omit -SwitchName to use 'Default Switch', or supply -SwitchName '' to leave the adapter Disconnected."
     }
     $computerName = [string](& $getOption 'ComputerName' 'lab-agent-test')
-    if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
+    if (-not (Test-LabComputerNameFormat $computerName)) {
         throw "Computer name '$computerName' is invalid: use 1-15 letters, digits or hyphens, not digits only. Supply -ComputerName."
     }
     $locale = [string](& $getOption 'Locale' 'en-US')
@@ -4229,11 +4260,10 @@ function Start-LabLinuxVMProvisioning {
     }
     # The Windows action's exact computer-name rule, plus one Linux-only addition below.
     $computerName = [string](& $getOption 'ComputerName' 'lab-agent-test')
-    if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
+    if (-not (Test-LabComputerNameFormat $computerName)) {
         throw "Computer name '$computerName' is invalid: use 1-15 letters, digits or hyphens, not digits only. Supply -ComputerName."
     }
-    # Linux hostnames (RFC 1123 labels, as systemd enforces them) may not start or end with a hyphen.
-    if ($computerName.StartsWith('-') -or $computerName.EndsWith('-')) {
+    if (-not (Test-LabLinuxComputerName $computerName)) {
         throw "Computer name '$computerName' is invalid for Linux: it must not start or end with a hyphen. Supply -ComputerName."
     }
     # A POSIX locale name (language[_TERRITORY][.codeset][@modifier], or the C locale such as C.UTF-8).
@@ -4306,9 +4336,10 @@ function Start-LabLinuxVMProvisioning {
             # deadlocked from real memory starvation -- ballooning's demand signal for this Linux
             # guest cannot be trusted on this host, so -StartupBytes is used as a genuine fixed
             # allocation instead of a dynamic starting point Hyper-V might shrink out from under it.
-            # -MinimumBytes/-MaximumBytes are passed through unused by Hyper-V under static memory,
-            # kept only so -MemoryMinimumGB/-MemoryMaximumGB stay meaningful if dynamic is ever
-            # reintroduced here; -MemoryStartupGB alone is what this VM actually gets.
+            # -MinimumBytes/-MaximumBytes are accepted and validated but dropped before reaching
+            # Hyper-V (New-LabVMCore omits them from Set-VMMemory under static memory -- it throws
+            # if they're sent), kept only so -MemoryMinimumGB/-MemoryMaximumGB stay meaningful if
+            # dynamic is ever reintroduced here; -MemoryStartupGB alone is what this VM actually gets.
             $vm = New-LabVMCore -Name $name -VmStoragePath $hardware.VmStoragePath -VCpuCount $hardware.VCpuCount `
                 -MinimumBytes $hardware.MinimumBytes -StartupBytes $hardware.StartupBytes -MaximumBytes $hardware.MaximumBytes `
                 -IsDynamic $false -VhdxPath $hardware.VhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName
@@ -4545,11 +4576,10 @@ function Start-LabLinuxServerVMProvisioning {
     # The Windows action's exact computer-name rule, plus one Linux-only addition below. Default is
     # distinct from Desktop's 'lab-agent-test' so the two don't collide if both are created with defaults.
     $computerName = [string](& $getOption 'ComputerName' 'lab-agent-srv')
-    if ($computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\d+$') {
+    if (-not (Test-LabComputerNameFormat $computerName)) {
         throw "Computer name '$computerName' is invalid: use 1-15 letters, digits or hyphens, not digits only. Supply -ComputerName."
     }
-    # Linux hostnames (RFC 1123 labels, as systemd enforces them) may not start or end with a hyphen.
-    if ($computerName.StartsWith('-') -or $computerName.EndsWith('-')) {
+    if (-not (Test-LabLinuxComputerName $computerName)) {
         throw "Computer name '$computerName' is invalid for Linux: it must not start or end with a hyphen. Supply -ComputerName."
     }
     # A POSIX locale name (language[_TERRITORY][.codeset][@modifier], or the C locale such as C.UTF-8).
@@ -4622,9 +4652,10 @@ function Start-LabLinuxServerVMProvisioning {
             # deadlocked from real memory starvation -- ballooning's demand signal for this Linux
             # guest cannot be trusted on this host, so -StartupBytes is used as a genuine fixed
             # allocation instead of a dynamic starting point Hyper-V might shrink out from under it.
-            # -MinimumBytes/-MaximumBytes are passed through unused by Hyper-V under static memory,
-            # kept only so -MemoryMinimumGB/-MemoryMaximumGB stay meaningful if dynamic is ever
-            # reintroduced here; -MemoryStartupGB alone is what this VM actually gets.
+            # -MinimumBytes/-MaximumBytes are accepted and validated but dropped before reaching
+            # Hyper-V (New-LabVMCore omits them from Set-VMMemory under static memory -- it throws
+            # if they're sent), kept only so -MemoryMinimumGB/-MemoryMaximumGB stay meaningful if
+            # dynamic is ever reintroduced here; -MemoryStartupGB alone is what this VM actually gets.
             $vm = New-LabVMCore -Name $name -VmStoragePath $hardware.VmStoragePath -VCpuCount $hardware.VCpuCount `
                 -MinimumBytes $hardware.MinimumBytes -StartupBytes $hardware.StartupBytes -MaximumBytes $hardware.MaximumBytes `
                 -IsDynamic $false -VhdxPath $hardware.VhdxPath -VhdxMaximumBytes ([long]$vhdxSizeGB * 1GB) -SwitchName $switchName

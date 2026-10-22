@@ -53,6 +53,7 @@ Write-Host 'PASS: the full script parses in this PowerShell runtime.'
 
 $allowlist = @('Test-LabVMName', 'ConvertTo-LabMenuIndex', 'Test-LabCheckpointName',
     'Get-LabVM', 'Assert-LabVMOff', 'Test-LabNewVMName', 'Test-LabVCpuCount', 'Test-LabMemorySpec',
+    'Test-LabComputerNameFormat', 'Test-LabLinuxComputerName',
     'Get-LabTransferConflictKind', 'Resolve-LabConflictAction', 'Get-LabSettingsDiff',
     'Assert-LabVMRunning', 'Get-LabTransferOnlyParameter', 'Get-LabSshConnectionSettingsPath',
     'Resolve-LabSshAuthMode', 'Get-LabTransferAdapterKind', 'Test-LabSshHostName', 'Test-LabSshUserName',
@@ -854,6 +855,14 @@ Test-Case 'New VM name accepts 100-character name' { Assert-Equal (Test-LabNewVM
 Test-Case 'vCPU count zero rejected' { Assert-Equal (Test-LabVCpuCount 0 8) $false }
 Test-Case 'vCPU count above host max rejected' { Assert-Equal (Test-LabVCpuCount 9 8) $false }
 Test-Case 'vCPU count within range accepted' { Assert-Equal (Test-LabVCpuCount 4 8) $true }
+Test-Case 'Computer name format has no leading/trailing hyphen restriction (that is a Linux-only addition)' { Assert-Equal (Test-LabComputerNameFormat '-lab-agent') $true }
+Test-Case 'Computer name format rejects digits-only' { Assert-Equal (Test-LabComputerNameFormat '12345') $false }
+Test-Case 'Computer name format accepts letters, digits and hyphens up to 15 chars' { Assert-Equal (Test-LabComputerNameFormat 'lab-agent-test1') $true }
+Test-Case 'Computer name format rejects over 15 chars' { Assert-Equal (Test-LabComputerNameFormat 'lab-agent-test-too-long') $false }
+Test-Case 'Linux computer name rejects a leading hyphen' { Assert-Equal (Test-LabLinuxComputerName '-lab-agent') $false }
+Test-Case 'Linux computer name rejects a trailing hyphen' { Assert-Equal (Test-LabLinuxComputerName 'lab-agent-') $false }
+Test-Case 'Linux computer name accepts an otherwise-valid name' { Assert-Equal (Test-LabLinuxComputerName 'lab-agent-test') $true }
+Test-Case 'Linux computer name still rejects whatever the base format rejects' { Assert-Equal (Test-LabLinuxComputerName '12345') $false }
 Test-Case 'Dynamic memory requires minimum <= startup <= maximum' { Assert-Equal (Test-LabMemorySpec 1GB 512MB 4GB $true) $false }
 Test-Case 'Dynamic memory rejects non-multiple-of-2MB value' { Assert-Equal (Test-LabMemorySpec 512MB (1GB+1MB) 4GB $true) $false }
 Test-Case 'Dynamic memory accepts valid ordered range' { Assert-Equal (Test-LabMemorySpec 512MB 1GB 4GB $true) $true }
@@ -2938,7 +2947,9 @@ Test-Case 'Write-LabLinuxProvisioningNote delivers the exact content via a KeyAg
         Assert-Equal $lines.Count 2
         # -mkdir first (the '-' keeps the batch going when Desktop already exists), then the put.
         # This is Desktop's own pre-existing behavior (now passed explicitly via -RemoteRelativePath
-        # instead of hardcoded inside the function) -- byte for byte unchanged.
+        # instead of hardcoded inside the function) -- behaviorally unchanged: the generalized function
+        # now quotes the directory ('-mkdir "Desktop"' vs the old unquoted '-mkdir Desktop'), but sftp's
+        # own batch parser strips the quotes, so what actually reaches the guest is identical.
         Assert-Equal $lines[0] '-mkdir "Desktop"'
         Assert-Equal ($lines[1] -match '^put\s+"([^"]+)"\s+"Desktop/lab-vm-manager-provisioning-note\.txt"$') $true
         # sftp's batch parser treats '\' as an escape: the local path uses forward slashes only.
@@ -4519,6 +4530,38 @@ Test-Case 'Gate: a shared creation parameter alone names both provisioning switc
     $r = Invoke-LabGateChild @('-VCpuCount', '2')
     Assert-Equal $r.ExitCode 1
     if (-not $r.Flat.Contains('-VCpuCountonlyapplyto-ProvisionWindowsVM,-ProvisionLinuxVM,or-ProvisionLinuxServerVM')) { throw "Unexpected output: $($r.Output)" }
+}
+# Linux Server Task 4 final review (Important#2 follow-up): same real-subprocess gate behavior Desktop's own tests
+# above use, for -ProvisionLinuxServerVM and the Server-only parameter tier.
+Test-Case 'Gate: the real script refuses a Server-only parameter without -ProvisionLinuxServerVM instead of opening the menu' {
+    $r = Invoke-LabGateChild @('-LinuxServerIsoPath', 'C:\nope.iso')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-LinuxServerIsoPathonlyapplyto-ProvisionLinuxServerVM')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses a Windows-only parameter with -ProvisionLinuxServerVM as foreign' {
+    $r = Invoke-LabGateChild @('-ProvisionLinuxServerVM', '-WindowsIsoPath', 'C:\nope.iso')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-WindowsIsoPathdonotapplyto-ProvisionLinuxServerVM')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses a Server-only parameter with -ProvisionWindowsVM as foreign' {
+    $r = Invoke-LabGateChild @('-ProvisionWindowsVM', '-LinuxServerIsoPath', 'C:\nope.iso')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-LinuxServerIsoPathdonotapplyto-ProvisionWindowsVM')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses -VMName with -ProvisionLinuxServerVM, pointing at -NewVMName' {
+    $r = Invoke-LabGateChild @('-ProvisionLinuxServerVM', '-VMName', 'LAB-x')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('-VMNamedonotapplyto-ProvisionLinuxServerVM(namethenewVMwith-NewVMName)')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: the real script refuses -ProvisionLinuxServerVM combined with -ProvisionWindowsVM (three-way one-action check)' {
+    $r = Invoke-LabGateChild @('-ProvisionLinuxServerVM', '-ProvisionWindowsVM')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('oneactionperinvocation')) { throw "Unexpected output: $($r.Output)" }
+}
+Test-Case 'Gate: a shared creation parameter passes the gate with -ProvisionLinuxServerVM too' {
+    $r = Invoke-LabGateChild @('-ProvisionLinuxServerVM', '-NewVMName', 'LAB-x', '-VCpuCount', '2', '-LinuxServerIsoPath', 'C:\nope.iso', '-NonInteractive')
+    Assert-Equal $r.ExitCode 1
+    if (-not $r.Flat.Contains('Supply-Credentialwith-ProvisionLinuxServerVM-NonInteractive')) { throw "Server run did not reach the CLI wrapper: $($r.Output)" }
 }
 
 # --- Hyper-V shape drift guard (final-review fix) ---

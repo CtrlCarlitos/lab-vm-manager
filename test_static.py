@@ -12,6 +12,14 @@ class SourceContract(unittest.TestCase):
 
     def test_minimum_powershell(self):
         self.assertIn('#requires -Version 5.1', self.s)
+    def test_every_top_level_parameter_has_comment_based_help(self):
+        help_block = self.s.split('<#', 1)[1].split('#>', 1)[0]
+        param_block = re.split(r'\)\r?\n\r?\nSet-StrictMode', self.s.split('\nparam(', 1)[1], maxsplit=1)[0]
+        names = re.findall(r'\]\$(\w+)', param_block)
+        self.assertGreater(len(names), 0)
+        documented = set(re.findall(r'\.PARAMETER (\w+)', help_block))
+        missing = [n for n in names if n not in documented]
+        self.assertEqual(missing, [], f'Get-Help will not document: {missing}')
     def test_exact_prefix_guard(self):
         self.assertIn("StartsWith('LAB-', [StringComparison]::OrdinalIgnoreCase)", self.s)
     def test_id_resolution(self):
@@ -1135,8 +1143,14 @@ class SourceContract(unittest.TestCase):
         first_check = dispatcher.split('exit 1', 1)[0]
         self.assertIn('[bool]$ProvisionLinuxVM', first_check)
     def test_linux_provisioning_validates_computer_name_like_windows(self):
+        # Reuses the shared validators (Test-LabComputerNameFormat/Test-LabLinuxComputerName) rather
+        # than a re-typed copy of the regex that could silently drift from Windows's own rule.
         body = self._linux_orchestrator_body()
-        self.assertIn("$computerName -notmatch '^[A-Za-z0-9-]{1,15}$' -or $computerName -match '^\\d+$'", body)
+        self.assertIn('Test-LabComputerNameFormat $computerName', body)
+        self.assertIn('Test-LabLinuxComputerName $computerName', body)
+        windows_body = self.s.split('function Start-LabWindowsVMProvisioning {', 1)[1].split('\nfunction ', 1)[0]
+        self.assertIn('Test-LabComputerNameFormat $computerName', windows_body)
+        self.assertNotIn('Test-LabLinuxComputerName', windows_body)
     def test_linux_provisioning_seed_is_cidata(self):
         body = self._linux_orchestrator_body()
         self.assertIn("-VolumeLabel 'cidata'", body)
@@ -1207,6 +1221,11 @@ class SourceContract(unittest.TestCase):
     def test_linux_server_provisioning_note_goes_to_home_directory(self):
         body = self._linux_server_orchestrator_body()
         self.assertIn("-RemoteRelativePath 'lab-vm-manager-provisioning-note.txt'", body)
+    def test_linux_server_provisioning_validates_computer_name_like_desktop(self):
+        # Same reuse requirement as Desktop's own test: no re-typed copy of the hyphen rule.
+        body = self._linux_server_orchestrator_body()
+        self.assertIn('Test-LabComputerNameFormat $computerName', body)
+        self.assertIn('Test-LabLinuxComputerName $computerName', body)
     def test_s_menu_entry_wired(self):
         body = self.s.split('function Select-LabVM {', 1)[1].split('\nfunction ', 1)[0]
         self.assertIn("-ieq 'S'", body)
