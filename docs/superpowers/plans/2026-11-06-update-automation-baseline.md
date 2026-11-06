@@ -172,7 +172,7 @@ Wait for the pull request's `test` job, merge only when green, then confirm a `p
 
 Run `gh api --method PUT repos/CtrlCarlitos/lab-vm-manager/vulnerability-alerts` and `gh api --method PUT repos/CtrlCarlitos/lab-vm-manager/private-vulnerability-reporting`.
 
-Expected: both requests return HTTP 204. Verify `gh api repos/CtrlCarlitos/lab-vm-manager/automated-security-fixes` still reports `enabled: false`.
+Expected: both requests return HTTP 204. Verify `gh api -i repos/CtrlCarlitos/lab-vm-manager/automated-security-fixes` returns HTTP 404, which is GitHub's disabled-state response for that endpoint.
 
 - [ ] **Step 4: Create the active default-branch ruleset**
 

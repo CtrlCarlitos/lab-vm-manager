@@ -1241,7 +1241,10 @@ class AutomationContract(unittest.TestCase):
         self.assertIn('pull_request:', self.workflow)
         self.assertRegex(self.workflow, r'(?ms)push:\n    branches:\n      - main\n')
         self.assertRegex(self.workflow, r'(?m)^permissions:\n  contents: read$')
-        self.assertNotIn('contents: write', self.workflow)
+        self.assertEqual(self.workflow.count('permissions:'), 1)
+        self.assertNotRegex(self.workflow, r'(?m)^\s+[a-z-]+: write$')
+        self.assertNotIn('${{ secrets.', self.workflow)
+        self.assertNotIn('pull_request_target:', self.workflow)
         self.assertIn('\n  test:\n    runs-on: windows-latest\n', self.workflow)
 
     def test_ci_actions_use_full_sha_pins(self):
