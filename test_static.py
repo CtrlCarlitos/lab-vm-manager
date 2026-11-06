@@ -1244,9 +1244,9 @@ class AutomationContract(unittest.TestCase):
         self.assertEqual(self.workflow.count('permissions:'), 1)
         self.assertNotRegex(
             self.workflow,
-            r'(?m)^\s+[a-z0-9_-]+:\s*write(?:\s+#.*)?\s*$',
+            r'(?m)^\s+[a-z0-9_-]+\s*:\s*write(?:\s+#.*)?\s*$',
         )
-        self.assertNotRegex(self.workflow, r'(?i)\$\{\{\s*secrets\.')
+        self.assertNotRegex(self.workflow, r'(?i)\$\{\{\s*secrets\s*\.\s*')
         self.assertNotIn('pull_request_target:', self.workflow)
         self.assertIn('\n  test:\n    runs-on: windows-latest\n', self.workflow)
 
