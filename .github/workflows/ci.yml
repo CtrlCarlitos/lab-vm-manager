@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Windows PowerShell parser and helper tests
+        shell: powershell
+        run: |
+          if (-not ($PSVersionTable.PSEdition -eq 'Desktop' -and $PSVersionTable.PSVersion.Major -eq 5)) {
+            throw "Tests require Windows PowerShell 5.1 Desktop."
+          }
+          & .\Test-LabVM.ps1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.x"
+      - name: Python source-contract tests
+        run: python -m unittest -v test_static.py
