@@ -1231,5 +1231,72 @@ class SourceContract(unittest.TestCase):
         self.assertIn("-ieq 'S'", body)
         self.assertIn('Start-LabLinuxServerVMProvisioning', body)
 
+
+class AutomationContract(unittest.TestCase):
+    def setUp(self):
+        workflow = Path(__file__).with_name('.github') / 'workflows' / 'ci.yml'
+        self.workflow = workflow.read_text(encoding='utf-8')
+
+    def test_ci_is_windows_read_only_and_uses_expected_triggers(self):
+        self.assertIn('pull_request:', self.workflow)
+        self.assertRegex(self.workflow, r'(?ms)push:\n    branches:\n      - main\n')
+        self.assertRegex(self.workflow, r'(?m)^permissions:\n  contents: read$')
+        self.assertEqual(self.workflow.count('permissions:'), 1)
+        self.assertNotRegex(
+            self.workflow,
+            r'(?m)^\s+[a-z0-9_-]+\s*:\s*write(?:\s+#.*)?\s*$',
+        )
+        self.assertNotRegex(self.workflow, r'(?i)\$\{\{\s*secrets\s*\.\s*')
+        self.assertNotIn('pull_request_target:', self.workflow)
+        self.assertIn('\n  test:\n    runs-on: windows-latest\n', self.workflow)
+
+    def test_ci_actions_use_full_sha_pins(self):
+        uses = re.findall(r'(?m)^\s+- uses: ([^\s]+)', self.workflow)
+        self.assertEqual(len(uses), 2)
+        for action in uses:
+            self.assertRegex(action, r'^actions/(checkout|setup-python)@[0-9a-f]{40}$')
+            self.assertNotRegex(action, r'@v\d+$')
+
+    def test_ci_runs_both_existing_suites(self):
+        self.assertIn('shell: powershell', self.workflow)
+        edition = "$PSVersionTable.PSEdition -eq 'Desktop'"
+        major = '$PSVersionTable.PSVersion.Major -eq 5'
+        powershell_test = '& .\\Test-LabVM.ps1'
+        self.assertIn(edition, self.workflow)
+        self.assertIn(major, self.workflow)
+        self.assertLess(self.workflow.index(edition), self.workflow.index(powershell_test))
+        self.assertLess(self.workflow.index(major), self.workflow.index(powershell_test))
+        self.assertIn('python -m unittest -v test_static.py', self.workflow)
+
+    def test_dependabot_only_updates_actions_weekly_as_one_group(self):
+        path = Path(__file__).with_name('.github') / 'dependabot.yml'
+        config = path.read_text(encoding='utf-8')
+        self.assertEqual(config.count('package-ecosystem:'), 1)
+        self.assertIn('package-ecosystem: github-actions', config)
+        self.assertIn('directory: /', config)
+        for setting in [
+            'interval: weekly',
+            'day: monday',
+            'time: "09:00"',
+            'timezone: Etc/UTC',
+            'open-pull-requests-limit: 1',
+        ]:
+            self.assertIn(setting, config)
+        self.assertEqual(config.count('patterns:'), 1)
+        self.assertRegex(config, r'(?m)^\s+- "\*"$')
+        self.assertNotIn('package-ecosystem: pip', config)
+
+    def test_security_policy_uses_private_reporting(self):
+        path = Path(__file__).with_name('SECURITY.md')
+        policy = path.read_text(encoding='utf-8')
+        self.assertIn(
+            'https://github.com/CtrlCarlitos/lab-vm-manager/security/advisories/new',
+            policy,
+        )
+        self.assertIn('Do not open a public issue', policy)
+        self.assertIn('Only the latest revision on `main` is supported', policy)
+        self.assertNotRegex(policy, r'\b[^\s@]+@[^\s@]+\.[^\s@]+\b')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
