@@ -1280,6 +1280,17 @@ class AutomationContract(unittest.TestCase):
         self.assertRegex(config, r'(?m)^\s+- "\*"$')
         self.assertNotIn('package-ecosystem: pip', config)
 
+    def test_security_policy_uses_private_reporting(self):
+        path = Path(__file__).with_name('SECURITY.md')
+        policy = path.read_text(encoding='utf-8')
+        self.assertIn(
+            'https://github.com/CtrlCarlitos/lab-vm-manager/security/advisories/new',
+            policy,
+        )
+        self.assertIn('Do not open a public issue', policy)
+        self.assertIn('Only the latest revision on `main` is supported', policy)
+        self.assertNotRegex(policy, r'\b[^\s@]+@[^\s@]+\.[^\s@]+\b')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
