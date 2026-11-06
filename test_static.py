@@ -1262,6 +1262,24 @@ class AutomationContract(unittest.TestCase):
         self.assertLess(self.workflow.index(major), self.workflow.index(powershell_test))
         self.assertIn('python -m unittest -v test_static.py', self.workflow)
 
+    def test_dependabot_only_updates_actions_weekly_as_one_group(self):
+        path = Path(__file__).with_name('.github') / 'dependabot.yml'
+        config = path.read_text(encoding='utf-8')
+        self.assertEqual(config.count('package-ecosystem:'), 1)
+        self.assertIn('package-ecosystem: github-actions', config)
+        self.assertIn('directory: /', config)
+        for setting in [
+            'interval: weekly',
+            'day: monday',
+            'time: "09:00"',
+            'timezone: Etc/UTC',
+            'open-pull-requests-limit: 1',
+        ]:
+            self.assertIn(setting, config)
+        self.assertEqual(config.count('patterns:'), 1)
+        self.assertRegex(config, r'(?m)^\s+- "\*"$')
+        self.assertNotIn('package-ecosystem: pip', config)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
